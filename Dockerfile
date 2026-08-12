@@ -15,7 +15,11 @@ FROM node:22-bookworm-slim AS runtime
 
 ENV NODE_ENV=production
 WORKDIR /app
-RUN corepack enable
+RUN corepack enable && apt-get update && apt-get install -y --no-install-recommends curl ca-certificates git && rm -rf /var/lib/apt/lists/*
+
+RUN npm install -g --ignore-scripts @earendil-works/pi-coding-agent \
+    && curl -fsSL https://omp.sh/install | sh \
+    && install -m 0755 /root/.local/bin/omp /usr/local/bin/omp
 
 COPY package.json pnpm-lock.yaml ./
 RUN pnpm install --prod --frozen-lockfile

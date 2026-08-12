@@ -6,7 +6,7 @@ services:
       POSTGRES_PASSWORD: mob
       POSTGRES_DB: mob
     ports:
-      - "5432:5432"
+      - "5434:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U mob -d mob"]
       interval: 2s
@@ -17,4 +17,3 @@ services:
 
 volumes:
   mob-postgres:
-

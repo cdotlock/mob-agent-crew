@@ -9,6 +9,7 @@ export * from "./claude-driver.js";
 export * from "./pi-rpc-driver.js";
 export * from "./omp-rpc-driver.js";
 export * from "./registry.js";
+export * from "./mob-ai-config.js";
 
 // Short aliases for worker wiring; the descriptive class names remain canonical.
 export { CodexExecDriver as CodexDriver } from "./codex-driver.js";

@@ -27,6 +27,13 @@ const environmentSchema = z.object({
   MOB_ENABLE_MOCK_DRIVER: booleanFromEnv,
   MOB_SESSION_SECRET: z.string().min(32).default("development-only-secret-change-me-now"),
   MOB_PUBLIC_URL: z.string().url().optional(),
+  MOB_ADMIN_EMAIL: z.string().email().optional(),
+  MOB_ADMIN_PASSWORD: z.string().min(12).optional(),
+  MOB_ADMIN_NAME: z.string().min(1).default("Workspace Admin"),
+  MOB_BOOTSTRAP_REPOSITORY_URL: z.string().url().default("https://github.com/cdotlock/mob-agent-crew"),
+  MOB_AI_KEY: z.string().startsWith("mob-").optional(),
+  MOB_AI_BASE_URL: z.string().url().default("https://ai.mob-ai.cn/api"),
+  MOB_AI_MODEL: z.string().min(1).default("deepseek-v4-pro"),
 });
 
 export type AppConfig = {
@@ -40,6 +47,13 @@ export type AppConfig = {
   enableMockDriver: boolean;
   sessionSecret: string;
   publicUrl?: string;
+  adminEmail?: string;
+  adminPassword?: string;
+  adminName: string;
+  bootstrapRepositoryUrl: string;
+  mobAiKey?: string;
+  mobAiBaseUrl: string;
+  mobAiModel: string;
 };
 
 export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppConfig {
@@ -63,5 +77,12 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
     enableMockDriver: parsed.MOB_ENABLE_MOCK_DRIVER,
     sessionSecret: parsed.MOB_SESSION_SECRET,
     ...(parsed.MOB_PUBLIC_URL ? { publicUrl: parsed.MOB_PUBLIC_URL } : {}),
+    ...(parsed.MOB_ADMIN_EMAIL ? { adminEmail: parsed.MOB_ADMIN_EMAIL } : {}),
+    ...(parsed.MOB_ADMIN_PASSWORD ? { adminPassword: parsed.MOB_ADMIN_PASSWORD } : {}),
+    adminName: parsed.MOB_ADMIN_NAME,
+    bootstrapRepositoryUrl: parsed.MOB_BOOTSTRAP_REPOSITORY_URL,
+    ...(parsed.MOB_AI_KEY ? { mobAiKey: parsed.MOB_AI_KEY } : {}),
+    mobAiBaseUrl: parsed.MOB_AI_BASE_URL,
+    mobAiModel: parsed.MOB_AI_MODEL,
   };
 }
