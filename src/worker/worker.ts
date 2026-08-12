@@ -191,14 +191,20 @@ export class MobWorker {
       });
 
       if (result.finalMessage) {
-        await this.#options.store.createMessage({
-          taskId: claim.taskId,
-          actorId: claim.agentActorId,
-          sourceRunId: claim.runId,
-          kind: status === "succeeded" ? "result" : "progress",
-          body: redactText(result.finalMessage, runtimeSecrets),
-          enqueueMentionedAgents: true,
-        });
+        const thread = await this.#options.store.getTaskThread(claim.taskId);
+        const resultAlreadyPosted = thread.messages.some(
+          (message) => message.sourceRunId === claim.runId && message.kind === "result",
+        );
+        if (!resultAlreadyPosted) {
+          await this.#options.store.createMessage({
+            taskId: claim.taskId,
+            actorId: claim.agentActorId,
+            sourceRunId: claim.runId,
+            kind: status === "succeeded" ? "result" : "progress",
+            body: redactText(result.finalMessage, runtimeSecrets),
+            enqueueMentionedAgents: true,
+          });
+        }
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);

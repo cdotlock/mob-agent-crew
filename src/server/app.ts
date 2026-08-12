@@ -270,7 +270,10 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
 
   app.post<{ Params: { id: string } }>("/api/tasks/:id/messages", async (request) => {
     const actor = requireActor(request);
-    const body = z.object({ content: z.string().min(1).max(20_000) }).parse(request.body);
+    const body = z.object({
+      content: z.string().min(1).max(20_000),
+      kind: z.enum(["comment", "progress", "result"]).optional(),
+    }).parse(request.body);
     const task = await store.getTask(request.params.id);
     if (!task) throw new StoreError("not_found", "Task was not found.");
     assertWorkspace(actor, task.workspaceId);
@@ -278,7 +281,14 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     const content = actor.kind === "run"
       ? redactText(body.content, [config.mobAiKey, bearer])
       : body.content;
-    return store.createMessage({ taskId: task.id, actorId: actor.actorId, sourceRunId: actor.kind === "run" ? actor.runId : null, body: content, enqueueMentionedAgents: true });
+    return store.createMessage({
+      taskId: task.id,
+      actorId: actor.actorId,
+      sourceRunId: actor.kind === "run" ? actor.runId : null,
+      kind: actor.kind === "run" ? (body.kind ?? "comment") : "comment",
+      body: content,
+      enqueueMentionedAgents: true,
+    });
   });
 
   app.post<{ Params: { id: string } }>("/api/tasks/:id/delegations", async (request) => {

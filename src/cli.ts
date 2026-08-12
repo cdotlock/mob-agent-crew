@@ -61,7 +61,7 @@ artifact.command("add").argument("<path>").description("publish a file artifact"
 
 program.command("done").argument("<summary>").description("post the run's final summary").action(async (summary: string) => {
   const claims = readRunClaims();
-  await api(`/api/tasks/${claims.taskId}/messages`, { method: "POST", body: JSON.stringify({ content: summary }) });
+  await api(`/api/tasks/${claims.taskId}/messages`, { method: "POST", body: JSON.stringify({ content: summary, kind: "result" }) });
   console.log("Summary posted.");
 });
 
