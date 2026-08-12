@@ -1,0 +1,45 @@
+{
+  "name": "mob-agent-crew",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "mob": "dist/cli.js"
+  },
+  "scripts": {
+    "dev": "tsx watch src/cli.ts start",
+    "dev:web": "vite --host 0.0.0.0",
+    "build": "tsc -p tsconfig.build.json && vite build",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "db:migrate": "tsx src/cli.ts db migrate",
+    "start": "node dist/cli.js start"
+  },
+  "dependencies": {
+    "@fastify/cookie": "^11.0.2",
+    "@fastify/static": "^8.2.0",
+    "@phosphor-icons/react": "^2.1.10",
+    "commander": "^14.0.1",
+    "fastify": "^5.6.1",
+    "postgres": "^3.4.7",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1",
+    "zod": "^4.1.5"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "@types/react": "^19.1.12",
+    "@types/react-dom": "^19.1.9",
+    "@vitejs/plugin-react": "^5.0.2",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2",
+    "vite": "^7.1.3",
+    "vitest": "^3.2.4"
+  },
+  "packageManager": "pnpm@10.15.0",
+  "engines": {
+    "node": ">=22"
+  }
+}
+
