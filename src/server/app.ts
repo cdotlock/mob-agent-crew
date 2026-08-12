@@ -108,6 +108,7 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
   const app = Fastify({ logger: true, trustProxy: true });
   await app.register(cookie);
   await app.register(multipart, { limits: { files: 1, fileSize: 1_000_000 } });
+  app.addHook("preSerialization", async (_request, _reply, payload) => jsonSafe(payload));
 
   app.setErrorHandler((error, _request, reply) => {
     if (error instanceof ZodError) {
@@ -323,4 +324,16 @@ function requireHuman(request: FastifyRequest): Extract<TokenClaims, { kind: "se
 
 function assertWorkspace(actor: TokenClaims, workspaceId: string): void {
   if (actor.workspaceId !== workspaceId) throw new StoreError("not_found", "Resource was not found.");
+}
+
+function jsonSafe(value: unknown): unknown {
+  if (typeof value === "bigint") return value.toString();
+  if (Array.isArray(value)) return value.map(jsonSafe);
+  if (value instanceof Date) return value.toISOString();
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([key, item]) => [key, jsonSafe(item)]),
+    );
+  }
+  return value;
 }
