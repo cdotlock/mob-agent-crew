@@ -28,7 +28,9 @@ COPY --from=build /app/dist ./dist
 COPY --from=build /app/web-dist ./web-dist
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint
 
-RUN mkdir -p /data && chmod 0755 /usr/local/bin/docker-entrypoint
+RUN mkdir -p /data \
+    && chmod 0755 /usr/local/bin/docker-entrypoint /app/dist/cli.js \
+    && ln -s /app/dist/cli.js /usr/local/bin/mob
 
 EXPOSE 4310
 ENTRYPOINT ["docker-entrypoint"]
