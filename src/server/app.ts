@@ -30,63 +30,80 @@ declare module "fastify" {
 }
 
 export async function ensureBootstrap(config: AppConfig, store: CollaborationStore): Promise<void> {
-  const existing = await store.getWorkspaceBySlug("crew");
-  if (existing) return;
-  if (!config.adminEmail || !config.adminPassword) {
-    throw new Error("MOB_ADMIN_EMAIL and MOB_ADMIN_PASSWORD are required for first startup");
+  let workspace = await store.getWorkspaceBySlug("crew");
+  let owner: { id: string } | undefined;
+  if (!workspace) {
+    if (!config.adminEmail || !config.adminPassword) {
+      throw new Error("MOB_ADMIN_EMAIL and MOB_ADMIN_PASSWORD are required for first startup");
+    }
+    const passwordHash = await hashPassword(config.adminPassword);
+    const created = await store.bootstrap({
+      slug: "crew",
+      name: "Mob Agent Crew",
+      owner: {
+        handle: "admin",
+        displayName: config.adminName,
+        provider: "password",
+        subject: config.adminEmail.toLowerCase(),
+        email: config.adminEmail.toLowerCase(),
+        passwordHash,
+      },
+    });
+    workspace = created.workspace;
+    owner = created.owner;
+  } else {
+    owner = (await store.listActors(workspace.id)).find((actor) => actor.kind === "human");
   }
+  if (!owner) throw new Error("Bootstrap workspace has no human owner");
 
-  const passwordHash = await hashPassword(config.adminPassword);
-  const { workspace, owner } = await store.bootstrap({
-    slug: "crew",
-    name: "Mob Agent Crew",
-    owner: {
-      handle: "admin",
-      displayName: config.adminName,
-      provider: "password",
-      subject: config.adminEmail.toLowerCase(),
-      email: config.adminEmail.toLowerCase(),
-      passwordHash,
-    },
-  });
-  const repository = await store.createRepository({
-    workspaceId: workspace.id,
-    name: config.bootstrapRepositoryUrl.split("/").filter(Boolean).at(-1) ?? "workspace",
-    kind: "git",
-    remoteUrl: normalizeGitHubRepositoryUrl(config.bootstrapRepositoryUrl),
-    defaultBranch: "main",
-    createdByActorId: owner.id,
-  });
+  const repositories = await store.listRepositories(workspace.id);
+  const repository = repositories[0] ?? await store.createRepository({
+      workspaceId: workspace.id,
+      name: config.bootstrapRepositoryUrl.split("/").filter(Boolean).at(-1) ?? "workspace",
+      kind: "git",
+      remoteUrl: normalizeGitHubRepositoryUrl(config.bootstrapRepositoryUrl),
+      defaultBranch: "main",
+      createdByActorId: owner.id,
+    });
+
+  const actors = await store.listActors(workspace.id);
 
   for (const agent of [
     { handle: "builder", name: "Builder", role: "Implementation agent", driver: "omp" },
     { handle: "reviewer", name: "Reviewer", role: "Review and risk agent", driver: "pi" },
   ]) {
-    const actor = await store.createActor({
-      workspaceId: workspace.id,
-      kind: "agent",
-      handle: agent.handle,
-      displayName: agent.name,
-    });
+    const actor = actors.find((item) => item.handle === agent.handle) ?? await store.createActor({
+        workspaceId: workspace.id,
+        kind: "agent",
+        handle: agent.handle,
+        displayName: agent.name,
+      });
     const home = resolve(config.dataDir, "agents", actor.id);
     await writeMobAiProviderConfig({ directory: home, baseUrl: config.mobAiBaseUrl, model: config.mobAiModel });
-    await store.createAgentProfile({
-      workspaceId: workspace.id,
-      actorId: actor.id,
-      ownerActorId: owner.id,
-      driver: agent.driver,
-      home,
-      role: agent.role,
-      capabilities: {
-        streaming: true,
-        steer: true,
-        followUp: true,
-        resume: false,
-        nativeCancel: true,
-      },
-    });
+    const profileRows = await store.sql<Array<{ actor_id: string }>>`
+      SELECT actor_id FROM agent_profiles WHERE actor_id = ${actor.id}
+    `;
+    if (profileRows.length === 0) {
+      await store.createAgentProfile({
+        workspaceId: workspace.id,
+        actorId: actor.id,
+        ownerActorId: owner.id,
+        driver: agent.driver,
+        home,
+        role: agent.role,
+        capabilities: {
+          streaming: true,
+          steer: true,
+          followUp: true,
+          resume: false,
+          nativeCancel: true,
+        },
+      });
+    }
   }
 
+  const existingTasks = await store.listTasks(workspace.id, 1);
+  if (existingTasks.length > 0) return;
   const task = await store.createTask({
     workspaceId: workspace.id,
     repositoryId: repository.id,
