@@ -1,4 +1,3 @@
-import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import type { AgentDriverId, AgentDriverRegistry, AgentRun } from "../agents/index.js";
 import type { AppConfig } from "../config.js";
@@ -6,6 +5,7 @@ import type { CollaborationStore } from "../db/store.js";
 import type { LeaseClaim } from "../domain/model.js";
 import { issueRunToken } from "../auth/tokens.js";
 import { redactText, redactValue } from "../security/redaction.js";
+import { materializeGitWorkspace } from "../workspace/materialize.js";
 
 export interface WorkerOptions {
   id: string;
@@ -20,6 +20,13 @@ type RuntimeProfile = {
   driver: AgentDriverId;
   home: string;
   role: string;
+};
+
+type TaskRepository = {
+  remoteUrl: string | null;
+  baseRevision: string;
+  allowlisted: boolean;
+  enabled: boolean;
 };
 
 export class MobWorker {
@@ -103,6 +110,27 @@ export class MobWorker {
       .join("\n\n");
   }
 
+  async #prepareTaskDirectory(claim: LeaseClaim): Promise<string> {
+    const taskDirectory = join(this.#options.config.dataDir, "tasks", claim.taskId);
+    const rows = await this.#options.store.sql<TaskRepository[]>`
+      SELECT r.remote_url AS "remoteUrl", t.base_revision AS "baseRevision",
+             r.allowlisted, r.enabled
+      FROM tasks t
+      JOIN repositories r ON r.id = t.repository_id AND r.workspace_id = t.workspace_id
+      WHERE t.id = ${claim.taskId} AND t.workspace_id = ${claim.workspaceId}
+    `;
+    const repository = rows[0];
+    if (!repository?.allowlisted || !repository.enabled || !repository.remoteUrl) {
+      throw new Error("Task repository is not an enabled allowlisted Git remote");
+    }
+    await materializeGitWorkspace({
+      taskDirectory,
+      remoteUrl: repository.remoteUrl,
+      baseRevision: repository.baseRevision,
+    });
+    return taskDirectory;
+  }
+
   async #execute(claim: LeaseClaim): Promise<void> {
     let nativeRun: AgentRun | undefined;
     try {
@@ -113,8 +141,7 @@ export class MobWorker {
       const driver = this.#options.drivers.get(profile.driver);
       await this.#options.store.markAttemptRunning(claim);
 
-      const taskDir = join(this.#options.config.dataDir, "tasks", claim.taskId);
-      await mkdir(taskDir, { recursive: true });
+      const taskDir = await this.#prepareTaskDirectory(claim);
       const token = issueRunToken(
         {
           actorId: claim.agentActorId,
