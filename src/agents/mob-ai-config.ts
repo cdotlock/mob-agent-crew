@@ -17,6 +17,9 @@ export async function writeMobAiProviderConfig(input: MobAiProviderConfig): Prom
         api: "openai-completions",
         apiKey: "$MOB_AI_KEY",
         authHeader: true,
+        headers: {
+          "User-Agent": "mob-agent-crew/0.1",
+        },
         compat: {
           supportsDeveloperRole: false,
           supportsReasoningEffort: false,
