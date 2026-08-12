@@ -5,6 +5,7 @@ import type { AppConfig } from "../config.js";
 import type { CollaborationStore } from "../db/store.js";
 import type { LeaseClaim } from "../domain/model.js";
 import { issueRunToken } from "../auth/tokens.js";
+import { redactText, redactValue } from "../security/redaction.js";
 
 export interface WorkerOptions {
   id: string;
@@ -95,6 +96,7 @@ export class MobWorker {
       `Task: ${thread.task.title}`,
       thread.task.description ? `Description: ${thread.task.description}` : "",
       "Use the mob CLI for collaboration. Post concise progress, delegate only bounded deliverables, and finish with mob done.",
+      "Never print environment variables, tokens, or credentials. Do not inspect runtime plumbing unless the task explicitly asks for it.",
       transcript ? `Shared thread:\n${transcript}` : "",
     ]
       .filter(Boolean)
@@ -137,18 +139,19 @@ export class MobWorker {
         },
       });
       this.#active.set(claim.runId, nativeRun);
+      const runtimeSecrets = [this.#options.config.mobAiKey, token];
 
       for await (const event of nativeRun) {
         await this.#options.store.appendRunEvent({
           claim,
           type: event.kind,
-          payload: {
+          payload: redactValue({
             driver: event.driver,
             sequence: event.sequence,
             ...(event.nativeType ? { nativeType: event.nativeType } : {}),
             ...(event.message ? { message: event.message } : {}),
             ...(event.data ?? {}),
-          },
+          }, runtimeSecrets),
         });
       }
       const result = await nativeRun.result;
@@ -166,7 +169,7 @@ export class MobWorker {
           actorId: claim.agentActorId,
           sourceRunId: claim.runId,
           kind: status === "succeeded" ? "result" : "progress",
-          body: result.finalMessage,
+          body: redactText(result.finalMessage, runtimeSecrets),
           enqueueMentionedAgents: true,
         });
       }

@@ -14,6 +14,7 @@ import { normalizeGitHubRepositoryUrl } from "../domain/rules.js";
 import { parseMarkdownImport } from "../imports/context-imports.js";
 import type { MobWorker } from "../worker/worker.js";
 import { writeMobAiProviderConfig } from "../agents/mob-ai-config.js";
+import { redactText } from "../security/redaction.js";
 
 const sessionCookie = "mob_session";
 
@@ -273,7 +274,11 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     const task = await store.getTask(request.params.id);
     if (!task) throw new StoreError("not_found", "Task was not found.");
     assertWorkspace(actor, task.workspaceId);
-    return store.createMessage({ taskId: task.id, actorId: actor.actorId, sourceRunId: actor.kind === "run" ? actor.runId : null, body: body.content, enqueueMentionedAgents: true });
+    const bearer = request.headers.authorization?.match(/^Bearer\s+(.+)$/iu)?.[1];
+    const content = actor.kind === "run"
+      ? redactText(body.content, [config.mobAiKey, bearer])
+      : body.content;
+    return store.createMessage({ taskId: task.id, actorId: actor.actorId, sourceRunId: actor.kind === "run" ? actor.runId : null, body: content, enqueueMentionedAgents: true });
   });
 
   app.post<{ Params: { id: string } }>("/api/tasks/:id/delegations", async (request) => {
