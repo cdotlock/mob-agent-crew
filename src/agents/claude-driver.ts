@@ -20,7 +20,7 @@ export const CLAUDE_CODE_CAPABILITIES: AgentCapabilities = Object.freeze({
   notes: Object.freeze([
     "Uses `claude -p --output-format stream-json`, not the Agent SDK.",
     "This first driver does not use stream-json input and therefore does not advertise steer.",
-    "Claude Code is not an OS sandbox; the worker/workspace boundary must isolate it.",
+    "Claude permissions are bypassed non-interactively; Mob's dedicated UID, disposable HOME, task permissions, and credential proxy are the isolation boundary.",
   ]),
 });
 
@@ -60,8 +60,7 @@ export class ClaudeCodeDriver implements AgentDriver {
       "--include-partial-messages",
       "--verbose",
       "--no-session-persistence",
-      "--permission-mode",
-      "dontAsk",
+      "--dangerously-skip-permissions",
       "--setting-sources",
       "",
       "--strict-mcp-config",
