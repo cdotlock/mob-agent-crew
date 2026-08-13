@@ -121,7 +121,7 @@ requires_openai_auth = false
     model: ${yamlString(input.model)}
 - insert:
     - id: mob-agent-crew
-      name: /opt/mob/deepseek-harness-plugin/index.js
+      name: /usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/mob-agent-crew-dsh-plugin/index.js
       config:
         executable: mob
         timeoutMs: 30000

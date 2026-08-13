@@ -58,7 +58,7 @@ RUN npm install -g --ignore-scripts "@earendil-works/pi-coding-agent@${PI_VERSIO
       --no-save "${CLAUDE_PLATFORM_PACKAGE}@${CLAUDE_CODE_VERSION}"
 
 COPY --from=deepseek-harness /usr/local/lib/node_modules/@deepseek-ai/dsh /usr/local/lib/node_modules/@deepseek-ai/dsh
-COPY integrations/deepseek-harness /opt/mob/deepseek-harness-plugin
+COPY integrations/deepseek-harness /usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/mob-agent-crew-dsh-plugin
 RUN ln -s /usr/local/lib/node_modules/@deepseek-ai/dsh/lib/bin.js /usr/local/bin/dsh
 
 # Install the immutable official OMP release asset. The moving omp.sh installer
@@ -137,7 +137,7 @@ RUN node /usr/local/lib/node_modules/@anthropic-ai/claude-code/install.cjs \
     && test -x /opt/codex/codex-resources/bwrap \
     && command -v dsh \
     && test "$(dsh --version)" = "${DEEPSEEK_HARNESS_VERSION}" \
-    && node -e "import('/opt/mob/deepseek-harness-plugin/index.js')" \
+    && node -e "import('/usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/mob-agent-crew-dsh-plugin/index.js')" \
     && DSH_HOME=/tmp/dsh-smoke dsh --profile headless --dump-default-config >/dev/null \
     && rm -rf /tmp/dsh-smoke \
     && command -v gh \
