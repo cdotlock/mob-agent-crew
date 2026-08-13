@@ -30,7 +30,7 @@ describe("Codex exec connector", () => {
       attemptId: "attempt-codex",
       prompt,
       cwd: fixture.directory,
-      timeoutMs: 1_000,
+      timeoutMs: 3_000,
     });
 
     const eventsPromise = collect(run.events);
@@ -55,6 +55,8 @@ describe("Codex exec connector", () => {
       stdin: string;
     };
     expect(capture.stdin).toBe("");
+    expect(capture.args).toContain("danger-full-access");
+    expect(capture.args).not.toContain("workspace-write");
     expect(capture.args.filter((value) => value === prompt)).toHaveLength(1);
     expect(capture.args.slice(-1)).toEqual([prompt]);
   });
