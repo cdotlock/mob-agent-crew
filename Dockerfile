@@ -15,8 +15,8 @@ FROM node:22-bookworm-slim AS runtime
 
 ARG CLAUDE_CODE_VERSION=2.1.220
 ARG CODEX_VERSION=0.142.5
-ARG CODEX_LINUX_AMD64_SHA256=cb933ec3cb61bf4b5fc88eecf5e6149829faa6172535b6ef0afb0154beb4aab8
-ARG CODEX_LINUX_ARM64_SHA256=b18c75c49645918fae23beba0ab41c05f07941601510a2451ba97fe519573c38
+ARG CODEX_PACKAGE_LINUX_AMD64_SHA256=14ab953574506cb30d8c773e5a3458fd0a2d1aad58062f0a98ea6a159889b80e
+ARG CODEX_PACKAGE_LINUX_ARM64_SHA256=600d444443e8ec04397586965fde7de77de7795842f5e7b0e622c7b05f7fc356
 ARG GH_VERSION=2.94.0
 ARG HERMES_VERSION=0.19.0
 ARG HERMES_WHEEL_SHA256=bd0bac012aee38a60894781f4597dc29ee7bedb3448540249921f10d3bef327f
@@ -71,21 +71,25 @@ RUN curl -fsSL "https://files.pythonhosted.org/packages/e5/30/c85be8290e9565dc3c
     && chmod 0755 /usr/local/bin/hermes-python \
     && rm "/tmp/hermes_agent-${HERMES_VERSION}-py3-none-any.whl"
 
-# Install the immutable official Codex binary. The standalone installer expects
-# newer companion assets that are absent from the reviewed 0.142.5 release.
+# Install the immutable official Codex package, not only the main executable.
+# Codex resolves its bundled rg, bwrap, and shell resources relative to the
+# executable, so the release directory layout must remain intact.
 RUN case "${TARGETARCH}" in \
-      amd64) CODEX_ARCH=x86_64; CODEX_SHA256="${CODEX_LINUX_AMD64_SHA256}" ;; \
-      arm64) CODEX_ARCH=aarch64; CODEX_SHA256="${CODEX_LINUX_ARM64_SHA256}" ;; \
+      amd64) CODEX_ARCH=x86_64; CODEX_SHA256="${CODEX_PACKAGE_LINUX_AMD64_SHA256}" ;; \
+      arm64) CODEX_ARCH=aarch64; CODEX_SHA256="${CODEX_PACKAGE_LINUX_ARM64_SHA256}" ;; \
       *) echo "Unsupported Codex architecture: ${TARGETARCH}" >&2; exit 1 ;; \
     esac \
-    && CODEX_ASSET="codex-${CODEX_ARCH}-unknown-linux-musl" \
+    && CODEX_ASSET="codex-package-${CODEX_ARCH}-unknown-linux-musl.tar.gz" \
     && curl -fL --retry 5 --retry-all-errors --connect-timeout 20 \
-      "https://github.com/openai/codex/releases/download/rust-v${CODEX_VERSION}/${CODEX_ASSET}.tar.gz" \
-      -o /tmp/codex.tar.gz \
-    && echo "${CODEX_SHA256}  /tmp/codex.tar.gz" | sha256sum -c - \
-    && tar -xzf /tmp/codex.tar.gz -C /tmp \
-    && install -m 0755 "/tmp/${CODEX_ASSET}" /usr/local/bin/codex \
-    && rm -f /tmp/codex.tar.gz "/tmp/${CODEX_ASSET}"
+      "https://github.com/openai/codex/releases/download/rust-v${CODEX_VERSION}/${CODEX_ASSET}" \
+      -o "/tmp/${CODEX_ASSET}" \
+    && echo "${CODEX_SHA256}  /tmp/${CODEX_ASSET}" | sha256sum -c - \
+    && install -d -m 0755 /opt/codex \
+    && tar -xzf "/tmp/${CODEX_ASSET}" -C /opt/codex \
+    && test -f /opt/codex/codex-package.json \
+    && chmod 0755 /opt/codex/bin/codex /opt/codex/codex-path/rg /opt/codex/codex-resources/bwrap \
+    && ln -s /opt/codex/bin/codex /usr/local/bin/codex \
+    && rm -f "/tmp/${CODEX_ASSET}"
 
 # Install GitHub CLI from its immutable official release and verify its asset
 # against the release checksum list. TARGETARCH is amd64 or arm64 on Railway.
@@ -113,6 +117,9 @@ RUN node /usr/local/lib/node_modules/@anthropic-ai/claude-code/install.cjs \
     && claude --version \
     && command -v codex \
     && codex --version \
+    && codex exec --help >/dev/null \
+    && test -x /opt/codex/codex-path/rg \
+    && test -x /opt/codex/codex-resources/bwrap \
     && command -v gh \
     && gh --version
 
