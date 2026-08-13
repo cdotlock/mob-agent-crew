@@ -67,6 +67,19 @@ export function verifyToken(
   return claims;
 }
 
+export function verifyAnyToken(token: string, secret: string, now = Date.now()): TokenClaims {
+  const encodedPayload = token.split(".")[0];
+  if (!encodedPayload) throw new Error("Invalid token format");
+  let kind: unknown;
+  try {
+    kind = (JSON.parse(Buffer.from(encodedPayload, "base64url").toString("utf8")) as { kind?: unknown }).kind;
+  } catch {
+    throw new Error("Invalid token payload");
+  }
+  if (kind !== "session" && kind !== "run") throw new Error("Invalid token kind");
+  return verifyToken(token, secret, kind, now);
+}
+
 export function issueSessionToken(
   input: Omit<SessionClaims, "kind" | "issuedAt" | "expiresAt">,
   secret: string,

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { issueRunToken, issueSessionToken, verifyToken } from "../../src/auth/tokens.js";
+import { issueRunToken, issueSessionToken, verifyAnyToken, verifyToken } from "../../src/auth/tokens.js";
 
 const secret = "a-secret-that-is-long-enough-for-tests";
 const actorId = "11111111-1111-4111-8111-111111111111";
@@ -42,5 +42,24 @@ describe("signed actor tokens", () => {
       "Invalid token signature",
     );
     expect(() => verifyToken(token, secret, "session", 200)).toThrow("Token expired");
+  });
+
+  it("verifies either token kind for external bearer clients", () => {
+    const session = issueSessionToken({ actorId, workspaceId }, secret, 1_000, 100);
+    const run = issueRunToken(
+      {
+        actorId,
+        workspaceId,
+        runId: "33333333-3333-4333-8333-333333333333",
+        taskId: "44444444-4444-4444-8444-444444444444",
+      },
+      secret,
+      1_000,
+      100,
+    );
+
+    expect(verifyAnyToken(session, secret, 500).kind).toBe("session");
+    expect(verifyAnyToken(run, secret, 500).kind).toBe("run");
+    expect(() => verifyAnyToken(`${session.slice(0, -1)}x`, secret, 500)).toThrow();
   });
 });

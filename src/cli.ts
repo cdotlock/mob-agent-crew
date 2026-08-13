@@ -8,6 +8,14 @@ import { loadConfig } from "./config.js";
 import { createCollaborationStore, createDatabaseClient, migrateDatabase } from "./db/index.js";
 import { buildApp, ensureBootstrap } from "./server/index.js";
 import { MobWorker } from "./worker/index.js";
+import { FileWorkspaceStore } from "./storage/index.js";
+import {
+  MobApiClient,
+  clearClientConfig,
+  loadClientConfig,
+  normalizeServerUrl,
+  saveClientConfig,
+} from "./client/index.js";
 
 const program = new Command()
   .name("mob")
@@ -17,6 +25,138 @@ const program = new Command()
 program.command("start").description("start the web app and embedded worker").action(() => runServer(true));
 program.command("serve").description("start the web app without a worker").action(() => runServer(false));
 program.command("worker").description("start a worker process").action(runWorker);
+
+program.command("login")
+  .description("connect this computer to a Mob environment")
+  .requiredOption("--server <url>", "Mob server URL")
+  .option("--email <email>", "account email")
+  .option("--password-stdin", "read the account password from stdin")
+  .option("--token-stdin", "read an existing scoped token from stdin")
+  .action(async (options: { server: string; email?: string; passwordStdin?: boolean; tokenStdin?: boolean }) => {
+    const server = normalizeServerUrl(options.server);
+    if (options.passwordStdin && options.tokenStdin) throw new Error("Choose password stdin or token stdin, not both");
+    let token: string;
+    if (options.tokenStdin) {
+      token = (await readStandardInput()).trim();
+      if (!token) throw new Error("No token was received on stdin");
+      await new MobApiClient({ server, token }).request("/api/bootstrap");
+    } else {
+      if (!options.email) throw new Error("--email is required when logging in with a password");
+      const password = options.passwordStdin
+        ? (await readStandardInput()).trimEnd()
+        : process.env.MOB_PASSWORD;
+      if (!password) throw new Error("Use --password-stdin or set MOB_PASSWORD");
+      const response = await new MobApiClient({ server }).request<{ token?: string }>("/api/session", {
+        method: "POST",
+        body: { email: options.email, password, client: "cli" },
+      });
+      if (!response.token) throw new Error("Mob server did not issue a CLI token");
+      token = response.token;
+    }
+    await saveClientConfig({ server, token });
+    console.log(`Connected to ${server}`);
+  });
+
+program.command("logout").description("remove this computer's Mob credential").action(async () => {
+  console.log((await clearClientConfig()) ? "Mob credential removed." : "No Mob credential was stored.");
+});
+
+const taskCommands = program.command("task").description("work with tasks in the connected Mob environment");
+taskCommands.command("list").action(async () => {
+  const client = await connectedClient();
+  const bootstrap = await client.request<{ tasks?: unknown[] }>("/api/bootstrap");
+  console.log(JSON.stringify(bootstrap.tasks ?? [], null, 2));
+});
+taskCommands.command("show").argument("<task-id>").action(async (taskId: string) => {
+  console.log(JSON.stringify(await (await connectedClient()).request(`/api/tasks/${encodeURIComponent(taskId)}`), null, 2));
+});
+
+const chatCommands = program.command("chat").description("send messages through the shared environment");
+chatCommands.command("send")
+  .argument("<task-id>")
+  .argument("<message...>")
+  .action(async (taskId: string, words: string[]) => {
+    const content = words.join(" ").trim();
+    if (!content) throw new Error("Message is required");
+    const result = await (await connectedClient()).request(`/api/tasks/${encodeURIComponent(taskId)}/messages`, {
+      method: "POST",
+      body: { content },
+    });
+    console.log(JSON.stringify(result, null, 2));
+  });
+
+const agentCommands = program.command("agent").description("invoke a named actor in the environment");
+agentCommands.command("invoke")
+  .argument("<task-id>")
+  .argument("<agent>", "agent ID or @handle")
+  .argument("<request...>")
+  .action(async (taskId: string, agent: string, words: string[]) => {
+    const client = await connectedClient();
+    const bootstrap = await client.request<{ agents?: Array<{ id?: string; handle?: string; name?: string }> }>("/api/bootstrap");
+    const needle = agent.replace(/^@/u, "").toLowerCase();
+    const matched = (bootstrap.agents ?? []).find((item) =>
+      item.id === agent || item.handle?.toLowerCase() === needle || item.name?.toLowerCase() === needle,
+    );
+    if (!matched?.handle) throw new Error(`Agent '${agent}' was not found`);
+    const content = `@${matched.handle} ${words.join(" ").trim()}`.trim();
+    const result = await client.request(`/api/tasks/${encodeURIComponent(taskId)}/messages`, {
+      method: "POST",
+      body: { content },
+    });
+    console.log(JSON.stringify(result, null, 2));
+  });
+
+const runCommands = program.command("run").description("observe and control agent runs");
+runCommands.command("status").argument("<run-id>").action(async (runId: string) => {
+  console.log(JSON.stringify(await (await connectedClient()).request(`/api/runs/${encodeURIComponent(runId)}`), null, 2));
+});
+runCommands.command("cancel").argument("<run-id>").action(async (runId: string) => {
+  console.log(JSON.stringify(await (await connectedClient()).request(`/api/runs/${encodeURIComponent(runId)}/cancel`, { method: "POST" }), null, 2));
+});
+runCommands.command("watch")
+  .argument("<run-id>")
+  .option("--interval <milliseconds>", "poll interval", "1500")
+  .action(async (runId: string, options: { interval: string }) => {
+    const client = await connectedClient();
+    const interval = Math.max(250, Math.min(30_000, Number(options.interval) || 1_500));
+    let cursor = 0;
+    for (;;) {
+      const page = await client.request<{ cursor: number; events: unknown[] }>(`/api/runs/${encodeURIComponent(runId)}/events`, { query: { after: cursor } });
+      for (const event of page.events) console.log(JSON.stringify(event));
+      cursor = page.cursor;
+      const status = await client.request<{ status: string }>(`/api/runs/${encodeURIComponent(runId)}`);
+      if (["succeeded", "failed", "cancelled"].includes(status.status)) {
+        console.log(JSON.stringify({ type: "run.status", status: status.status }));
+        return;
+      }
+      await delay(interval);
+    }
+  });
+
+const knowledgeCommands = program.command("knowledge").alias("wiki").description("read and maintain workspace knowledge files");
+knowledgeCommands.command("list").option("--area <area>", "raw or wiki").action(async (options: { area?: string }) => {
+  console.log(JSON.stringify(await (await connectedClient()).request("/api/knowledge", { query: { area: options.area } }), null, 2));
+});
+knowledgeCommands.command("search").argument("<query...>").action(async (words: string[]) => {
+  console.log(JSON.stringify(await (await connectedClient()).request("/api/knowledge/search", { query: { q: words.join(" ") } }), null, 2));
+});
+knowledgeCommands.command("retrieve").argument("<query...>").action(async (words: string[]) => {
+  console.log(JSON.stringify(await (await connectedClient()).request("/api/knowledge/retrieve", { query: { q: words.join(" ") } }), null, 2));
+});
+knowledgeCommands.command("read").argument("<path>").action(async (path: string) => {
+  console.log(JSON.stringify(await (await connectedClient()).request("/api/knowledge/file", { query: { path } }), null, 2));
+});
+knowledgeCommands.command("add-raw").argument("<knowledge-path>").argument("<file>").action(async (path: string, file: string) => {
+  const content = await readFile(file, "utf8");
+  console.log(JSON.stringify(await (await connectedClient()).request("/api/knowledge/raw", { method: "POST", body: { path, content, source: `cli:${basename(file)}` } }), null, 2));
+});
+knowledgeCommands.command("curate").argument("<knowledge-path>").argument("<file>").action(async (path: string, file: string) => {
+  const content = await readFile(file, "utf8");
+  console.log(JSON.stringify(await (await connectedClient()).request("/api/knowledge/wiki", { method: "POST", body: { path, content, source: `cli:${basename(file)}` } }), null, 2));
+});
+knowledgeCommands.command("lint").action(async () => {
+  console.log(JSON.stringify(await (await connectedClient()).request("/api/knowledge/lint"), null, 2));
+});
 
 const db = program.command("db");
 db.command("migrate").action(async () => {
@@ -41,13 +181,14 @@ program.command("say").argument("<message>").description("post a message to the 
 });
 
 program.command("delegate")
-  .argument("<agent>", "agent UUID")
+  .argument("<agent>", "agent UUID or @handle")
   .argument("<deliverable>")
+  .option("--read-only", "do not request the task writer lease")
   .description("delegate a bounded deliverable to another agent")
-  .action(async (agent: string, deliverable: string) => {
+  .action(async (agent: string, deliverable: string, options: { readOnly?: boolean }) => {
     const claims = readRunClaims();
     const agentId = agent.replace(/^@/u, "");
-    console.log(JSON.stringify(await api(`/api/tasks/${claims.taskId}/delegations`, { method: "POST", body: JSON.stringify({ agentId, deliverable }) }), null, 2));
+    console.log(JSON.stringify(await api(`/api/tasks/${claims.taskId}/delegations`, { method: "POST", body: JSON.stringify({ agentId, deliverable, writerRequired: !options.readOnly }) }), null, 2));
   });
 
 const artifact = program.command("artifact");
@@ -72,7 +213,8 @@ async function createRuntime() {
   const sql = createDatabaseClient(config.databaseUrl);
   await migrateDatabase(sql);
   const store = createCollaborationStore(sql);
-  await ensureBootstrap(config, store);
+  const files = new FileWorkspaceStore({ dataDir: config.dataDir });
+  await ensureBootstrap(config, store, files);
   const drivers = createDefaultAgentDriverRegistry({
     mock: new MockDriver({
       delegate: async (input, context) => {
@@ -89,8 +231,8 @@ async function createRuntime() {
       extraArgs: ["--model", `mob-ai/${config.mobAiModel}`, "--no-session"],
     },
   });
-  const worker = new MobWorker({ id: `${hostname()}-${process.pid}`, store, drivers, config });
-  return { config, sql, store, worker };
+  const worker = new MobWorker({ id: `${hostname()}-${process.pid}`, store, files, drivers, config });
+  return { config, sql, store, files, worker };
 }
 
 async function runServer(forceEmbedded: boolean): Promise<void> {
@@ -100,6 +242,7 @@ async function runServer(forceEmbedded: boolean): Promise<void> {
   const app = await buildApp({
     config: runtime.config,
     store: runtime.store,
+    files: runtime.files,
     ...(embedded ? { worker: runtime.worker } : {}),
   });
   await app.listen({ host: runtime.config.host, port: runtime.config.port });
@@ -130,6 +273,28 @@ function installShutdown(shutdown: () => Promise<void>): void {
   };
   process.once("SIGINT", handler);
   process.once("SIGTERM", handler);
+}
+
+async function connectedClient(): Promise<MobApiClient> {
+  if (process.env.MOB_RUN_TOKEN) {
+    return new MobApiClient({
+      server: process.env.MOB_API_URL ?? "http://127.0.0.1:4310",
+      token: process.env.MOB_RUN_TOKEN,
+    });
+  }
+  const config = await loadClientConfig();
+  if (!config) throw new Error("Run 'mob login' first");
+  return new MobApiClient(config);
+}
+
+async function readStandardInput(): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of process.stdin) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  return Buffer.concat(chunks).toString("utf8").replace(/\r?\n$/u, "");
+}
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolveDelay) => setTimeout(resolveDelay, milliseconds));
 }
 
 function readRunClaims(): { taskId: string } {

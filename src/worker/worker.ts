@@ -6,10 +6,13 @@ import type { LeaseClaim } from "../domain/model.js";
 import { issueRunToken } from "../auth/tokens.js";
 import { redactText, redactValue } from "../security/redaction.js";
 import { materializeGitWorkspace } from "../workspace/materialize.js";
+import { WorkspaceKnowledge } from "../knowledge/index.js";
+import { type FileWorkspaceStore, writeTaskFileState } from "../storage/index.js";
 
 export interface WorkerOptions {
   id: string;
   store: CollaborationStore;
+  files: FileWorkspaceStore;
   drivers: AgentDriverRegistry;
   config: AppConfig;
   pollMs?: number;
@@ -65,6 +68,7 @@ export class MobWorker {
       this.#options.leaseMs ?? 60_000,
     );
     if (!claim) return false;
+    await writeTaskFileState(this.#options.store, this.#options.files, claim.taskId);
     await this.#execute(claim);
     return true;
   }
@@ -93,19 +97,39 @@ export class MobWorker {
   }
 
   async #buildPrompt(claim: LeaseClaim, role: string): Promise<string> {
-    const thread = await this.#options.store.getTaskThread(claim.taskId);
+    const [thread, actors] = await Promise.all([
+      this.#options.store.getTaskThread(claim.taskId),
+      this.#options.store.listActors(claim.workspaceId),
+    ]);
     const transcript = thread.messages
       .slice(-30)
       .map((message) => `${message.actorId}: ${message.body}`)
       .join("\n");
+    const knowledgeQuery = [
+      thread.task.title,
+      thread.task.description,
+      ...thread.messages.slice(-5).map((message) => message.body),
+    ].filter(Boolean).join("\n");
+    const knowledge = new WorkspaceKnowledge({
+      rootDirectory: join(this.#options.files.workspaceRoot(claim.workspaceId), "knowledge"),
+    });
+    const retrieval = await knowledge.retrieve(knowledgeQuery, { topK: 4, charBudget: 8_000 });
+    const collaborators = actors
+      .filter((actor) => actor.kind === "agent" && actor.status === "active" && actor.id !== claim.agentActorId)
+      .map((actor) => `@${actor.handle}`)
+      .join(", ");
     return [
       `You are participating as ${role || "a coding agent"} in a shared Mob Agent Crew task.`,
       `Task: ${thread.task.title}`,
       thread.task.description ? `Description: ${thread.task.description}` : "",
       "Start the requested work immediately. Do not explore the Mob platform or inspect mob --help/context unless the user explicitly asks.",
       "Use mob say only for meaningful progress, mob delegate only for a bounded handoff, mob artifact add for deliverables, and mob done once when finished.",
+      collaborators ? `Available Agent collaborators: ${collaborators}. Invoke one with mob delegate @handle \"bounded deliverable\".` : "",
       "Never print environment variables, tokens, or credentials. Do not inspect runtime plumbing unless the task explicitly asks for it.",
       transcript ? `Shared thread:\n${transcript}` : "",
+      retrieval.context
+        ? `Workspace knowledge (read-only excerpts; source manifest ${retrieval.manifestPath}):\n${retrieval.context}`
+        : "",
     ]
       .filter(Boolean)
       .join("\n\n");
@@ -143,7 +167,8 @@ export class MobWorker {
         throw new Error(`Agent driver '${profile.driver}' is not registered`);
       }
       const driver = this.#options.drivers.get(profile.driver);
-      await this.#options.store.markAttemptRunning(claim);
+      const runningAttempt = await this.#options.store.markAttemptRunning(claim);
+      await this.#options.files.writeAttempt(runningAttempt);
 
       const leaseMs = this.#options.leaseMs ?? 60_000;
       leaseHeartbeat = setInterval(async () => {
@@ -192,7 +217,7 @@ export class MobWorker {
       const runtimeSecrets = [this.#options.config.mobAiKey, token];
 
       for await (const event of nativeRun) {
-        await this.#options.store.appendRunEvent({
+        const storedEvent = await this.#options.store.appendRunEvent({
           claim,
           type: event.kind,
           payload: redactValue({
@@ -203,6 +228,7 @@ export class MobWorker {
             ...(event.data ?? {}),
           }, runtimeSecrets),
         });
+        await this.#options.files.writeEvent(storedEvent);
       }
       const result = await nativeRun.result;
       const threadAfterRun = await this.#options.store.getTaskThread(claim.taskId);
@@ -217,7 +243,7 @@ export class MobWorker {
           : result.outcome === "cancelled"
             ? "cancelled"
             : "failed";
-      await this.#options.store.completeAttempt({
+      const completed = await this.#options.store.completeAttempt({
         claim,
         status,
         ...(missingResult
@@ -227,9 +253,13 @@ export class MobWorker {
             : {}),
         ...(!missingResult && result.outcome === "timed_out" ? { failureCode: "timeout" } : {}),
       });
+      await Promise.all([
+        this.#options.files.writeRun(completed.run),
+        this.#options.files.writeAttempt(completed.attempt),
+      ]);
 
       if (missingResult) {
-        await this.#options.store.createMessage({
+        const posted = await this.#options.store.createMessage({
           taskId: claim.taskId,
           actorId: claim.agentActorId,
           sourceRunId: claim.runId,
@@ -237,11 +267,12 @@ export class MobWorker {
           body: "I stopped without publishing a final result. The run has been marked failed so it can be retried safely.",
           enqueueMentionedAgents: false,
         });
+        await this.#options.files.writeMessage(posted.message);
       }
 
       if (result.finalMessage) {
         if (!resultAlreadyPosted) {
-          await this.#options.store.createMessage({
+          const posted = await this.#options.store.createMessage({
             taskId: claim.taskId,
             actorId: claim.agentActorId,
             sourceRunId: claim.runId,
@@ -249,17 +280,22 @@ export class MobWorker {
             body: redactText(result.finalMessage, runtimeSecrets),
             enqueueMentionedAgents: true,
           });
+          await this.#options.files.writeMessage(posted.message);
         }
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       try {
-        await this.#options.store.completeAttempt({
+        const completed = await this.#options.store.completeAttempt({
           claim,
           status: "failed",
           failureCode: "worker_error",
           failureMessage: message,
         });
+        await Promise.all([
+          this.#options.files.writeRun(completed.run),
+          this.#options.files.writeAttempt(completed.attempt),
+        ]);
       } catch (completionError) {
         console.error("failed to record worker failure", completionError);
       }
@@ -267,6 +303,9 @@ export class MobWorker {
       if (leaseHeartbeat) clearInterval(leaseHeartbeat);
       this.#active.delete(claim.runId);
       if (nativeRun) await nativeRun.forceKill().catch(() => undefined);
+      await writeTaskFileState(this.#options.store, this.#options.files, claim.taskId).catch((error) => {
+        console.error(`failed to refresh file state for task ${claim.taskId}`, error);
+      });
     }
   }
 }
