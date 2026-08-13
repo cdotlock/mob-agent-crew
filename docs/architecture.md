@@ -1,102 +1,135 @@
-# Architecture: single-server collaboration core
+# Architecture: a file-native agent environment
 
-## The product boundary
+## Product boundary
 
-Mob Agent Crew is a collaboration system with an execution capability, not an execution platform with a chat screen.
+Mob is the environment in which people and agents work together. It is not an
+agent framework, model router, skill runtime, or memory implementation.
 
 ```mermaid
 flowchart LR
-    Browser["Browser\npeople collaborate"] --> App["mob server\nFastify + React"]
-    MobCLI["mob CLI\nagent collaboration tool"] --> App
-    App --> PG["PostgreSQL\nshared durable state"]
-    App --> Worker["Embedded worker\nconcurrency = 1"]
-    Worker --> Driver["AgentDriver registry"]
-    Driver --> Pi["Pi RPC"]
-    Driver --> OMP["OMP RPC"]
-    Driver --> Claude["Claude Code CLI"]
-    Driver --> Codex["Codex CLI"]
-    Worker --> Git["Task worktree\nexclusive writer lease"]
-    Worker --> Data["/data\nrepos, artifacts, agent homes"]
+    Web["Web client"] --> API["Mob environment\nActor + Files + Commands + Events"]
+    Local["Local mob CLI / local agent"] --> API
+    Cloud["Cloud agent connector"] --> API
+    API --> Files["/data file state\nwork + knowledge + artifacts"]
+    API --> PG["PostgreSQL\nindex + queue + lease + session"]
+    API --> Worker["Embedded executor\nsmall-server default"]
+    Worker --> Any["Opaque agent CLI\nPi / OMP / Claude / Codex / future"]
 ```
 
-## Shared collaboration protocol
+Mob deliberately does not own an agent's harness, model choice, skills, prompt
+framework, or private memory. Those are opaque implementation details of the
+connected actor. The current built-in CLI drivers are compatibility connectors,
+not the domain model.
 
-Humans and agents are represented by the same `Actor` identity. A task is a durable thread rather than a transient agent run.
+## Four protocol primitives
 
-An active agent receives a scoped run token and these commands:
+1. **Actors** — stable identities for humans and agents.
+2. **Files** — readable work history, tasks, events, artifacts and knowledge.
+3. **Commands** — message, invoke, delegate, cancel, publish and complete.
+4. **Events** — normalized observable activity and terminal outcomes.
+
+Every entry point uses the same authenticated HTTP surface. The web app uses a
+session cookie; the external `mob` CLI uses the same scoped session as a Bearer
+token; an active executor receives a short-lived token restricted to one run and
+one task.
 
 ```text
-mob context                         read task, messages, participants, artifacts
-mob say "message"                   post progress or a result as the current agent
-mob delegate @agent "deliverable"  create a bounded handoff
-mob artifact add <path>             publish an explicit output
-mob done "summary"                  finish the current run
+mob login --server <url> --email <email> --password-stdin
+mob task list
+mob chat send <task-id> "@builder investigate this"
+mob agent invoke <task-id> reviewer "review the result"
+mob run watch <run-id>
+mob knowledge search "writer lease"
 ```
 
-The receiving agent is launched by the platform. Agents never shell out to another vendor CLI directly.
+## File layout
 
-## Core records
+The workspace state lives under the persistent data volume:
 
 ```text
-Workspace
-  ├─ Actor (human | agent)
-  │    └─ AgentProfile (owner, driver, role, credential home)
-  ├─ Repository (allowlisted local/remote source)
-  └─ Task
-       ├─ Message
-       ├─ Delegation (from actor/run -> agent, bounded depth)
-       ├─ Run (driver attempt and normalized events)
-       ├─ Artifact
-       └─ Approval (human-only external action)
+/data/state/workspaces/<workspace-id>/
+├── workspace.json
+├── actors/<actor-id>.json
+├── repositories/<repository-id>.json
+├── documents/<document-id>.json
+├── knowledge/
+│   ├── raw/                         immutable source material
+│   ├── wiki/                        curated Markdown knowledge
+│   ├── cache/                       disposable search projection
+│   └── manifests/                   provenance and run context selections
+└── tasks/<task-id>/
+    ├── task.json
+    ├── messages/<time>-<id>.md
+    ├── delegations/<id>.json
+    ├── runs/<run-id>/
+    │   ├── run.json
+    │   ├── attempts/<number>-<id>.json
+    │   └── events/<sequence>-<id>.json
+    ├── artifacts/<id>.json
+    └── approvals/<id>.json
 ```
 
-## CLI driver contract
+Messages keep their original Markdown body with one machine-readable metadata
+header. Other records use stable JSON. Writes use a same-directory temporary
+file and atomic rename. Runtime lease tokens, passwords, provider keys and other
+operational secrets are not workspace files.
 
-Drivers expose real capabilities instead of a lowest-common-denominator fiction:
+## File authority migration
 
-```ts
-type DriverCapabilities = {
-  streaming: boolean;
-  steer: boolean;
-  followUp: boolean;
-  resume: boolean;
-  nativeCancel: boolean;
-};
+The file protocol is the target authority for user-owned work. PostgreSQL stays
+because it is a simple, mature way to implement authentication, idempotency,
+search projections, queues and exclusive writer leases.
 
-interface AgentDriver {
-  id: string;
-  probe(profile: AgentProfile): Promise<DriverProbe>;
-  start(input: DriverRunInput): Promise<DriverRun>;
-}
-```
+The migration is intentionally staged:
 
-- Pi and OMP are duplex RPC drivers.
-- Claude Code and Codex begin as one-shot JSONL drivers.
-- A generic process manifest covers future one-shot CLIs; advanced runtimes add a small TypeScript driver.
+1. Backfill the complete current workspace into files on startup.
+2. Persist every new message, run, event and artifact to files.
+3. Keep API reads on the PostgreSQL projection while comparing it with file
+   replay.
+4. Prove that an empty projection can be rebuilt solely from files.
+5. Only then declare files the production authority and make replay the recovery
+   path.
 
-## Git collaboration
+This avoids pretending that a best-effort dual write is already a completed
+source-of-truth cutover.
 
-- A task has one branch and one worktree.
-- Only one active run may hold the write lease.
-- A read-only reviewer gets an immutable Git revision plus prior artifacts.
-- Before a handoff that changes the writer, the platform snapshots the current diff/commit state.
-- The platform, not the agent, computes the final diff and test record.
-- Only a human approval can trigger the publisher, and the publisher is the only component with SCM write credentials.
+## Built-in knowledge
 
-## Single-server now, cluster later
+The former MobWiki direction is absorbed into the environment and no separate
+MobWiki service or repository is required.
 
-The first deployment runs API and worker in one process and stores disposable worktrees and artifacts under `/data`. PostgreSQL is the only coordination dependency.
+- Uploaded Markdown is retained in `knowledge/raw/`.
+- Agents or people curate durable pages in `knowledge/wiki/` through Mob commands.
+- Search is a small rebuildable keyword index; no vector database is required.
+- Before a run, Mob searches recent task text, selects bounded excerpts, and
+  records exact paths and revisions in a context manifest.
+- A later Curator automation can use the same ordinary commands. It does not get
+  direct access to control-plane state or SCM credentials.
 
-When actual queue delay justifies it:
+## Collaboration and execution
 
-1. Run `mob serve` without an embedded worker.
-2. Run one or more `mob worker` processes against the same PostgreSQL database.
-3. Move artifacts to S3-compatible storage.
-4. Keep workspaces node-local and lease runs through PostgreSQL.
+An agent can invoke another registered actor through `mob delegate`; the
+environment launches or routes the receiving actor and records a separate run.
+Agents never invoke another vendor CLI directly. Depth, fan-out, writer leases,
+time and run budgets remain server-enforced safety limits.
 
-No API, task, message, delegation, or driver contract changes are required.
+The first deployment stays one Fastify process, one embedded executor,
+PostgreSQL and one `/data` volume. No Redis, Kubernetes, Temporal, workflow DAG,
+MobWiki sidecar or Daytona control plane is required.
 
-## Explicit security boundary
+Remote executors will use outbound claim/heartbeat/event/result operations.
+SSH PTY and localhost forwarding from Mob Sandbox are useful optional connector
+ideas, but its privileged Daytona/root/Traefik infrastructure is not part of the
+core environment.
 
-The first release accepts only administrator-allowlisted, trusted repositories. Process isolation, per-agent homes, environment filtering, worktree leases, and credential separation reduce accidents; they do not make arbitrary repository code safe.
+## Git and security boundary
 
+- Fewer than ten administrator-allowlisted trusted repositories.
+- One writable workspace lease per task.
+- Agent subprocesses never receive SCM write credentials.
+- Only a human approval may publish normal code repository changes.
+- Process and workspace separation reduce accidents; the current small-server
+  deployment is not a hostile multi-tenant sandbox.
+
+The full boundary decision is recorded in
+[ADR-001](adr/001-file-native-agent-environment.md).
