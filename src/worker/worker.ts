@@ -4,10 +4,15 @@ import type { AppConfig } from "../config.js";
 import type { CollaborationStore } from "../db/store.js";
 import type { LeaseClaim } from "../domain/model.js";
 import { issueRunToken } from "../auth/tokens.js";
-import { redactText, redactValue } from "../security/redaction.js";
 import { materializeGitWorkspace } from "../workspace/materialize.js";
 import { WorkspaceKnowledge } from "../knowledge/index.js";
 import { type FileWorkspaceStore, writeTaskFileState } from "../storage/index.js";
+import {
+  agentOutputPersistence,
+  redactRuntimeError,
+  redactRuntimePayload,
+  redactedRuntimeError,
+} from "./runtime-redaction.js";
 
 export interface WorkerOptions {
   id: string;
@@ -161,6 +166,10 @@ export class MobWorker {
     let leaseLost = false;
     let renewingLease = false;
     let leaseHeartbeat: ReturnType<typeof setInterval> | undefined;
+    const runtimeSecrets: (string | undefined)[] = [
+      this.#options.config.mobAiKey,
+      claim.token,
+    ];
     try {
       const profile = await this.#loadProfile(claim);
       if (profile.driver !== "mock" && !this.#options.drivers.has(profile.driver)) {
@@ -181,7 +190,10 @@ export class MobWorker {
             if (nativeRun) await nativeRun.cancel("Worker lease was lost");
           }
         } catch (error) {
-          console.error(`failed to renew lease for run ${claim.runId}`, error);
+          console.error(
+            `failed to renew lease for run ${claim.runId}`,
+            redactedRuntimeError(error, runtimeSecrets),
+          );
         } finally {
           renewingLease = false;
         }
@@ -199,6 +211,7 @@ export class MobWorker {
         },
         this.#options.config.sessionSecret,
       );
+      runtimeSecrets.push(token);
 
       nativeRun = await driver.run({
         jobId: claim.runId,
@@ -214,13 +227,12 @@ export class MobWorker {
         },
       });
       this.#active.set(claim.runId, nativeRun);
-      const runtimeSecrets = [this.#options.config.mobAiKey, token];
 
       for await (const event of nativeRun) {
         const storedEvent = await this.#options.store.appendRunEvent({
           claim,
           type: event.kind,
-          payload: redactValue({
+          payload: redactRuntimePayload({
             driver: event.driver,
             sequence: event.sequence,
             ...(event.nativeType ? { nativeType: event.nativeType } : {}),
@@ -249,7 +261,7 @@ export class MobWorker {
         ...(missingResult
           ? { failureCode: "missing_result", failureMessage: "Agent exited without posting mob done or returning a final message." }
           : result.error
-            ? { failureMessage: result.error }
+            ? { failureMessage: redactRuntimeError(result.error, runtimeSecrets) }
             : {}),
         ...(!missingResult && result.outcome === "timed_out" ? { failureCode: "timeout" } : {}),
       });
@@ -277,14 +289,13 @@ export class MobWorker {
             actorId: claim.agentActorId,
             sourceRunId: claim.runId,
             kind: status === "succeeded" ? "result" : "progress",
-            body: redactText(result.finalMessage, runtimeSecrets),
-            enqueueMentionedAgents: true,
+            ...agentOutputPersistence(result.finalMessage, runtimeSecrets),
           });
           await this.#options.files.writeMessage(posted.message);
         }
       }
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
+      const message = redactRuntimeError(error, runtimeSecrets);
       try {
         const completed = await this.#options.store.completeAttempt({
           claim,
@@ -297,14 +308,20 @@ export class MobWorker {
           this.#options.files.writeAttempt(completed.attempt),
         ]);
       } catch (completionError) {
-        console.error("failed to record worker failure", completionError);
+        console.error(
+          "failed to record worker failure",
+          redactedRuntimeError(completionError, runtimeSecrets),
+        );
       }
     } finally {
       if (leaseHeartbeat) clearInterval(leaseHeartbeat);
       this.#active.delete(claim.runId);
       if (nativeRun) await nativeRun.forceKill().catch(() => undefined);
       await writeTaskFileState(this.#options.store, this.#options.files, claim.taskId).catch((error) => {
-        console.error(`failed to refresh file state for task ${claim.taskId}`, error);
+        console.error(
+          `failed to refresh file state for task ${claim.taskId}`,
+          redactedRuntimeError(error, runtimeSecrets),
+        );
       });
     }
   }

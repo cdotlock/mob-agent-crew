@@ -16,7 +16,7 @@ import { normalizeGitHubRepositoryUrl } from "../domain/rules.js";
 import { parseMarkdownImport } from "../imports/context-imports.js";
 import type { MobWorker } from "../worker/worker.js";
 import { writeMobAiProviderConfig } from "../agents/mob-ai-config.js";
-import { redactText } from "../security/redaction.js";
+import { redactText, redactValue } from "../security/redaction.js";
 import { WorkspaceKnowledge } from "../knowledge/index.js";
 import {
   type FileWorkspaceStore,
@@ -358,7 +358,9 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
       sourceRunId: actor.kind === "run" ? actor.runId : null,
       kind: actor.kind === "run" ? (body.kind ?? "comment") : "comment",
       body: content,
-      enqueueMentionedAgents: true,
+      // Agent collaboration must use explicit delegation so depth, self-delegation,
+      // and run-budget guardrails cannot be bypassed with an @mention in mob say.
+      enqueueMentionedAgents: actor.kind === "session",
     });
     await writeTaskFileState(store, files, task.id);
     return result;
@@ -625,15 +627,20 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
       metadata: z.record(z.string(), z.union([z.string(), z.number(), z.boolean(), z.null()])).optional(),
     }).parse(request.body);
     const knowledge = knowledgeFor(files, actor.workspaceId);
+    const bearer = request.headers.authorization?.match(/^Bearer\s+(.+)$/iu)?.[1];
+    const runtimeSecrets = actor.kind === "run" ? [config.mobAiKey, bearer] : [];
+    const metadata = {
+      ...(body.metadata ?? {}),
+      writtenByActorId: actor.actorId,
+      ...(actor.kind === "run" ? { sourceRunId: actor.runId } : {}),
+    };
     const input = {
-      path: body.path,
-      content: body.content,
-      source: body.source ?? `api:${actor.kind}`,
-      metadata: {
-        ...(body.metadata ?? {}),
-        writtenByActorId: actor.actorId,
-        ...(actor.kind === "run" ? { sourceRunId: actor.runId } : {}),
-      },
+      path: actor.kind === "run" ? redactText(body.path, runtimeSecrets) : body.path,
+      content: actor.kind === "run" ? redactText(body.content, runtimeSecrets) : body.content,
+      source: actor.kind === "run"
+        ? redactText(body.source ?? `api:${actor.kind}`, runtimeSecrets)
+        : (body.source ?? `api:${actor.kind}`),
+      metadata: actor.kind === "run" ? redactValue(metadata, runtimeSecrets) : metadata,
     };
     return area === "raw" ? knowledge.writeRaw(input) : knowledge.writeWiki(input);
   });
