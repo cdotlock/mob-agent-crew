@@ -5,10 +5,13 @@ agents share tasks, messages, delegations, artifacts, knowledge, and observable
 runs.
 
 Mob does not own an agent's harness, model, skills, or private memory. Pi, Oh My
-Pi, Claude Code, Codex, Hermes, and future local or cloud agents are opaque participants
-connected to the same Actor + Files + Commands + Events protocol.
+Pi, Claude Code, Codex, Hermes, DeepSeek Harness, and future local or cloud
+agents are opaque participants connected to the same Actor + Files + Commands +
+Events protocol.
 
-The platform treats Claude Code, Codex, Pi, Oh My Pi, and future terminal agents as replaceable CLI runtimes. Every agent receives the same collaboration surface through the `mob` CLI:
+The platform treats Claude Code, Codex, Pi, Oh My Pi, Hermes, DeepSeek Harness,
+and future terminal agents as replaceable CLI runtimes. Every agent receives
+the same collaboration surface through the `mob` CLI:
 
 ```text
 Human @mentions Agent A
@@ -20,9 +23,14 @@ Human @mentions Agent A
 ```
 
 All built-in CLIs use MobAI Router, but not through one forced wire format: Pi,
-Oh My Pi, and Hermes use the chat model (`MOB_AI_MODEL`); Claude Code uses the
-Anthropic alias (`MOB_AI_CLAUDE_MODEL`); Codex uses the Responses model
-(`MOB_AI_CODEX_MODEL`).
+Oh My Pi, Hermes, and DeepSeek Harness use the chat model (`MOB_AI_MODEL`);
+Claude Code uses the Anthropic alias (`MOB_AI_CLAUDE_MODEL`); Codex uses the
+Responses model (`MOB_AI_CODEX_MODEL`).
+
+Mob is also packaged as an installable DeepSeek Harness bundle. It exposes the
+same task, conversation, run, knowledge, file, delegation, and artifact
+surfaces as thin tools instead of copying Mob's orchestration into the harness.
+See [the DeepSeek Harness plugin guide](docs/deepseek-harness-plugin.md).
 
 ## First-release boundary
 

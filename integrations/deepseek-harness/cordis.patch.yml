@@ -1,0 +1,12 @@
+# Installable DeepSeek Harness bundle layer. The base profile provides the
+# tools, skills and commands services injected by this plugin.
+- insert:
+    - id: mob-agent-crew
+      name: mob-agent-crew-dsh-plugin
+      config:
+        executable: mob
+        timeoutMs: 30000
+        maxOutputBytes: 1048576
+        fileApiBaseUrl: ''
+        fileApiTokenEnv: MOB_DSH_TOKEN
+        allowInsecureFileApi: false
