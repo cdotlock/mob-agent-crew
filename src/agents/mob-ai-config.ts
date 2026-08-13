@@ -112,6 +112,18 @@ wire_api = "responses"
 requires_openai_auth = false
 `;
   await writeReadableProviderFile(join(directory, "config.toml"), codexConfig);
+
+  // dsh headless has no model flag. Its documented --patch layer is the
+  // secret-free way to select Mob's configured model for each fresh session.
+  const deepSeekHarnessPatch = `- id: agent-default-model
+  config:
+    provider: deepseek-official
+    model: ${yamlString(input.model)}
+`;
+  await writeReadableProviderFile(
+    join(directory, "dsh.cordis.patch.yml"),
+    deepSeekHarnessPatch,
+  );
 }
 
 async function writeReadableProviderFile(path: string, contents: string): Promise<void> {

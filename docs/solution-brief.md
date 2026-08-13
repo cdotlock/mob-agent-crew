@@ -20,7 +20,7 @@ Build a shared task workspace where humans and agents are both named collaborato
 1. **Shared task threads:** Humans and agents post into one auditable conversation with mentions, status, artifacts, and decisions.
 2. **Personal and shared agents:** Every agent has an owner, name, role, CLI driver, isolated credential home, and visible availability.
 3. **Bounded delegation:** Agents can ask another agent for analysis, implementation, or review through the platform, with depth, concurrency, and budget limits.
-4. **Pluggable CLI drivers:** Pi, OMP, Claude Code, and Codex use one capability-aware driver interface; future one-shot JSONL CLIs can be registered without changing collaboration logic.
+4. **Pluggable CLI drivers:** Pi, OMP, Claude Code, Codex, Hermes, and DeepSeek Harness use one capability-aware driver interface; future CLI protocols can be registered without changing collaboration logic.
 5. **Safe Git handoff:** Each task owns a branch/worktree and a single writable lease. Humans approve any push or pull request action.
 
 ## Success Metrics
@@ -59,4 +59,3 @@ Build a shared task workspace where humans and agents are both named collaborato
 2. Run a complete thread using the mock driver and two agents.
 3. Add Codex and Claude one-shot drivers, then Pi/OMP duplex drivers.
 4. Validate one real repository task with a human-approved patch.
-

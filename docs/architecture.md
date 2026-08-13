@@ -13,7 +13,7 @@ flowchart LR
     API --> Files["/data file state\nwork + knowledge + artifacts"]
     API --> PG["PostgreSQL\nindex + queue + lease + session"]
     API --> Worker["Embedded executor\nsmall-server default"]
-    Worker --> Any["Opaque agent CLI\nPi / OMP / Claude / Codex / Hermes / future"]
+    Worker --> Any["Opaque agent CLI\nPi / OMP / Claude / Codex / Hermes / DeepSeek / future"]
 ```
 
 Mob deliberately does not own an agent's harness, model choice, skills, prompt
@@ -83,8 +83,8 @@ operational secrets are not workspace files.
 Secret-free CLI provider files live separately under `/data/agents/<actor-id>`.
 They are generated from environment configuration and are not part of the
 workspace replay ledger. The built-in mapping is deliberately per harness:
-Pi/OMP/Hermes use the Router chat model, Claude Code uses an Anthropic model
-alias, and Codex uses a Responses model.
+Pi/OMP/Hermes/DeepSeek Harness use the Router chat model, Claude Code uses an
+Anthropic model alias, and Codex uses a Responses model.
 
 In production, provider calls go through a run-token-authenticated local MobAI
 proxy. The real Router key stays in the control process. CLI processes run under

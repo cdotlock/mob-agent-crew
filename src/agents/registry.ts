@@ -1,5 +1,6 @@
 import { ClaudeCodeDriver } from "./claude-driver.js";
 import { CodexExecDriver } from "./codex-driver.js";
+import { DeepSeekHarnessDriver } from "./deepseek-driver.js";
 import { HermesDriver } from "./hermes-driver.js";
 import { MockDriver } from "./mock-driver.js";
 import { OmpRpcDriver } from "./omp-rpc-driver.js";
@@ -44,6 +45,7 @@ export interface DefaultAgentDriverRegistryOptions {
   readonly pi?: CliDriverOptions;
   readonly omp?: CliDriverOptions;
   readonly hermes?: CliDriverOptions;
+  readonly deepseek?: CliDriverOptions;
 }
 
 export function createDefaultAgentDriverRegistry(
@@ -56,5 +58,6 @@ export function createDefaultAgentDriverRegistry(
     new PiRpcDriver(options.pi),
     new OmpRpcDriver(options.omp),
     new HermesDriver(options.hermes),
+    new DeepSeekHarnessDriver(options.deepseek),
   ]);
 }

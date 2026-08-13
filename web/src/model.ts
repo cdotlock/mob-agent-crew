@@ -211,7 +211,7 @@ export interface NewConversationInput {
 export interface NewAgentInput {
   handle: string;
   name: string;
-  driver: "pi" | "omp" | "claude" | "codex" | "hermes";
+  driver: "pi" | "omp" | "claude" | "codex" | "hermes" | "deepseek";
   role: string;
 }
 

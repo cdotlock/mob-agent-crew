@@ -4,7 +4,8 @@ export type AgentDriverId =
   | "claude"
   | "pi"
   | "omp"
-  | "hermes";
+  | "hermes"
+  | "deepseek";
 
 export type AgentTransport = "in-process" | "one-shot" | "duplex-jsonl";
 

@@ -310,13 +310,22 @@ describe("conversation API", () => {
 });
 
 describe("Agent identity API", () => {
-  it("creates a thin file-backed Agent connector profile", async () => {
+  it.each([
+    {
+      driver: "hermes" as const,
+      capabilities: { streaming: true, steer: true, followUp: false, nativeCancel: true },
+    },
+    {
+      driver: "deepseek" as const,
+      capabilities: { streaming: false, steer: false, followUp: false, nativeCancel: false },
+    },
+  ])("creates a thin file-backed $driver connector profile", async ({ driver, capabilities }) => {
     const fixture = await createFixture();
     const createActor = vi.fn(async () => ({
       ...agent,
       id: "99999999-9999-4999-8999-999999999999",
-      handle: "hermes-reviewer",
-      displayName: "Hermes Reviewer",
+      handle: `${driver}-reviewer`,
+      displayName: `${driver} Reviewer`,
     }));
     const createAgentProfile = vi.fn(async (input: Record<string, unknown>) => ({
       ...input,
@@ -329,18 +338,18 @@ describe("Agent identity API", () => {
       url: "/api/agents",
       headers: { authorization: `Bearer ${sessionToken()}` },
       payload: {
-        handle: "hermes-reviewer",
-        name: "Hermes Reviewer",
-        driver: "hermes",
+        handle: `${driver}-reviewer`,
+        name: `${driver} Reviewer`,
+        driver,
         role: "Independent reviewer",
       },
     });
 
     expect(response.statusCode).toBe(200);
     expect(createAgentProfile).toHaveBeenCalledWith(expect.objectContaining({
-      driver: "hermes",
+      driver,
       role: "Independent reviewer",
-      capabilities: expect.objectContaining({ steer: true, followUp: false }),
+      capabilities: expect.objectContaining(capabilities),
     }));
     expect(fixture.writeActor).toHaveBeenCalledOnce();
     expect(fixture.writeAgentProfile).toHaveBeenCalledOnce();

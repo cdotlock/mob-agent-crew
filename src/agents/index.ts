@@ -6,6 +6,7 @@ export * from "./driver-options.js";
 export * from "./mock-driver.js";
 export * from "./codex-driver.js";
 export * from "./claude-driver.js";
+export * from "./deepseek-driver.js";
 export * from "./pi-rpc-driver.js";
 export * from "./omp-rpc-driver.js";
 export * from "./hermes-driver.js";
@@ -17,6 +18,7 @@ export { CodexExecDriver as CodexDriver } from "./codex-driver.js";
 export { ClaudeCodeDriver as ClaudeDriver } from "./claude-driver.js";
 export { PiRpcDriver as PiDriver } from "./pi-rpc-driver.js";
 export { OmpRpcDriver as OmpDriver } from "./omp-rpc-driver.js";
+export { DeepSeekHarnessDriver as DeepSeekDriver } from "./deepseek-driver.js";
 export {
   AgentDriverRegistry as DriverRegistry,
   createDefaultAgentDriverRegistry as createDefaultDriverRegistry,

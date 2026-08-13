@@ -282,7 +282,7 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
       handle: z.string().min(1).max(64).regex(/^[A-Za-z0-9][A-Za-z0-9_-]*$/u),
       name: z.string().min(1).max(120),
       role: z.string().max(500).default("Coding collaborator"),
-      driver: z.enum(["pi", "omp", "claude", "codex", "hermes"]),
+      driver: z.enum(["pi", "omp", "claude", "codex", "hermes", "deepseek"]),
     }).parse(request.body);
     const actors = await store.listActors(actor.workspaceId);
     if (actors.some((candidate) => candidate.handle.toLowerCase() === body.handle.toLowerCase())) {
@@ -1204,10 +1204,10 @@ function runStatusSummary(status: string): string {
   return "Agent run was cancelled.";
 }
 
-function connectorCapabilities(driver: "pi" | "omp" | "claude" | "codex" | "hermes") {
+function connectorCapabilities(driver: "pi" | "omp" | "claude" | "codex" | "hermes" | "deepseek") {
   const duplex = driver === "pi" || driver === "omp" || driver === "hermes";
   return {
-    streaming: true,
+    streaming: driver !== "deepseek",
     steer: duplex,
     followUp: driver === "pi" || driver === "omp",
     resume: false,

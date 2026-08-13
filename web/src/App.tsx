@@ -1096,7 +1096,7 @@ function NewAgentModal({ busy, error, onClose, onSubmit }: { busy: boolean; erro
           <label><span>Display name</span><input required value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} placeholder="Researcher" /></label>
         </div>
         <label><span>CLI connector</span><select value={form.driver} onChange={(event) => setForm({ ...form, driver: event.target.value as NewAgentInput["driver"] })}>
-          <option value="pi">Pi</option><option value="omp">Oh My Pi</option><option value="claude">Claude Code</option><option value="codex">Codex</option><option value="hermes">Hermes</option>
+          <option value="pi">Pi</option><option value="omp">Oh My Pi</option><option value="claude">Claude Code</option><option value="codex">Codex</option><option value="hermes">Hermes</option><option value="deepseek">DeepSeek Harness</option>
         </select></label>
         <label><span>Role</span><input required value={form.role} onChange={(event) => setForm({ ...form, role: event.target.value })} placeholder="Repository research and documentation" /></label>
         <div className="selected-agent agent-definition-preview"><span className="agent-definition-mark"><Code /></span><span><strong>@{form.handle || "handle"} · {form.driver}</strong><small>Thin connector only · no planner privilege · no Mob-owned model layer</small></span></div>

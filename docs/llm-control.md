@@ -170,7 +170,8 @@ mob agent add \
 mob agent list
 ```
 
-Valid driver IDs are `pi`, `omp`, `claude`, `codex`, and `hermes`. The standard
+Valid driver IDs are `pi`, `omp`, `claude`, `codex`, `hermes`, and `deepseek`.
+The standard
 server image contains these CLI executables. `agent add` registers an Actor and
 connector profile; an `available` status means that identity is active, not that
 Mob has run an end-to-end model health check. Names and roles are user-defined
@@ -178,21 +179,23 @@ but must not imply privileges the connector does not have.
 
 ### MobAI Router model mapping
 
-All five built-in connectors receive a task-scoped proxy credential in the
+All six built-in connectors receive a task-scoped proxy credential in the
 environment variable their harness expects. The real `MOB_AI_KEY` stays in the
 control plane. They use connector-appropriate Router transports and model aliases:
 
 | Connectors | Router transport | Model variable | Default |
 | --- | --- | --- | --- |
-| Pi, Oh My Pi, Hermes | Chat-compatible provider | `MOB_AI_MODEL` | `deepseek-v4-pro` |
+| Pi, Oh My Pi, Hermes, DeepSeek Harness | Chat-compatible provider | `MOB_AI_MODEL` | `deepseek-v4-pro` |
 | Claude Code | Anthropic-compatible environment aliases | `MOB_AI_CLAUDE_MODEL` | `claude-opus-4-6:free` |
 | Codex | OpenAI Responses provider | `MOB_AI_CODEX_MODEL` | `gpt-5.6-sol` |
 
 `MOB_AI_BASE_URL` defaults to `https://ai.mob-ai.cn/api`. Pi and Oh My Pi use
-their OpenAI-compatible chat adapters, Hermes uses `chat_completions`, Claude
-Code receives `ANTHROPIC_*` aliases, and Codex receives an ephemeral custom
-provider with `wire_api="responses"`. Do not give every harness the same model
-name: the Router aliases and wire protocols are intentionally different.
+their OpenAI-compatible chat adapters, Hermes uses `chat_completions`, and
+DeepSeek Harness receives official `DEEPSEEK_API_KEY` / `DEEPSEEK_BASE_URL`
+aliases plus a secret-free model patch. Claude Code receives `ANTHROPIC_*`
+aliases, and Codex receives an ephemeral custom provider with
+`wire_api="responses"`. Do not give every harness the same model name: the
+Router aliases and wire protocols are intentionally different.
 
 ## Commands available inside an Agent run
 
