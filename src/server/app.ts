@@ -927,7 +927,7 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
         {
           method: "POST",
           headers: upstreamHeaders,
-          body: JSON.stringify(request.body ?? {}),
+          body: JSON.stringify(providerRequestBody(endpoint, request)),
           signal: controller.signal,
         },
       );
@@ -1335,6 +1335,27 @@ async function assertActiveRunClaims(
 
 function providerProxyBaseUrl(config: AppConfig): string {
   return `http://127.0.0.1:${config.port}/api/provider`;
+}
+
+function providerRequestBody(
+  endpoint: "chat/completions" | "messages" | "responses",
+  request: FastifyRequest,
+): unknown {
+  const body = request.body ?? {};
+  if (
+    endpoint !== "chat/completions" ||
+    typeof request.headers["x-deepseek-harness-user-id"] !== "string" ||
+    !body ||
+    typeof body !== "object" ||
+    Array.isArray(body)
+  ) {
+    return body;
+  }
+
+  const compatibleBody = { ...(body as Record<string, unknown>) };
+  delete compatibleBody.reasoning_effort;
+  delete compatibleBody.thinking;
+  return compatibleBody;
 }
 
 const safeWorkspaceFileRoots = new Set(["documents", "knowledge"]);

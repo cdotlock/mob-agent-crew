@@ -64,6 +64,82 @@ describe("server Agent security boundaries", () => {
     expect(headers.get("authorization")).not.toContain(runToken);
   });
 
+  it("removes unsupported top-level reasoning fields only from DeepSeek Harness chat requests", async () => {
+    const fixture = await createFixture();
+    const runToken = issueRunToken(
+      { actorId: AGENT_ID, workspaceId: WORKSPACE_ID, taskId: TASK_ID, runId: RUN_ID, attemptId: ATTEMPT_ID },
+      SESSION_SECRET,
+    );
+    const fetchMock = vi.fn(async (_input: string | URL | Request, _init?: RequestInit) => new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("data: compatible\n\n"));
+        controller.close();
+      },
+    }), { status: 200, headers: { "content-type": "text/event-stream" } }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await fixture.app.inject({
+      method: "POST",
+      url: "/api/provider/v1/chat/completions",
+      headers: {
+        authorization: `Bearer ${runToken}`,
+        accept: "text/event-stream",
+        "x-deepseek-harness-user-id": "deepseek-smoke",
+      },
+      payload: {
+        model: "test-model",
+        stream: true,
+        reasoning_effort: "high",
+        thinking: { type: "enabled" },
+        metadata: { reasoning_effort: "preserve-nested" },
+        messages: [],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.body).toBe("data: compatible\n\n");
+    const [, init] = fetchMock.mock.calls[0]!;
+    expect(JSON.parse(String(init?.body))).toEqual({
+      model: "test-model",
+      stream: true,
+      metadata: { reasoning_effort: "preserve-nested" },
+      messages: [],
+    });
+  });
+
+  it.each([
+    ["another CLI chat request", "/api/provider/v1/chat/completions", {}],
+    ["a DeepSeek Harness messages request", "/api/provider/v1/messages", { "x-deepseek-harness-user-id": "deepseek-smoke" }],
+  ])("preserves reasoning fields for %s", async (_case, url, clientHeaders) => {
+    const fixture = await createFixture();
+    const runToken = issueRunToken(
+      { actorId: AGENT_ID, workspaceId: WORKSPACE_ID, taskId: TASK_ID, runId: RUN_ID, attemptId: ATTEMPT_ID },
+      SESSION_SECRET,
+    );
+    const fetchMock = vi.fn(async (_input: string | URL | Request, _init?: RequestInit) => new Response("{}", {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    const payload = {
+      model: "test-model",
+      reasoning_effort: "high",
+      thinking: { type: "enabled" },
+      messages: [],
+    };
+
+    const response = await fixture.app.inject({
+      method: "POST",
+      url,
+      headers: { authorization: `Bearer ${runToken}`, ...clientHeaders },
+      payload,
+    });
+
+    expect(response.statusCode).toBe(200);
+    const [, init] = fetchMock.mock.calls[0]!;
+    expect(JSON.parse(String(init?.body))).toEqual(payload);
+  });
+
   it("rejects human sessions and mismatched run claims before contacting MobAI", async () => {
     const fixture = await createFixture();
     const fetchMock = vi.fn();
