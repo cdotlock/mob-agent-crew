@@ -34,7 +34,22 @@ export class CodexExecDriver implements AgentDriver {
   }
 
   run(input: AgentRunInput): Promise<AgentRun> {
+    const merged = mergeRunEnvironment(this.#options.env, input.env);
+    const routerBaseUrl = merged.MOB_AI_BASE_URL?.replace(/\/$/u, "");
+    const routerModel = merged.MOB_AI_CODEX_MODEL ?? "gpt-5.6-sol";
+    const providerArgs = merged.MOB_AI_KEY && routerBaseUrl
+      ? [
+          "-c", 'model_provider="mob_ai"',
+          "-c", 'model_providers.mob_ai.name="MobAI Router"',
+          "-c", `model_providers.mob_ai.base_url=${JSON.stringify(`${routerBaseUrl}/v1`)}`,
+          "-c", 'model_providers.mob_ai.env_key="MOB_AI_KEY"',
+          "-c", 'model_providers.mob_ai.wire_api="responses"',
+          "-c", "model_providers.mob_ai.requires_openai_auth=false",
+          "-m", routerModel,
+        ]
+      : [];
     const args = [
+      ...providerArgs,
       "exec",
       "--json",
       "--ephemeral",
@@ -54,7 +69,7 @@ export class CodexExecDriver implements AgentDriver {
       mapper: mapCodexEvent,
       command: this.#options.command ?? "codex",
       args,
-      env: mergeRunEnvironment(this.#options.env, input.env),
+      env: merged,
       ...(this.#options.envAllowlist
         ? { envAllowlist: this.#options.envAllowlist }
         : {}),

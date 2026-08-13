@@ -7,7 +7,7 @@ export type TaskStatus =
   | "failed"
   | "cancelled";
 
-export type TaskResolution = "unreviewed" | "accepted" | "rejected" | "pr_created";
+export type TaskResolution = "unreviewed" | "accepted" | "rejected" | "branch_published" | "pr_created";
 
 export type AgentStatus = "available" | "working" | "reviewing" | "offline" | "error";
 
@@ -22,6 +22,8 @@ export type RunStatus =
   | "skipped";
 
 export type ActorKind = "human" | "agent" | "system";
+
+export type ConversationKind = "direct" | "group";
 
 export type ArtifactKind = "patch" | "diff" | "report" | "plan" | "log" | "file";
 
@@ -48,6 +50,30 @@ export interface AgentProfile {
   capabilities: string[];
   currentTaskId: string | null;
   color: string;
+}
+
+export interface ConversationMember {
+  id: string;
+  name: string;
+  handle: string;
+  kind: "human" | "agent";
+  initials: string;
+}
+
+export interface ConversationSummary {
+  id: string;
+  taskId: string;
+  kind: ConversationKind;
+  title: string | null;
+  isPrimary: boolean;
+  updatedAt: string;
+  members: ConversationMember[];
+  lastMessage: ThreadMessage | null;
+}
+
+export interface ConversationDetail extends ConversationSummary {
+  messages: ThreadMessage[];
+  runs: AgentRun[];
 }
 
 export interface TaskSummary {
@@ -86,6 +112,48 @@ export interface AgentRun {
   finishedAt: string | null;
   summary: string;
   parentRunId: string | null;
+}
+
+export interface RunEvent {
+  sequence: number;
+  type: string;
+  payload: Record<string, unknown>;
+  createdAt: string;
+}
+
+export type FileScope = "workspace" | "repository";
+
+export interface FileEntry {
+  name: string;
+  path: string;
+  kind: "directory" | "file";
+  bytes: number | null;
+  updatedAt: string;
+}
+
+export interface FileListing {
+  scope: FileScope;
+  path: string;
+  entries: FileEntry[];
+}
+
+export interface FileContents {
+  scope: FileScope;
+  path: string;
+  name: string;
+  bytes: number;
+  language: string;
+  content: string;
+  truncated: boolean;
+}
+
+export interface KnowledgeEntry {
+  path: string;
+  area: "raw" | "wiki";
+  title: string;
+  bytes: number;
+  revision: string;
+  updatedAt: string;
 }
 
 export interface Artifact {
@@ -131,6 +199,20 @@ export interface NewTaskInput {
 export interface DelegationInput {
   agentId: string;
   deliverable: string;
+}
+
+export interface NewConversationInput {
+  taskId: string;
+  kind: ConversationKind;
+  title?: string | null;
+  members: string[];
+}
+
+export interface NewAgentInput {
+  handle: string;
+  name: string;
+  driver: "pi" | "omp" | "claude" | "codex" | "hermes";
+  role: string;
 }
 
 export interface ImportedContext {

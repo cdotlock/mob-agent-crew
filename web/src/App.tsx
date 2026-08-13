@@ -34,13 +34,19 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, KeyboardEvent as ReactKeyboardEvent, ReactNode } from "react";
 import {
   cancelRun,
+  createAgent,
+  createConversation,
   createSession,
   createTask,
   fetchBootstrap,
+  fetchConversation,
+  fetchConversations,
   fetchTask,
   importGithubUrl,
   postDelegation,
+  postConversationMessage,
   postMessage,
+  publishTask,
   retryRun,
   reviewTask,
   uploadMarkdown,
@@ -51,12 +57,19 @@ import {
   demoBootstrap,
   getDemoTask,
 } from "./demo.js";
+import { WorkspaceInspector } from "./WorkspaceInspector.js";
+
+const allowDemoFallback = import.meta.env.DEV;
 import type {
   AgentProfile,
   AgentRun,
   Artifact,
   BootstrapData,
+  ConversationDetail,
+  ConversationSummary,
   ImportedContext,
+  NewAgentInput,
+  NewConversationInput,
   NewTaskInput,
   TaskDetail,
   TaskStatus,
@@ -66,7 +79,7 @@ import type {
 
 type LoadState = "loading" | "ready" | "error";
 type MobilePane = "tasks" | "thread" | "crew";
-type ModalKind = "new-task" | "delegate" | "github" | null;
+type ModalKind = "new-task" | "new-conversation" | "new-agent" | "delegate" | "github" | null;
 type AuthState = "login" | "signing-in" | "authenticated";
 
 const taskStatusCopy: Record<TaskStatus, string> = {
@@ -91,6 +104,27 @@ function slug(value: string): string {
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-|-$/g, "")
     .slice(0, 32) || "untitled-task";
+}
+
+function primaryConversationFor(task: TaskSummary): ConversationSummary {
+  return {
+    id: task.id,
+    taskId: task.id,
+    kind: "group",
+    title: task.title,
+    isPrimary: true,
+    updatedAt: task.updatedAt,
+    members: [],
+    lastMessage: null,
+  };
+}
+
+function conversationTitle(conversation: ConversationSummary, currentUserId: string): string {
+  if (conversation.title?.trim()) return conversation.title;
+  if (conversation.kind === "direct") {
+    return conversation.members.find((member) => member.id !== currentUserId)?.name ?? "Direct chat";
+  }
+  return "Group chat";
 }
 
 function relativeTime(value: string): string {
@@ -150,6 +184,15 @@ function renderMessageContent(content: string) {
       <span key={`${part}-${index}`}>{part}</span>
     ),
   );
+}
+
+function visibleMessageContent(message: ThreadMessage): string {
+  if (message.actorKind !== "agent") return message.content;
+  return message.content
+    .split("\n")
+    .filter((line) => line.trim().toLowerCase() !== "mob done")
+    .join("\n")
+    .trim();
 }
 
 function Avatar({
@@ -215,22 +258,32 @@ function FatalError({ message, onRetry }: { message: string; onRetry: () => void
 function TaskSidebar({
   bootstrap,
   tasks,
+  conversations,
   selectedTaskId,
+  selectedConversationId,
   search,
   source,
   onSearch,
   onSelect,
+  onSelectConversation,
   onNewTask,
+  onNewConversation,
+  onNewAgent,
   onReconnect,
 }: {
   bootstrap: BootstrapData;
   tasks: TaskSummary[];
+  conversations: ConversationSummary[];
   selectedTaskId: string | null;
+  selectedConversationId: string | null;
   search: string;
   source: "api" | "demo";
   onSearch: (value: string) => void;
   onSelect: (taskId: string) => void;
+  onSelectConversation: (conversation: ConversationSummary) => void;
   onNewTask: () => void;
+  onNewConversation: () => void;
+  onNewAgent: () => void;
   onReconnect: () => void;
 }) {
   return (
@@ -248,6 +301,11 @@ function TaskSidebar({
         <span className="key-hint">N</span>
       </button>
 
+      <div className="sidebar-create-actions" aria-label="Workspace creation actions">
+        <button onClick={onNewConversation}><ChatCircleDots /><span>New chat</span></button>
+        <button onClick={onNewAgent}><Plus /><span>Add Agent</span></button>
+      </div>
+
       <label className="sidebar-search">
         <MagnifyingGlass aria-hidden="true" />
         <span className="sr-only">Search task channels</span>
@@ -255,17 +313,17 @@ function TaskSidebar({
       </label>
 
       <div className="channel-heading">
-        <span>Task channels</span>
+        <span>Primary groups</span>
         <span>{tasks.length}</span>
       </div>
 
       <nav className="task-list" aria-label="Task channels">
         {tasks.length ? tasks.map((task) => (
           <button
-            className={classNames("task-item", task.id === selectedTaskId && "is-selected")}
+            className={classNames("task-item", task.id === selectedTaskId && selectedConversationId === task.id && "is-selected")}
             key={task.id}
             onClick={() => onSelect(task.id)}
-            aria-current={task.id === selectedTaskId ? "page" : undefined}
+            aria-current={task.id === selectedTaskId && selectedConversationId === task.id ? "page" : undefined}
           >
             <span className={classNames("task-state-icon", `tone-${statusTone(task.status)}`)}>
               {task.status === "review_ready" ? <CheckCircle weight="fill" /> : <Hash weight="bold" />}
@@ -275,7 +333,7 @@ function TaskSidebar({
                 <strong>{slug(task.title)}</strong>
                 <time dateTime={task.updatedAt}>{relativeTime(task.updatedAt)}</time>
               </span>
-              <span className="task-item-summary">{task.summary || task.repository}</span>
+              <span className="task-item-summary"><span className="conversation-kind">group</span>{task.summary || task.repository}</span>
             </span>
             {task.unread > 0 ? <span className="unread-count" aria-label={`${task.unread} unread`}>{task.unread}</span> : null}
           </button>
@@ -286,6 +344,34 @@ function TaskSidebar({
             <span>Try another search or start a task.</span>
           </div>
         )}
+        {conversations.length ? (
+          <>
+            <div className="channel-heading chat-heading"><span>Direct & group</span><span>{conversations.length}</span></div>
+            {conversations.map((conversation) => {
+              const label = conversationTitle(conversation, bootstrap.currentUser.id);
+              const lastMessage = conversation.lastMessage?.content;
+              return (
+                <button
+                  className={classNames("task-item conversation-item", selectedConversationId === conversation.id && "is-selected")}
+                  key={conversation.id}
+                  onClick={() => onSelectConversation(conversation)}
+                  aria-current={selectedConversationId === conversation.id ? "page" : undefined}
+                >
+                  <span className="task-state-icon conversation-icon">
+                    {conversation.kind === "direct" ? <ChatCircleDots weight="bold" /> : <UsersThree weight="bold" />}
+                  </span>
+                  <span className="task-item-copy">
+                    <span className="task-item-line">
+                      <strong>{label}</strong>
+                      <time dateTime={conversation.updatedAt}>{relativeTime(conversation.updatedAt)}</time>
+                    </span>
+                    <span className="task-item-summary"><span className="conversation-kind">{conversation.kind}</span>{lastMessage || "No messages yet"}</span>
+                  </span>
+                </button>
+              );
+            })}
+          </>
+        ) : null}
       </nav>
 
       <div className="sidebar-footer">
@@ -318,6 +404,7 @@ function MessageItem({
   artifacts: Artifact[];
   onOpenArtifact: (artifactId: string) => void;
 }) {
+  const visibleContent = visibleMessageContent(message);
   const linkedArtifacts = message.artifactIds
     .map((id) => artifacts.find((artifact) => artifact.id === id))
     .filter((artifact): artifact is Artifact => Boolean(artifact));
@@ -326,7 +413,7 @@ function MessageItem({
       <article className="system-message">
         <span className="system-line" />
         <ShieldCheck weight="duotone" />
-        <p>{renderMessageContent(message.content)}</p>
+        {visibleContent ? <p>{renderMessageContent(visibleContent)}</p> : null}
         <time title={absoluteTime(message.createdAt)}>{relativeTime(message.createdAt)}</time>
       </article>
     );
@@ -342,7 +429,7 @@ function MessageItem({
           {message.delivery === "pending" ? <SpinnerGap className="spin" aria-label="Sending" /> : null}
           {message.delivery === "failed" ? <WarningCircle className="error-icon" aria-label="Failed to send" /> : null}
         </div>
-        <p>{renderMessageContent(message.content)}</p>
+        {visibleContent ? <p>{renderMessageContent(visibleContent)}</p> : null}
         {linkedArtifacts.length ? (
           <div className="message-artifacts">
             {linkedArtifacts.map((artifact) => (
@@ -362,24 +449,31 @@ function MessageItem({
 function Composer({
   task,
   agents,
+  runAgents,
+  conversationKind,
   value,
   busy,
   onChange,
   onSend,
+  onRunAgent,
   onUpload,
   onOpenGithub,
 }: {
   task: TaskDetail;
   agents: AgentProfile[];
+  runAgents: AgentProfile[];
+  conversationKind: ConversationSummary["kind"];
   value: string;
   busy: boolean;
   onChange: (value: string) => void;
   onSend: () => void;
+  onRunAgent: (agentId: string) => void;
   onUpload: (file: File) => void;
   onOpenGithub: () => void;
 }) {
   const uploadRef = useRef<HTMLInputElement>(null);
   const [mentionIndex, setMentionIndex] = useState(0);
+  const [runAgentId, setRunAgentId] = useState(runAgents[0]?.id ?? "");
   const mentionMatch = value.match(/(?:^|\s)@([\w-]*)$/);
   const mentionQuery = mentionMatch?.[1]?.toLowerCase() ?? null;
   const matches = mentionQuery === null
@@ -387,6 +481,9 @@ function Composer({
     : agents.filter((agent) => agent.name.toLowerCase().startsWith(mentionQuery)).slice(0, 5);
 
   useEffect(() => setMentionIndex(0), [mentionQuery]);
+  useEffect(() => {
+    if (!runAgents.some((agent) => agent.id === runAgentId)) setRunAgentId(runAgents[0]?.id ?? "");
+  }, [runAgentId, runAgents]);
 
   function insertMention(agent: AgentProfile) {
     const start = mentionMatch?.index ?? value.length;
@@ -447,7 +544,7 @@ function Composer({
           value={value}
           onChange={(event) => onChange(event.target.value)}
           onKeyDown={onKeyDown}
-          placeholder={`Message #${slug(task.title)} · type @ to involve an agent`}
+          placeholder={`Message ${conversationKind === "direct" ? "this direct chat" : `#${slug(task.title)}`} · sending does not run an Agent`}
           rows={3}
           disabled={busy}
           aria-label="Message the task thread"
@@ -474,11 +571,26 @@ function Composer({
             <button className="composer-tool" onClick={() => onChange(`${value}${value && !value.endsWith(" ") ? " " : ""}@`)} aria-label="Mention an agent" title="Mention an agent">
               <At />
             </button>
-            <span className="composer-hint">Markdown · ⌘↵ to send</span>
+            <span className="composer-hint">Chat only · ⌘↵ to send</span>
           </div>
-          <button className="send-button" onClick={onSend} disabled={!value.trim() || busy} aria-label="Send message">
-            {busy ? <SpinnerGap className="spin" /> : <PaperPlaneRight weight="fill" />}
-          </button>
+          <div className="composer-submit-actions">
+            {runAgents.length ? (
+              <div className="run-agent-control">
+                {runAgents.length > 1 ? (
+                  <select value={runAgentId} onChange={(event) => setRunAgentId(event.target.value)} aria-label="Agent to run">
+                    {runAgents.map((agent) => <option key={agent.id} value={agent.id}>{agent.name}</option>)}
+                  </select>
+                ) : null}
+                <button className="run-agent-button" onClick={() => onRunAgent(runAgentId)} disabled={!value.trim() || busy || !runAgentId} aria-label={`Run ${runAgents.find((agent) => agent.id === runAgentId)?.name ?? "Agent"} with this instruction`}>
+                  {busy ? <SpinnerGap className="spin" /> : <Code />}
+                  <span>{runAgents.length === 1 ? `Run ${runAgents[0]?.name}` : "Run"}</span>
+                </button>
+              </div>
+            ) : null}
+            <button className="send-button" onClick={onSend} disabled={!value.trim() || busy} aria-label="Send chat message without running an Agent" title="Send chat only">
+              {busy ? <SpinnerGap className="spin" /> : <PaperPlaneRight weight="fill" />}
+            </button>
+          </div>
         </div>
       </div>
     </div>
@@ -487,6 +599,7 @@ function Composer({
 
 function ThreadPane({
   task,
+  conversation,
   agents,
   loading,
   error,
@@ -495,14 +608,17 @@ function ThreadPane({
   actionError,
   onComposerChange,
   onSend,
+  onRunAgent,
   onUpload,
   onOpenGithub,
   onOpenArtifact,
   onRetryLoad,
   onOpenDelegate,
   onReview,
+  onPublish,
 }: {
   task: TaskDetail | null;
+  conversation: ConversationSummary | null;
   agents: AgentProfile[];
   loading: boolean;
   error: string | null;
@@ -511,12 +627,14 @@ function ThreadPane({
   actionError: string | null;
   onComposerChange: (value: string) => void;
   onSend: () => void;
+  onRunAgent: (agentId: string) => void;
   onUpload: (file: File) => void;
   onOpenGithub: () => void;
   onOpenArtifact: (artifactId: string) => void;
   onRetryLoad: () => void;
   onOpenDelegate: () => void;
   onReview: (decision: "accept" | "reject" | "request_changes") => void;
+  onPublish: () => void;
 }) {
   if (loading) {
     return (
@@ -540,17 +658,25 @@ function ThreadPane({
       </main>
     );
   }
-  const participants = agents.filter((agent) => task.participantIds.includes(agent.id));
+  const conversationAgentIds = new Set(conversation?.members.filter((member) => member.kind === "agent").map((member) => member.id) ?? []);
+  const participants = conversationAgentIds.size
+    ? agents.filter((agent) => conversationAgentIds.has(agent.id))
+    : agents.filter((agent) => task.participantIds.includes(agent.id));
+  const runnableAgents = participants.length ? participants : conversation?.isPrimary ? agents : [];
+  const activeTitle = conversation && !conversation.isPrimary
+    ? conversation.title?.trim() || conversation.members.find((member) => member.kind === "agent")?.name || "Group chat"
+    : slug(task.title);
+  const conversationLabel = conversation?.kind === "direct" ? "Direct chat" : conversation?.isPrimary ? "Primary group" : "Group chat";
   const activeRun = [...task.runs].reverse().find((run) => !terminalRunStatuses.has(run.status));
   const activeAgent = activeRun ? agents.find((agent) => agent.id === activeRun.agentId) : null;
   return (
     <main className="thread-pane pane" id="main-content">
       <header className="thread-header">
         <div className="thread-title-row">
-          <span className="channel-icon"><Hash weight="bold" /></span>
+          <span className="channel-icon">{conversation?.kind === "direct" ? <ChatCircleDots weight="bold" /> : conversation?.isPrimary ? <Hash weight="bold" /> : <UsersThree weight="bold" />}</span>
           <div className="thread-title">
-            <h2>{slug(task.title)}</h2>
-            <p>{task.title}</p>
+            <h2>{activeTitle}</h2>
+            <p>{conversationLabel} · {task.title}</p>
           </div>
           <StatusPill status={task.status} label={taskStatusCopy[task.status]} />
         </div>
@@ -586,9 +712,9 @@ function ThreadPane({
         <div className="thread-intro">
           <span className="intro-icon"><Hash weight="bold" /></span>
           <div>
-            <p className="eyebrow">Task channel</p>
-            <h3>{task.title}</h3>
-            <p>{task.description}</p>
+            <p className="eyebrow">{conversationLabel}</p>
+            <h3>{activeTitle}</h3>
+            <p>{conversation?.isPrimary || !conversation ? task.description : `A task-scoped ${conversation.kind} transcript. Chat stays chat until you explicitly run an Agent.`}</p>
             <div className="intro-badges">
               <span><GitBranch /> {task.baseRef}</span>
               <span><UsersThree /> {participants.length || task.participantIds.length} agents</span>
@@ -620,13 +746,25 @@ function ThreadPane({
         </div>
       ) : null}
 
+      {task.status === "completed" && task.resolution === "accepted" && !task.branch.startsWith("mob/") ? (
+        <div className="review-bar">
+          <div className="review-copy"><ShieldCheck weight="duotone" /><span><strong>Result accepted</strong><small>SCM publication is still separate and requires your confirmation.</small></span></div>
+          <div className="review-actions">
+            <button className="primary-button" onClick={onPublish} disabled={actionBusy}>{actionBusy ? <SpinnerGap className="spin" /> : <GitBranch />} Publish branch</button>
+          </div>
+        </div>
+      ) : null}
+
       <Composer
         task={task}
-        agents={agents}
+        agents={conversation && !conversation.isPrimary ? runnableAgents : agents}
+        runAgents={runnableAgents}
+        conversationKind={conversation?.kind ?? "group"}
         value={composer}
         busy={actionBusy}
         onChange={onComposerChange}
         onSend={onSend}
+        onRunAgent={onRunAgent}
         onUpload={onUpload}
         onOpenGithub={onOpenGithub}
       />
@@ -876,6 +1014,98 @@ function GithubModal({ busy, error, onClose, onSubmit }: { busy: boolean; error:
   );
 }
 
+function NewConversationModal({
+  tasks,
+  agents,
+  initialTaskId,
+  busy,
+  error,
+  onClose,
+  onSubmit,
+}: {
+  tasks: TaskSummary[];
+  agents: AgentProfile[];
+  initialTaskId: string;
+  busy: boolean;
+  error: string | null;
+  onClose: () => void;
+  onSubmit: (input: NewConversationInput) => void;
+}) {
+  const [kind, setKind] = useState<NewConversationInput["kind"]>("direct");
+  const [taskId, setTaskId] = useState(initialTaskId || tasks[0]?.id || "");
+  const [title, setTitle] = useState("");
+  const [members, setMembers] = useState<string[]>(agents[0]?.id ? [agents[0].id] : []);
+  const valid = Boolean(taskId && members.length && (kind === "group" ? title.trim() : members.length === 1));
+
+  function chooseKind(next: NewConversationInput["kind"]) {
+    setKind(next);
+    if (next === "direct" && members.length > 1) setMembers(members.slice(0, 1));
+  }
+
+  function toggleMember(agentId: string) {
+    if (kind === "direct") {
+      setMembers([agentId]);
+      return;
+    }
+    setMembers((current) => current.includes(agentId) ? current.filter((id) => id !== agentId) : [...current, agentId]);
+  }
+
+  return (
+    <Modal title="Create a conversation" description="Chats share a task environment, but messages do not run an Agent until you press Run." onClose={onClose}>
+      <form className="modal-form" onSubmit={(event) => {
+        event.preventDefault();
+        if (valid) onSubmit({ taskId, kind, title: kind === "group" ? title.trim() : null, members });
+      }}>
+        {error ? <div className="inline-alert" role="alert"><WarningCircle /> {error}</div> : null}
+        <fieldset className="conversation-kind-picker">
+          <legend>Conversation type</legend>
+          <button type="button" className={kind === "direct" ? "is-selected" : ""} onClick={() => chooseKind("direct")} aria-pressed={kind === "direct"}><ChatCircleDots /><span><strong>Direct</strong><small>One human + one Agent</small></span></button>
+          <button type="button" className={kind === "group" ? "is-selected" : ""} onClick={() => chooseKind("group")} aria-pressed={kind === "group"}><UsersThree /><span><strong>Group</strong><small>Named room with Agents</small></span></button>
+        </fieldset>
+        <label><span>Task environment</span><select value={taskId} onChange={(event) => setTaskId(event.target.value)}>{tasks.map((task) => <option key={task.id} value={task.id}>{task.title} · {task.repository}</option>)}</select></label>
+        {kind === "group" ? <label><span>Group name</span><input autoFocus required value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Release review" /></label> : null}
+        <fieldset className="conversation-members">
+          <legend>{kind === "direct" ? "Agent" : "Agent members"}</legend>
+          {agents.map((agent) => {
+            const checked = members.includes(agent.id);
+            return (
+              <label key={agent.id} className={checked ? "is-selected" : ""}>
+                <input type={kind === "direct" ? "radio" : "checkbox"} name="conversation-agent" checked={checked} onChange={() => toggleMember(agent.id)} />
+                <Avatar initials={agent.initials} color={agent.color} size="small" status={agent.status} />
+                <span><strong>{agent.name}</strong><small>{agent.role} · {agent.driver}</small></span>
+              </label>
+            );
+          })}
+        </fieldset>
+        <div className="modal-note"><ShieldCheck /> The task owns repository access and run guardrails; this conversation owns only its members and transcript.</div>
+        <footer className="modal-actions"><button type="button" className="ghost-button" onClick={onClose}>Cancel</button><button className="primary-button" disabled={busy || !valid}>{busy ? <SpinnerGap className="spin" /> : <ChatCircleDots />} Create chat</button></footer>
+      </form>
+    </Modal>
+  );
+}
+
+function NewAgentModal({ busy, error, onClose, onSubmit }: { busy: boolean; error: string | null; onClose: () => void; onSubmit: (input: NewAgentInput) => void }) {
+  const [form, setForm] = useState<NewAgentInput>({ handle: "", name: "", driver: "pi", role: "Coding agent" });
+  const handleValid = /^[a-z][a-z0-9_-]{1,31}$/.test(form.handle);
+  return (
+    <Modal title="Add an Agent identity" description="Give one installed CLI connector a stable workspace identity. Harness, model, skills, and memory remain owned by that CLI." onClose={onClose}>
+      <form className="modal-form" onSubmit={(event) => { event.preventDefault(); if (handleValid) onSubmit(form); }}>
+        {error ? <div className="inline-alert" role="alert"><WarningCircle /> {error}</div> : null}
+        <div className="form-row">
+          <label><span>Handle</span><input autoFocus required value={form.handle} onChange={(event) => setForm({ ...form, handle: event.target.value.toLowerCase().replace(/[^a-z0-9_-]/g, "") })} placeholder="researcher" aria-invalid={Boolean(form.handle) && !handleValid} /><small>2–32 lowercase letters, numbers, _ or -</small></label>
+          <label><span>Display name</span><input required value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} placeholder="Researcher" /></label>
+        </div>
+        <label><span>CLI connector</span><select value={form.driver} onChange={(event) => setForm({ ...form, driver: event.target.value as NewAgentInput["driver"] })}>
+          <option value="pi">Pi</option><option value="omp">Oh My Pi</option><option value="claude">Claude Code</option><option value="codex">Codex</option><option value="hermes">Hermes</option>
+        </select></label>
+        <label><span>Role</span><input required value={form.role} onChange={(event) => setForm({ ...form, role: event.target.value })} placeholder="Repository research and documentation" /></label>
+        <div className="selected-agent agent-definition-preview"><span className="agent-definition-mark"><Code /></span><span><strong>@{form.handle || "handle"} · {form.driver}</strong><small>Thin connector only · no planner privilege · no Mob-owned model layer</small></span></div>
+        <footer className="modal-actions"><button type="button" className="ghost-button" onClick={onClose}>Cancel</button><button className="primary-button" disabled={busy || !handleValid || !form.name.trim() || !form.role.trim()}>{busy ? <SpinnerGap className="spin" /> : <Plus />} Add Agent</button></footer>
+      </form>
+    </Modal>
+  );
+}
+
 function MobileNavigation({ active, onChange }: { active: MobilePane; onChange: (pane: MobilePane) => void }) {
   return (
     <nav className="mobile-nav" aria-label="Workspace sections">
@@ -938,10 +1168,15 @@ export function App() {
   const [bootstrap, setBootstrap] = useState<BootstrapData | null>(null);
   const [source, setSource] = useState<"api" | "demo">("api");
   const [tasks, setTasks] = useState<TaskSummary[]>([]);
+  const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
+  const [selectedConversationId, setSelectedConversationId] = useState<string | null>(null);
   const [detailCache, setDetailCache] = useState<Record<string, TaskDetail>>({});
+  const [conversationCache, setConversationCache] = useState<Record<string, ConversationDetail>>({});
   const [detailLoading, setDetailLoading] = useState(false);
   const [detailError, setDetailError] = useState<string | null>(null);
+  const [conversationLoading, setConversationLoading] = useState(false);
+  const [conversationError, setConversationError] = useState<string | null>(null);
   const [search, setSearch] = useState("");
   const [composer, setComposer] = useState("");
   const [mobilePane, setMobilePane] = useState<MobilePane>("thread");
@@ -956,8 +1191,19 @@ export function App() {
   const noticeTimer = useRef<number | null>(null);
 
   const selectedTask = tasks.find((task) => task.id === selectedTaskId) ?? null;
-  const detail = selectedTaskId ? detailCache[selectedTaskId] ?? null : null;
+  const taskDetail = selectedTaskId ? detailCache[selectedTaskId] ?? null : null;
   const agents = bootstrap?.agents ?? [];
+  const selectedConversation = conversations.find((conversation) => conversation.id === selectedConversationId)
+    ?? (selectedTask ? primaryConversationFor(selectedTask) : null);
+  const selectedConversationDetail = selectedConversationId ? conversationCache[selectedConversationId] ?? null : null;
+  const detail = taskDetail && selectedConversation && !selectedConversation.isPrimary && selectedConversationDetail
+    ? {
+        ...taskDetail,
+        messages: selectedConversationDetail.messages,
+        runs: selectedConversationDetail.runs,
+        participantIds: selectedConversationDetail.members.filter((member) => member.kind === "agent").map((member) => member.id),
+      }
+    : taskDetail;
 
   const filteredTasks = useMemo(() => {
     const query = search.trim().toLowerCase();
@@ -965,23 +1211,50 @@ export function App() {
     return tasks.filter((task) => `${task.title} ${task.repository} ${task.summary}`.toLowerCase().includes(query));
   }, [search, tasks]);
 
+  const filteredConversations = useMemo(() => {
+    const query = search.trim().toLowerCase();
+    return conversations.filter((conversation) => {
+      if (conversation.isPrimary) return false;
+      if (!query) return true;
+      const members = conversation.members.map((member) => `${member.name} ${member.handle}`).join(" ");
+      return `${conversation.title ?? ""} ${conversation.kind} ${members} ${conversation.lastMessage?.content ?? ""}`.toLowerCase().includes(query);
+    });
+  }, [conversations, search]);
+
   const loadBootstrap = useCallback(async () => {
     setLoadState("loading");
     setFatalError(null);
     try {
       const live = await fetchBootstrap();
+      let liveConversations: ConversationSummary[];
+      try {
+        liveConversations = await fetchConversations();
+      } catch {
+        liveConversations = live.tasks.map(primaryConversationFor);
+      }
       setBootstrap(live);
       setTasks(live.tasks);
+      setConversations(liveConversations);
       setSource("api");
       setSelectedTaskId((current) => current && live.tasks.some((task) => task.id === current) ? current : live.tasks[0]?.id ?? null);
+      setSelectedConversationId((current) => current && liveConversations.some((conversation) => conversation.id === current)
+        ? current
+        : liveConversations.find((conversation) => conversation.isPrimary)?.id ?? live.tasks[0]?.id ?? null);
       setLoadState("ready");
     } catch (error) {
+      if (!allowDemoFallback) {
+        setFatalError(error instanceof Error ? error.message : "The workspace API is unavailable.");
+        setLoadState("error");
+        return;
+      }
       try {
         const fallback = structuredClone(demoBootstrap);
         setBootstrap(fallback);
         setTasks(fallback.tasks);
+        setConversations(fallback.tasks.map(primaryConversationFor));
         setSource("demo");
         setSelectedTaskId((current) => current && fallback.tasks.some((task) => task.id === current) ? current : fallback.tasks[0]?.id ?? null);
+        setSelectedConversationId((current) => current && fallback.tasks.some((task) => task.id === current) ? current : fallback.tasks[0]?.id ?? null);
         setLoadState("ready");
       } catch {
         setFatalError(error instanceof Error ? error.message : "Unknown workspace error");
@@ -1015,20 +1288,42 @@ export function App() {
   }, [selectedTask?.id, source]);
 
   useEffect(() => {
+    if (!selectedConversation || selectedConversation.isPrimary || source !== "api") return;
+    let stopped = false;
+    setConversationLoading(true);
+    setConversationError(null);
+    void fetchConversation(selectedConversation.id)
+      .then((next) => {
+        if (!stopped) setConversationCache((current) => ({ ...current, [next.id]: next }));
+      })
+      .catch((error: unknown) => {
+        if (!stopped) setConversationError(error instanceof Error ? error.message : "Unable to load this conversation.");
+      })
+      .finally(() => { if (!stopped) setConversationLoading(false); });
+    return () => { stopped = true; };
+  }, [selectedConversation?.id, selectedConversation?.isPrimary, source]);
+
+  useEffect(() => {
     if (source !== "api" || !selectedTask) return;
     let stopped = false;
     let inFlight = false;
     const task = selectedTask;
+    const conversationId = selectedConversation && !selectedConversation.isPrimary ? selectedConversation.id : null;
     const refresh = async () => {
       if (stopped || inFlight || document.visibilityState === "hidden") return;
       inFlight = true;
       try {
-        const next = await fetchTask(task);
+        const [next, nextConversation] = await Promise.all([
+          fetchTask(task),
+          conversationId ? fetchConversation(conversationId) : Promise.resolve(null),
+        ]);
         if (stopped) return;
         setDetailCache((current) => ({ ...current, [task.id]: next }));
+        if (nextConversation) setConversationCache((current) => ({ ...current, [nextConversation.id]: nextConversation }));
         setTasks((current) => current.map((item) => item.id === task.id ? {
           ...item,
           status: next.status,
+          resolution: next.resolution,
           updatedAt: next.updatedAt,
           summary: next.messages.at(-1)?.content ?? item.summary,
         } : item));
@@ -1044,7 +1339,7 @@ export function App() {
       stopped = true;
       window.clearInterval(interval);
     };
-  }, [source, selectedTask?.id]);
+  }, [source, selectedTask?.id, selectedConversation?.id, selectedConversation?.isPrimary]);
 
   useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
@@ -1069,19 +1364,44 @@ export function App() {
     });
   }
 
+  function updateActiveTranscript(updater: (value: { messages: ThreadMessage[]; runs: AgentRun[] }) => { messages: ThreadMessage[]; runs: AgentRun[] }) {
+    if (selectedConversation && !selectedConversation.isPrimary) {
+      setConversationCache((current) => {
+        const existing = current[selectedConversation.id];
+        if (!existing) return current;
+        return { ...current, [selectedConversation.id]: { ...existing, ...updater(existing) } };
+      });
+      return;
+    }
+    if (detail) updateDetail(detail.id, (current) => ({ ...current, ...updater(current) }));
+  }
+
   function updateTaskSummary(taskId: string, patch: Partial<TaskSummary>) {
     setTasks((current) => current.map((task) => task.id === taskId ? { ...task, ...patch } : task));
   }
 
   function selectTask(taskId: string) {
     setSelectedTaskId(taskId);
+    setSelectedConversationId(conversations.find((conversation) => conversation.taskId === taskId && conversation.isPrimary)?.id ?? taskId);
     setMobilePane("thread");
     setComposer("");
     setActionError(null);
   }
 
-  async function handleSend() {
+  function selectConversation(conversation: ConversationSummary) {
+    setSelectedTaskId(conversation.taskId);
+    setSelectedConversationId(conversation.id);
+    setMobilePane("thread");
+    setComposer("");
+    setActionError(null);
+  }
+
+  async function submitComposer(invoke: boolean, agentId?: string) {
     if (!detail || !bootstrap || !composer.trim() || actionBusy) return;
+    if (invoke && !selectedConversation) {
+      setActionError("Choose a conversation before running an Agent.");
+      return;
+    }
     const content = composer.trim();
     const optimisticId = `message-${crypto.randomUUID()}`;
     const optimistic: ThreadMessage = {
@@ -1099,57 +1419,70 @@ export function App() {
     setComposer("");
     setActionBusy(true);
     setActionError(null);
-    updateDetail(detail.id, (current) => ({ ...current, messages: [...current.messages, optimistic] }));
+    updateActiveTranscript((current) => ({ ...current, messages: [...current.messages, optimistic] }));
     updateTaskSummary(detail.id, { updatedAt: optimistic.createdAt, summary: content });
+    if (selectedConversation) {
+      setConversations((current) => current.map((conversation) => conversation.id === selectedConversation.id
+        ? { ...conversation, updatedAt: optimistic.createdAt, lastMessage: optimistic }
+        : conversation));
+    }
     try {
       if (source === "api") {
-        const saved = await postMessage(detail.id, content);
-        updateDetail(detail.id, (current) => ({ ...current, messages: current.messages.map((message) => message.id === optimisticId ? saved : message) }));
-        const refreshed = await fetchTask(detail);
-        setDetailCache((current) => ({ ...current, [detail.id]: refreshed }));
-      } else {
-        const mentioned = agents.find((agent) => new RegExp(`@${agent.name}\\b`, "i").test(content));
-        if (mentioned) {
-          const runId = `run-${crypto.randomUUID()}`;
-          const run: AgentRun = {
-            id: runId,
-            agentId: mentioned.id,
-            role: "Mention follow-up",
-            status: "queued",
-            attempt: 1,
-            startedAt: null,
-            finishedAt: null,
-            summary: "Queued from a human mention in the shared thread.",
-            parentRunId: null,
-          };
-          const system: ThreadMessage = {
-            id: `message-${crypto.randomUUID()}`,
-            actorId: "system",
-            actorName: "Crew control",
-            actorKind: "system",
-            actorInitials: "CC",
-            content: `@${mentioned.name} was added to this task with the current thread, revision, and published artifacts.`,
-            createdAt: new Date().toISOString(),
-            runId,
-            artifactIds: [],
-            delivery: "sent",
-          };
-          updateDetail(detail.id, (current) => ({
-            ...current,
-            participantIds: current.participantIds.includes(mentioned.id) ? current.participantIds : [...current.participantIds, mentioned.id],
-            runs: [...current.runs, run],
-            messages: [...current.messages, system],
+        if (selectedConversation) {
+          const result = await postConversationMessage(selectedConversation.id, content, invoke
+            ? { invoke: true, ...(agentId ? { agent: agentId } : {}) }
+            : { invoke: false });
+          updateActiveTranscript((current) => ({
+            messages: current.messages.map((message) => message.id === optimisticId ? { ...result.message, actorName: optimistic.actorName, actorInitials: optimistic.actorInitials, actorKind: "human" } : message),
+            runs: [...current.runs, ...result.runs],
           }));
+          if (selectedConversation.isPrimary) {
+            const refreshed = await fetchTask(detail);
+            setDetailCache((current) => ({ ...current, [detail.id]: refreshed }));
+          } else {
+            const refreshed = await fetchConversation(selectedConversation.id);
+            setConversationCache((current) => ({ ...current, [refreshed.id]: refreshed }));
+          }
+        } else {
+          if (invoke) throw new Error("This server does not expose explicit conversation runs yet.");
+          const saved = await postMessage(detail.id, content);
+          updateActiveTranscript((current) => ({ ...current, messages: current.messages.map((message) => message.id === optimisticId ? saved : message) }));
         }
+      } else if (invoke && agentId) {
+        const agent = agents.find((entry) => entry.id === agentId);
+        const run: AgentRun = {
+          id: `run-${crypto.randomUUID()}`,
+          agentId,
+          role: "Explicit chat run",
+          status: "queued",
+          attempt: 1,
+          startedAt: null,
+          finishedAt: null,
+          summary: content,
+          parentRunId: null,
+        };
+        updateActiveTranscript((current) => ({
+          messages: current.messages.map((message) => message.id === optimisticId ? { ...message, delivery: "sent" } : message),
+          runs: [...current.runs, run],
+        }));
+        setActionError(agent ? `${agent.name} was queued from the explicit Run action (demo).` : null);
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : "Message failed to send.";
       setActionError(message);
-      updateDetail(detail.id, (current) => ({ ...current, messages: current.messages.map((entry) => entry.id === optimisticId ? { ...entry, delivery: "failed" } : entry) }));
+      updateActiveTranscript((current) => ({ ...current, messages: current.messages.map((entry) => entry.id === optimisticId ? { ...entry, delivery: "failed" } : entry) }));
       setComposer(content);
     } finally {
       setActionBusy(false);
     }
+  }
+
+  async function handleSend() {
+    await submitComposer(false);
+  }
+
+  async function handleRunAgent(agentId: string) {
+    await submitComposer(true, agentId);
   }
 
   function openDelegate(agentId = "") {
@@ -1235,12 +1568,51 @@ export function App() {
         }
       }
       setTasks((current) => [created, ...current]);
+      const primary = primaryConversationFor(created);
+      setConversations((current) => [primary, ...current]);
       setDetailCache((current) => ({ ...current, [created.id]: created }));
       setSelectedTaskId(created.id);
+      setSelectedConversationId(primary.id);
       setModal(null);
       setMobilePane("thread");
     } catch (error) {
       setModalError(error instanceof Error ? error.message : "Task could not be created.");
+    } finally {
+      setModalBusy(false);
+    }
+  }
+
+  async function handleCreateConversation(input: NewConversationInput) {
+    setModalBusy(true);
+    setModalError(null);
+    try {
+      if (source !== "api") throw new Error("Connect the server to create direct and group conversations.");
+      const created = await createConversation(input);
+      setConversations((current) => [created, ...current]);
+      setConversationCache((current) => ({ ...current, [created.id]: created }));
+      setSelectedTaskId(created.taskId);
+      setSelectedConversationId(created.id);
+      setModal(null);
+      setMobilePane("thread");
+    } catch (error) {
+      setModalError(error instanceof Error ? error.message : "Conversation could not be created.");
+    } finally {
+      setModalBusy(false);
+    }
+  }
+
+  async function handleCreateAgent(input: NewAgentInput) {
+    setModalBusy(true);
+    setModalError(null);
+    try {
+      if (source !== "api") throw new Error("Connect the server to add an Agent identity.");
+      await createAgent(input);
+      const live = await fetchBootstrap();
+      setBootstrap(live);
+      setTasks(live.tasks);
+      setModal(null);
+    } catch (error) {
+      setModalError(error instanceof Error ? error.message : "Agent could not be added.");
     } finally {
       setModalBusy(false);
     }
@@ -1382,6 +1754,46 @@ export function App() {
     }
   }
 
+  async function handlePublish() {
+    if (!detail || !bootstrap || actionBusy) return;
+    if (!window.confirm("Publish the accepted task changes to a new mob/ branch on GitHub?")) return;
+    setActionBusy(true);
+    setActionError(null);
+    try {
+      const published = source === "api"
+        ? await publishTask(detail.id)
+        : { branch: `mob/${detail.id.slice(0, 8)}`, commit: "demo0000", changedFiles: ["README.md"] };
+      const now = new Date().toISOString();
+      const system: ThreadMessage = {
+        id: `message-${crypto.randomUUID()}`,
+        actorId: "system",
+        actorName: "Crew control",
+        actorKind: "system",
+        actorInitials: "CC",
+        content: `${bootstrap.currentUser.name} published ${published.branch} at ${published.commit.slice(0, 8)} (${published.changedFiles.length} files).`,
+        createdAt: now,
+        runId: null,
+        artifactIds: [],
+        delivery: "sent",
+      };
+      updateDetail(detail.id, (current) => ({
+        ...current,
+        baseRef: published.branch,
+        resolution: "branch_published",
+        messages: [...current.messages, system],
+      }));
+      updateTaskSummary(detail.id, {
+        branch: published.branch,
+        resolution: "branch_published",
+        updatedAt: now,
+      });
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : "The branch could not be published.");
+    } finally {
+      setActionBusy(false);
+    }
+  }
+
   function handleOpenArtifact(artifactId: string) {
     setExpandedArtifactId((current) => current === artifactId ? null : artifactId);
     setMobilePane("crew");
@@ -1399,8 +1811,19 @@ export function App() {
         setAuthState("login");
         return;
       }
-      // The preview remains usable when the local API is absent; bootstrap will
-      // clearly identify the resulting demo fallback instead of implying a live session.
+      if (!allowDemoFallback) {
+        setLoginError(
+          error instanceof ApiError && error.status >= 500
+            ? "The workspace server is unavailable. Retry shortly."
+            : error instanceof Error
+              ? error.message
+              : "The workspace server is unavailable.",
+        );
+        setAuthState("login");
+        return;
+      }
+      // Local Vite development can open a clearly labelled demo without an API.
+      // Production never crosses this boundary: connectivity failures stay visible.
     }
     sessionStorage.setItem("mob-authenticated", "true");
     sessionStorage.setItem("mob-account-email", email);
@@ -1426,45 +1849,46 @@ export function App() {
         <TaskSidebar
           bootstrap={bootstrap}
           tasks={filteredTasks}
+          conversations={filteredConversations}
           selectedTaskId={selectedTaskId}
+          selectedConversationId={selectedConversationId}
           search={search}
           source={source}
           onSearch={setSearch}
           onSelect={selectTask}
+          onSelectConversation={selectConversation}
           onNewTask={() => { setModalError(null); setModal("new-task"); }}
+          onNewConversation={() => { setModalError(null); setModal("new-conversation"); }}
+          onNewAgent={() => { setModalError(null); setModal("new-agent"); }}
           onReconnect={() => void loadBootstrap()}
         />
         <ThreadPane
           task={detail}
+          conversation={selectedConversation}
           agents={agents}
-          loading={detailLoading}
-          error={detailError}
+          loading={detailLoading || conversationLoading}
+          error={detailError ?? conversationError}
           composer={composer}
           actionBusy={actionBusy}
           actionError={actionError}
           onComposerChange={setComposer}
           onSend={() => void handleSend()}
+          onRunAgent={(agentId) => void handleRunAgent(agentId)}
           onUpload={(file) => void handleUpload(file)}
           onOpenGithub={() => { setModalError(null); setModal("github"); }}
           onOpenArtifact={handleOpenArtifact}
           onRetryLoad={() => selectedTask && void loadTask(selectedTask, true)}
           onOpenDelegate={() => openDelegate()}
           onReview={(decision) => void handleReview(decision)}
+          onPublish={() => void handlePublish()}
         />
-        <InspectorPane
-          task={detail}
-          agents={agents}
-          expandedArtifactId={expandedArtifactId}
-          busyRunId={busyRunId}
-          onOpenArtifact={handleOpenArtifact}
-          onCancel={(runId) => void handleCancelRun(runId)}
-          onRetry={(runId) => void handleRetryRun(runId)}
-          onDelegate={openDelegate}
-        />
+        <WorkspaceInspector task={detail} agents={agents} onDelegate={openDelegate} source={source} />
       </div>
       <MobileNavigation active={mobilePane} onChange={setMobilePane} />
 
       {modal === "new-task" ? <NewTaskModal agents={agents} busy={modalBusy} error={modalError} onClose={() => setModal(null)} onSubmit={(input) => void handleCreateTask(input)} /> : null}
+      {modal === "new-conversation" ? <NewConversationModal tasks={tasks} agents={agents} initialTaskId={selectedTaskId ?? ""} busy={modalBusy} error={modalError} onClose={() => setModal(null)} onSubmit={(input) => void handleCreateConversation(input)} /> : null}
+      {modal === "new-agent" ? <NewAgentModal busy={modalBusy} error={modalError} onClose={() => setModal(null)} onSubmit={(input) => void handleCreateAgent(input)} /> : null}
       {modal === "delegate" ? <DelegateModal agents={agents} initialAgentId={delegateAgentId} busy={modalBusy} error={modalError} onClose={() => setModal(null)} onSubmit={(input) => void handleDelegate(input)} /> : null}
       {modal === "github" ? <GithubModal busy={modalBusy} error={modalError} onClose={() => setModal(null)} onSubmit={(url) => void handleGithubImport(url)} /> : null}
     </div>

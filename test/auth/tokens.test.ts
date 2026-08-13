@@ -4,6 +4,7 @@ import { issueRunToken, issueSessionToken, verifyAnyToken, verifyToken } from ".
 const secret = "a-secret-that-is-long-enough-for-tests";
 const actorId = "11111111-1111-4111-8111-111111111111";
 const workspaceId = "22222222-2222-4222-8222-222222222222";
+const attemptId = "55555555-5555-4555-8555-555555555555";
 
 describe("signed actor tokens", () => {
   it("round-trips a human session", () => {
@@ -22,6 +23,7 @@ describe("signed actor tokens", () => {
         actorId,
         workspaceId,
         runId: "33333333-3333-4333-8333-333333333333",
+        attemptId,
         taskId: "44444444-4444-4444-8444-444444444444",
       },
       secret,
@@ -30,7 +32,7 @@ describe("signed actor tokens", () => {
     );
 
     const claims = verifyToken(token, secret, "run", 500);
-    expect(claims).toMatchObject({ kind: "run", actorId, workspaceId });
+    expect(claims).toMatchObject({ kind: "run", actorId, workspaceId, attemptId });
     expect(() => verifyToken(token, secret, "session", 500)).toThrow();
   });
 
@@ -51,6 +53,7 @@ describe("signed actor tokens", () => {
         actorId,
         workspaceId,
         runId: "33333333-3333-4333-8333-333333333333",
+        attemptId,
         taskId: "44444444-4444-4444-8444-444444444444",
       },
       secret,

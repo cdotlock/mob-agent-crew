@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   mapClaudeEvent,
   mapCodexEvent,
+  mapHermesEvent,
   mapOmpEvent,
   mapPiEvent,
 } from "../../src/agents/index.js";
@@ -83,6 +84,61 @@ describe("native terminal event mapping", () => {
         { kind: "command.accepted" },
         { kind: "turn.completed", nativeType: "prompt.local_only" },
       ],
+    });
+  });
+
+  it("uses Hermes message.complete status as the terminal boundary", () => {
+    expect(
+      mapHermesEvent({
+        jsonrpc: "2.0",
+        method: "event",
+        params: {
+          type: "message.delta",
+          session_id: "live-1",
+          payload: { text: "hel" },
+        },
+      }).terminal,
+    ).toBeUndefined();
+    expect(
+      mapHermesEvent({
+        jsonrpc: "2.0",
+        method: "event",
+        params: {
+          type: "message.complete",
+          session_id: "live-1",
+          payload: {
+            text: "hello",
+            status: "complete",
+            usage: { input_tokens: 3 },
+          },
+        },
+      }),
+    ).toMatchObject({
+      terminal: {
+        outcome: "completed",
+        finalMessage: "hello",
+        sessionId: "live-1",
+      },
+      events: [
+        { kind: "message.completed" },
+        { kind: "usage.updated" },
+        { kind: "turn.completed" },
+      ],
+    });
+    expect(
+      mapHermesEvent({
+        jsonrpc: "2.0",
+        method: "event",
+        params: {
+          type: "message.complete",
+          session_id: "live-1",
+          payload: { text: "provider failed", status: "error" },
+        },
+      }).terminal,
+    ).toEqual({
+      outcome: "failed",
+      error: "provider failed",
+      sessionId: "live-1",
     });
   });
 });

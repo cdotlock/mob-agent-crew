@@ -1,11 +1,12 @@
 import { join } from "node:path";
-import type { AgentDriverId, AgentDriverRegistry, AgentRun } from "../agents/index.js";
+import type { AgentCommand, AgentCommandAck, AgentDriverId, AgentDriverRegistry, AgentRun } from "../agents/index.js";
 import type { AppConfig } from "../config.js";
 import type { CollaborationStore } from "../db/store.js";
 import type { LeaseClaim } from "../domain/model.js";
 import { issueRunToken } from "../auth/tokens.js";
-import { materializeGitWorkspace } from "../workspace/materialize.js";
-import { WorkspaceKnowledge } from "../knowledge/index.js";
+import { controlRepositoryDirectory, materializeGitWorkspace } from "../workspace/materialize.js";
+import { grantAgentWorkspace, revokeAgentWorkspace } from "../workspace/agent-access.js";
+import { syncRepositoryKnowledge, WorkspaceKnowledge } from "../knowledge/index.js";
 import { type FileWorkspaceStore, writeTaskFileState } from "../storage/index.js";
 import {
   agentOutputPersistence,
@@ -13,6 +14,7 @@ import {
   redactRuntimePayload,
   redactedRuntimeError,
 } from "./runtime-redaction.js";
+import { runConversationContext } from "./prompt-context.js";
 
 export interface WorkerOptions {
   id: string;
@@ -31,6 +33,7 @@ type RuntimeProfile = {
 };
 
 type TaskRepository = {
+  name: string;
   remoteUrl: string | null;
   baseRevision: string;
   allowlisted: boolean;
@@ -65,6 +68,29 @@ export class MobWorker {
     if (!active) return false;
     await active.cancel("Cancelled by a collaborator");
     return true;
+  }
+
+  async sendRunCommand(runId: string, command: AgentCommand): Promise<AgentCommandAck> {
+    const active = this.#active.get(runId);
+    if (!active) {
+      return { accepted: false, command: command.type, error: "Agent run is not active on this worker" };
+    }
+    try {
+      const acknowledgement = await active.send(command);
+      return acknowledgement.accepted
+        ? acknowledgement
+        : {
+            accepted: false,
+            command: acknowledgement.command,
+            error: "Agent connector rejected the command",
+          };
+    } catch {
+      return {
+        accepted: false,
+        command: command.type,
+        error: "Agent connector does not support this command",
+      };
+    }
   }
 
   async tick(): Promise<boolean> {
@@ -106,14 +132,18 @@ export class MobWorker {
       this.#options.store.getTaskThread(claim.taskId),
       this.#options.store.listActors(claim.workspaceId),
     ]);
-    const transcript = thread.messages
+    const { messages: conversationMessages, currentInstruction } = runConversationContext(
+      thread,
+      claim.runId,
+    );
+    const transcript = conversationMessages
       .slice(-30)
       .map((message) => `${message.actorId}: ${message.body}`)
       .join("\n");
     const knowledgeQuery = [
       thread.task.title,
-      thread.task.description,
-      ...thread.messages.slice(-5).map((message) => message.body),
+      currentInstruction,
+      ...conversationMessages.slice(-5).map((message) => message.body),
     ].filter(Boolean).join("\n");
     const knowledge = new WorkspaceKnowledge({
       rootDirectory: join(this.#options.files.workspaceRoot(claim.workspaceId), "knowledge"),
@@ -126,14 +156,19 @@ export class MobWorker {
     return [
       `You are participating as ${role || "a coding agent"} in a shared Mob Agent Crew task.`,
       `Task: ${thread.task.title}`,
-      thread.task.description ? `Description: ${thread.task.description}` : "",
+      thread.task.description && currentInstruction !== thread.task.description
+        ? `Task background (context only, not the current instruction): ${thread.task.description}`
+        : "",
       "Start the requested work immediately. Do not explore the Mob platform or inspect mob --help/context unless the user explicitly asks.",
       "Use mob say only for meaningful progress, mob delegate only for a bounded handoff, mob artifact add for deliverables, and mob done once when finished.",
       collaborators ? `Available Agent collaborators: ${collaborators}. Invoke one with mob delegate @handle \"bounded deliverable\".` : "",
       "Never print environment variables, tokens, or credentials. Do not inspect runtime plumbing unless the task explicitly asks for it.",
-      transcript ? `Shared thread:\n${transcript}` : "",
+      transcript ? `Current conversation:\n${transcript}` : "",
       retrieval.context
         ? `Workspace knowledge (read-only excerpts; source manifest ${retrieval.manifestPath}):\n${retrieval.context}`
+        : "",
+      currentInstruction
+        ? `Current instruction (execute this now; it overrides older task text and transcript messages):\n${currentInstruction}`
         : "",
     ]
       .filter(Boolean)
@@ -143,7 +178,7 @@ export class MobWorker {
   async #prepareTaskDirectory(claim: LeaseClaim): Promise<string> {
     const taskDirectory = join(this.#options.config.dataDir, "tasks", claim.taskId);
     const rows = await this.#options.store.sql<TaskRepository[]>`
-      SELECT r.remote_url AS "remoteUrl", t.base_revision AS "baseRevision",
+      SELECT r.name, r.remote_url AS "remoteUrl", t.base_revision AS "baseRevision",
              r.allowlisted, r.enabled
       FROM tasks t
       JOIN repositories r ON r.id = t.repository_id AND r.workspace_id = t.workspace_id
@@ -153,16 +188,27 @@ export class MobWorker {
     if (!repository?.allowlisted || !repository.enabled || !repository.remoteUrl) {
       throw new Error("Task repository is not an enabled allowlisted Git remote");
     }
-    await materializeGitWorkspace({
+    const materialized = await materializeGitWorkspace({
       taskDirectory,
+      controlDirectory: controlRepositoryDirectory(this.#options.config.dataDir, claim.taskId),
       remoteUrl: repository.remoteUrl,
       baseRevision: repository.baseRevision,
+    });
+    await syncRepositoryKnowledge({
+      checkoutDirectory: taskDirectory,
+      repositoryName: repository.name,
+      remoteUrl: repository.remoteUrl,
+      revision: materialized.baseCommit,
+      knowledge: new WorkspaceKnowledge({
+        rootDirectory: join(this.#options.files.workspaceRoot(claim.workspaceId), "knowledge"),
+      }),
     });
     return taskDirectory;
   }
 
   async #execute(claim: LeaseClaim): Promise<void> {
     let nativeRun: AgentRun | undefined;
+    let taskDir: string | undefined;
     let leaseLost = false;
     let renewingLease = false;
     let leaseHeartbeat: ReturnType<typeof setInterval> | undefined;
@@ -178,6 +224,12 @@ export class MobWorker {
       const driver = this.#options.drivers.get(profile.driver);
       const runningAttempt = await this.#options.store.markAttemptRunning(claim);
       await this.#options.files.writeAttempt(runningAttempt);
+      const syncing = await this.#options.store.appendRunEvent({
+        claim,
+        type: "workspace.sync.started",
+        payload: { message: "Preparing the repository and workspace knowledge" },
+      });
+      await this.#options.files.writeEvent(syncing);
 
       const leaseMs = this.#options.leaseMs ?? 60_000;
       leaseHeartbeat = setInterval(async () => {
@@ -200,13 +252,21 @@ export class MobWorker {
       }, Math.max(1_000, Math.floor(leaseMs / 3)));
       leaseHeartbeat.unref();
 
-      const taskDir = await this.#prepareTaskDirectory(claim);
+      taskDir = await this.#prepareTaskDirectory(claim);
+      await grantAgentWorkspace(taskDir);
+      const synced = await this.#options.store.appendRunEvent({
+        claim,
+        type: "workspace.sync.completed",
+        payload: { message: "Repository checkout and Wiki context are ready" },
+      });
+      await this.#options.files.writeEvent(synced);
       if (leaseLost) throw new Error("Worker lease was lost while preparing the task workspace");
       const token = issueRunToken(
         {
           actorId: claim.agentActorId,
           workspaceId: claim.workspaceId,
           runId: claim.runId,
+          attemptId: claim.attemptId,
           taskId: claim.taskId,
         },
         this.#options.config.sessionSecret,
@@ -221,7 +281,10 @@ export class MobWorker {
         timeoutMs: 30 * 60_000,
         env: {
           PI_CODING_AGENT_DIR: profile.home,
-          ...(this.#options.config.mobAiKey ? { MOB_AI_KEY: this.#options.config.mobAiKey } : {}),
+          ...agentRuntimeProviderEnvironment(this.#options.config, token),
+          MOB_AI_MODEL: this.#options.config.mobAiModel,
+          MOB_AI_CLAUDE_MODEL: this.#options.config.mobAiClaudeModel ?? "claude-opus-4-6:free",
+          MOB_AI_CODEX_MODEL: this.#options.config.mobAiCodexModel ?? "gpt-5.6-sol",
           MOB_API_URL: this.#options.config.publicUrl ?? `http://127.0.0.1:${this.#options.config.port}`,
           MOB_RUN_TOKEN: token,
         },
@@ -244,6 +307,7 @@ export class MobWorker {
       }
       const result = await nativeRun.result;
       const threadAfterRun = await this.#options.store.getTaskThread(claim.taskId);
+      const runContext = runConversationContext(threadAfterRun, claim.runId);
       const resultAlreadyPosted = threadAfterRun.messages.some(
         (message) => message.sourceRunId === claim.runId && message.kind === "result",
       );
@@ -271,21 +335,20 @@ export class MobWorker {
       ]);
 
       if (missingResult) {
-        const posted = await this.#options.store.createMessage({
-          taskId: claim.taskId,
+        const posted = await this.#options.store.createConversationMessage({
+          conversationId: runContext.run.conversationId,
           actorId: claim.agentActorId,
           sourceRunId: claim.runId,
           kind: "progress",
           body: "I stopped without publishing a final result. The run has been marked failed so it can be retried safely.",
-          enqueueMentionedAgents: false,
         });
         await this.#options.files.writeMessage(posted.message);
       }
 
       if (result.finalMessage) {
         if (!resultAlreadyPosted) {
-          const posted = await this.#options.store.createMessage({
-            taskId: claim.taskId,
+          const posted = await this.#options.store.createConversationMessage({
+            conversationId: runContext.run.conversationId,
             actorId: claim.agentActorId,
             sourceRunId: claim.runId,
             kind: status === "succeeded" ? "result" : "progress",
@@ -296,6 +359,17 @@ export class MobWorker {
       }
     } catch (error) {
       const message = redactRuntimeError(error, runtimeSecrets);
+      try {
+        const failedEvent = await this.#options.store.appendRunEvent({
+          claim,
+          type: "error",
+          payload: { message },
+        });
+        await this.#options.files.writeEvent(failedEvent);
+      } catch {
+        // A lost/expired lease cannot append an event; completion below will
+        // make the same lease check and preserves the original safe error.
+      }
       try {
         const completed = await this.#options.store.completeAttempt({
           claim,
@@ -317,6 +391,14 @@ export class MobWorker {
       if (leaseHeartbeat) clearInterval(leaseHeartbeat);
       this.#active.delete(claim.runId);
       if (nativeRun) await nativeRun.forceKill().catch(() => undefined);
+      if (taskDir) {
+        await revokeAgentWorkspace(taskDir).catch((error) => {
+          console.error(
+            `failed to revoke workspace access for run ${claim.runId}`,
+            redactedRuntimeError(error, runtimeSecrets),
+          );
+        });
+      }
       await writeTaskFileState(this.#options.store, this.#options.files, claim.taskId).catch((error) => {
         console.error(
           `failed to refresh file state for task ${claim.taskId}`,
@@ -325,6 +407,16 @@ export class MobWorker {
       });
     }
   }
+}
+
+export function agentRuntimeProviderEnvironment(
+  config: Pick<AppConfig, "port" | "mobAiKey">,
+  runToken: string,
+): Readonly<Record<string, string>> {
+  return {
+    ...(config.mobAiKey ? { MOB_AI_KEY: runToken } : {}),
+    MOB_AI_BASE_URL: `http://127.0.0.1:${config.port}/api/provider`,
+  };
 }
 
 function delay(milliseconds: number): Promise<void> {

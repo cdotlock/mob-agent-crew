@@ -1,5 +1,6 @@
 import { ClaudeCodeDriver } from "./claude-driver.js";
 import { CodexExecDriver } from "./codex-driver.js";
+import { HermesDriver } from "./hermes-driver.js";
 import { MockDriver } from "./mock-driver.js";
 import { OmpRpcDriver } from "./omp-rpc-driver.js";
 import { PiRpcDriver } from "./pi-rpc-driver.js";
@@ -42,6 +43,7 @@ export interface DefaultAgentDriverRegistryOptions {
   readonly claude?: CliDriverOptions;
   readonly pi?: CliDriverOptions;
   readonly omp?: CliDriverOptions;
+  readonly hermes?: CliDriverOptions;
 }
 
 export function createDefaultAgentDriverRegistry(
@@ -53,5 +55,6 @@ export function createDefaultAgentDriverRegistry(
     new ClaudeCodeDriver(options.claude),
     new PiRpcDriver(options.pi),
     new OmpRpcDriver(options.omp),
+    new HermesDriver(options.hermes),
   ]);
 }

@@ -11,8 +11,11 @@ import {
 import { basename, dirname, join, resolve, sep } from "node:path";
 import type {
   Actor,
+  AgentProfile,
   Approval,
   Artifact,
+  Conversation,
+  ConversationMembership,
   Delegation,
   Message,
   Repository,
@@ -32,8 +35,11 @@ const MESSAGE_HEADER_SUFFIX = " -->";
 type StoredEntity =
   | "workspace"
   | "actor"
+  | "agent_profile"
   | "repository"
   | "task"
+  | "conversation"
+  | "conversation_membership"
   | "message"
   | "run"
   | "attempt"
@@ -118,6 +124,19 @@ export class FileWorkspaceStore {
     );
   }
 
+  async writeAgentProfile(value: AgentProfile): Promise<string> {
+    return this.#writeJson(
+      "agent_profile",
+      value,
+      safeJoin(
+        this.workspaceRoot(value.workspaceId),
+        "agents",
+        safeSegment(value.actorId, "actorId"),
+        "profile.json",
+      ),
+    );
+  }
+
   async writeRepository(value: Repository): Promise<string> {
     return this.#writeJson(
       "repository",
@@ -147,6 +166,40 @@ export class FileWorkspaceStore {
       "task",
       value,
       safeJoin(this.taskRoot(value.workspaceId, value.id), "task.json"),
+    );
+  }
+
+  async writeConversation(value: Conversation): Promise<string> {
+    return this.#writeJson(
+      "conversation",
+      value,
+      safeJoin(
+        this.taskRoot(value.workspaceId, value.taskId),
+        "conversations",
+        safeSegment(value.id, "conversationId"),
+        "conversation.json",
+      ),
+    );
+  }
+
+  async writeConversationMembership(
+    workspaceId: string,
+    taskId: string,
+    value: ConversationMembership,
+  ): Promise<string> {
+    if (value.workspaceId !== workspaceId) {
+      throw new FileWorkspaceStoreError("Conversation membership belongs to another workspace");
+    }
+    return this.#writeJson(
+      "conversation_membership",
+      value,
+      safeJoin(
+        this.taskRoot(workspaceId, taskId),
+        "conversations",
+        safeSegment(value.conversationId, "conversationId"),
+        "members",
+        `${safeSegment(value.actorId, "actorId")}.json`,
+      ),
     );
   }
 
@@ -280,10 +333,54 @@ export class FileWorkspaceStore {
     );
   }
 
+  async readAgentProfile(workspaceId: string, actorId: string): Promise<AgentProfile | null> {
+    return this.#readJson(
+      "agent_profile",
+      safeJoin(
+        this.workspaceRoot(workspaceId),
+        "agents",
+        safeSegment(actorId, "actorId"),
+        "profile.json",
+      ),
+    );
+  }
+
   async readTask(workspaceId: string, taskId: string): Promise<Task | null> {
     return this.#readJson(
       "task",
       safeJoin(this.taskRoot(workspaceId, taskId), "task.json"),
+    );
+  }
+
+  async readConversation(
+    workspaceId: string,
+    taskId: string,
+    conversationId: string,
+  ): Promise<Conversation | null> {
+    return this.#readJson(
+      "conversation",
+      safeJoin(
+        this.taskRoot(workspaceId, taskId),
+        "conversations",
+        safeSegment(conversationId, "conversationId"),
+        "conversation.json",
+      ),
+    );
+  }
+
+  async readConversationMemberships(
+    workspaceId: string,
+    taskId: string,
+    conversationId: string,
+  ): Promise<ConversationMembership[]> {
+    return this.#readJsonDirectory<ConversationMembership>(
+      "conversation_membership",
+      safeJoin(
+        this.taskRoot(workspaceId, taskId),
+        "conversations",
+        safeSegment(conversationId, "conversationId"),
+        "members",
+      ),
     );
   }
 
@@ -408,6 +505,9 @@ export class FileWorkspaceStore {
     validateThread(thread);
     const writers: Array<() => Promise<string>> = [
       () => this.writeTask(thread.task),
+      ...thread.conversations.map((value) => () => this.writeConversation(value)),
+      ...thread.conversationMemberships.map((value) => () =>
+        this.writeConversationMembership(thread.task.workspaceId, thread.task.id, value)),
       ...thread.messages.map((value) => () => this.writeMessage(value)),
       ...thread.delegations.map((value) => () => this.writeDelegation(value)),
       ...thread.runs.map((value) => () => this.writeRun(value)),
@@ -434,6 +534,7 @@ export class FileWorkspaceStore {
     const expected = new Set(exported.paths.map((path) => resolve(path)));
     const managedRoots = [
       safeJoin(exported.root, "messages"),
+      safeJoin(exported.root, "conversations"),
       safeJoin(exported.root, "delegations"),
       safeJoin(exported.root, "runs"),
       safeJoin(exported.root, "artifacts"),
@@ -450,6 +551,17 @@ export class FileWorkspaceStore {
     const task = await this.readTask(workspaceId, taskId);
     if (!task) return null;
     const root = this.taskRoot(workspaceId, taskId);
+    const conversations: Conversation[] = [];
+    const conversationMemberships: ConversationMembership[] = [];
+    for (const conversationId of await directoryNames(safeJoin(root, "conversations"))) {
+      safeSegment(conversationId, "conversationId");
+      const conversation = await this.readConversation(workspaceId, taskId, conversationId);
+      if (!conversation) continue;
+      conversations.push(conversation);
+      conversationMemberships.push(
+        ...(await this.readConversationMemberships(workspaceId, taskId, conversationId)),
+      );
+    }
     const messages = await this.#readMessages(safeJoin(root, "messages"));
     const delegations = await this.#readJsonDirectory<Delegation>(
       "delegation",
@@ -485,6 +597,12 @@ export class FileWorkspaceStore {
     }
 
     messages.sort(compareCreated);
+    conversations.sort(compareCreated);
+    conversationMemberships.sort((left, right) =>
+      left.conversationId === right.conversationId
+        ? left.actorId.localeCompare(right.actorId)
+        : left.conversationId.localeCompare(right.conversationId),
+    );
     delegations.sort(compareCreated);
     runs.sort(compareCreated);
     attempts.sort((left, right) =>
@@ -500,7 +618,18 @@ export class FileWorkspaceStore {
     artifacts.sort(compareCreated);
     approvals.sort(compareCreated);
 
-    return { task, messages, delegations, runs, attempts, events, artifacts, approvals };
+    return {
+      task,
+      conversations,
+      conversationMemberships,
+      messages,
+      delegations,
+      runs,
+      attempts,
+      events,
+      artifacts,
+      approvals,
+    };
   }
 
   #runRoot(workspaceId: string, taskId: string, runId: string): string {
@@ -656,8 +785,11 @@ function parseEnvelope<T>(source: string, entity: StoredEntity, path: string): E
 const DATE_FIELDS: Record<StoredEntity, readonly string[]> = {
   workspace: ["createdAt", "updatedAt"],
   actor: ["createdAt", "updatedAt"],
+  agent_profile: ["createdAt", "updatedAt"],
   repository: ["createdAt", "updatedAt"],
   task: ["createdAt", "updatedAt"],
+  conversation: ["createdAt", "updatedAt"],
+  conversation_membership: ["joinedAt"],
   message: ["createdAt"],
   run: ["createdAt", "updatedAt", "completedAt"],
   attempt: ["leaseExpiresAt", "startedAt", "completedAt", "createdAt", "updatedAt"],
@@ -708,6 +840,7 @@ function checkedDate(value: Date, label: string): Date {
 function validateThread(thread: TaskThread): void {
   const { workspaceId, id: taskId } = thread.task;
   const records: Array<{ workspaceId: string; taskId?: string }> = [
+    ...thread.conversations,
     ...thread.messages,
     ...thread.delegations,
     ...thread.runs,
@@ -718,6 +851,11 @@ function validateThread(thread: TaskThread): void {
   ];
   if (records.some((record) => record.workspaceId !== workspaceId || record.taskId !== taskId)) {
     throw new FileWorkspaceStoreError("TaskThread contains a record from another workspace or task");
+  }
+  const conversationIds = new Set(thread.conversations.map((conversation) => conversation.id));
+  if (thread.conversationMemberships.some((membership) =>
+    membership.workspaceId !== workspaceId || !conversationIds.has(membership.conversationId))) {
+    throw new FileWorkspaceStoreError("TaskThread contains a membership from another conversation");
   }
 }
 

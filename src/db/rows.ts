@@ -3,6 +3,8 @@ import type {
   AgentProfile,
   Approval,
   Artifact,
+  Conversation,
+  ConversationMembership,
   Delegation,
   DriverCapabilities,
   Message,
@@ -192,12 +194,36 @@ export function mapMessage(row: DbRow, mentions: string[] = []): Message {
     id: stringValue(row, "id"),
     workspaceId: stringValue(row, "workspace_id"),
     taskId: stringValue(row, "task_id"),
+    conversationId: stringValue(row, "conversation_id"),
     actorId: stringValue(row, "actor_id"),
     sourceRunId: nullableString(row, "source_run_id"),
     kind: stringValue(row, "kind") as Message["kind"],
     body: stringValue(row, "body"),
     mentions,
     createdAt: dateValue(row, "created_at"),
+  };
+}
+
+export function mapConversation(row: DbRow): Conversation {
+  return {
+    id: stringValue(row, "id"),
+    workspaceId: stringValue(row, "workspace_id"),
+    taskId: stringValue(row, "task_id"),
+    kind: stringValue(row, "kind") as Conversation["kind"],
+    title: nullableString(row, "title"),
+    createdByActorId: stringValue(row, "created_by_actor_id"),
+    isPrimary: booleanValue(row, "is_primary"),
+    createdAt: dateValue(row, "created_at"),
+    updatedAt: dateValue(row, "updated_at"),
+  };
+}
+
+export function mapConversationMembership(row: DbRow): ConversationMembership {
+  return {
+    workspaceId: stringValue(row, "workspace_id"),
+    conversationId: stringValue(row, "conversation_id"),
+    actorId: stringValue(row, "actor_id"),
+    joinedAt: dateValue(row, "joined_at"),
   };
 }
 
@@ -225,6 +251,8 @@ export function mapRun(row: DbRow): Run {
     id: stringValue(row, "id"),
     workspaceId: stringValue(row, "workspace_id"),
     taskId: stringValue(row, "task_id"),
+    conversationId: stringValue(row, "conversation_id"),
+    triggerMessageId: nullableString(row, "trigger_message_id"),
     agentActorId: stringValue(row, "agent_actor_id"),
     requestedByActorId: stringValue(row, "requested_by_actor_id"),
     delegationId: nullableString(row, "delegation_id"),

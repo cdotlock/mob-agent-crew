@@ -6,3 +6,4 @@ export {
   type TaskThreadRepairResult,
 } from "./file-workspace-store.js";
 export * from "./current-state.js";
+export * from "./projection-replay.js";

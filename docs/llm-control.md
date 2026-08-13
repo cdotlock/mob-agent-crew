@@ -1,0 +1,380 @@
+# Mob control protocol for people and LLM agents
+
+This is the operational entrypoint for an LLM, local coding Agent, or person
+controlling a Mob environment from another computer. Read this document before
+issuing commands.
+
+## Mental model and hard boundaries
+
+Mob is a thin shared environment: **Actors + Files + Commands + Events**. It
+does not implement a harness, model, skill system, plugin system, or private
+memory. Pi, Oh My Pi, Claude Code, Codex and Hermes are peer CLI connectors
+behind the same `AgentDriver` contract. Hermes is not a planner and receives no
+orchestration privilege.
+
+Keep these invariants:
+
+- A task owns the repository checkout, guardrails and primary group chat.
+- A direct or group conversation owns membership and a separate transcript.
+- Sending chat text does not necessarily invoke an Agent. Use an explicit
+  invoke command when work should start.
+- An active Agent may ask another Agent for a bounded deliverable only through
+  `mob delegate`; it must not invoke another vendor CLI directly.
+- One task has one writable workspace lease at a time. A human may separately
+  approve and publish a reviewed result to a new `mob/` branch; Agents cannot.
+- Never put a password, Mob token, provider key or GitHub token in a prompt,
+  chat message, command argument, artifact, or workspace file.
+
+## Install or update the external CLI
+
+Requirements: Git, Node.js 22 or newer, and Corepack. Review the installer,
+then run it from a trusted checkout:
+
+```bash
+git clone https://github.com/cdotlock/mob-agent-crew.git
+cd mob-agent-crew
+sh scripts/install-cli.sh
+```
+
+The installer is idempotent. It keeps a managed checkout at
+`~/.local/share/mob-agent-crew-cli`, builds the pinned lockfile, and links only
+`~/.local/bin/mob`. It refuses to replace another `mob` executable or overwrite
+tracked local edits. Add that bin directory to `PATH` if necessary:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+mob --help
+```
+
+The locations and source ref can be selected without editing the script:
+
+```bash
+MOB_CLI_INSTALL_DIR="$HOME/tools/mob-cli" \
+MOB_CLI_BIN_DIR="$HOME/bin" \
+MOB_CLI_REF="main" \
+sh scripts/install-cli.sh
+```
+
+Running the same command updates the managed checkout. For a more controlled
+installation, set `MOB_CLI_REF` to a reviewed release branch or tag instead of
+tracking `main`. This installer follows the selected ref on update; it does not
+pin or verify an immutable commit, so it is not a reproducible-build mechanism.
+
+## Login safely
+
+Use standard input so the password is not stored in shell history:
+
+```bash
+printf '%s' "$MOB_PASSWORD" | mob login \
+  --server https://your-mob.example \
+  --email you@example.com \
+  --password-stdin
+```
+
+An existing scoped token can also arrive on standard input:
+
+```bash
+printf '%s' "$MOB_TOKEN" | mob login \
+  --server https://your-mob.example \
+  --token-stdin
+```
+
+The client stores the normalized server URL and scoped session token in
+`~/.config/mob/config.json` with mode `0600`. Override the location with
+`MOB_CONFIG_PATH`. Use `mob logout` to delete it. Do not read or print that file
+inside an LLM session.
+
+## Common remote-control workflow
+
+Discover stable IDs first; do not guess them:
+
+```bash
+mob task list
+mob task show <task-id>
+mob agent list
+mob conversation list
+```
+
+The task chat is the backward-compatible primary group conversation:
+
+```bash
+mob chat send <task-id> "Here is context only; do not start work yet."
+mob agent invoke <task-id> @builder "Inspect the failure and implement the smallest safe fix."
+```
+
+`agent invoke` posts an explicit `@mention` to the primary task chat and returns
+the queued run. Save the returned run ID and observe normalized events:
+
+```bash
+mob run status <run-id>
+mob run watch <run-id>
+mob run steer <run-id> "Prioritize the failing path; leave unrelated files unchanged."
+mob run follow-up <run-id> "Now run the focused verification and summarize evidence."
+mob run cancel <run-id>
+```
+
+`steer` or `follow-up` is accepted only while that run is active on the same
+worker and only if its connector implements the capability. A `409` rejection
+is a real connector/lifecycle limitation, not permission to start a hidden
+second process. `run watch` stops at `succeeded`, `failed`, or `cancelled`.
+
+## Direct and group conversations
+
+Every task has a primary group conversation whose ID equals the task ID. Create
+an additional private/direct or group transcript under that task:
+
+```bash
+mob conversation create <task-id> --kind direct --member @builder
+mob conversation create <task-id> --kind group \
+  --title "Release review" --member @builder @reviewer
+
+mob conversation show <conversation-id>
+mob conversation send <conversation-id> "Discussion only; do not execute."
+mob conversation send <conversation-id> \
+  --invoke @reviewer \
+  "Review the current patch and return blocking risks."
+```
+
+For `direct`, Mob enforces exactly one human and one Agent. For `group`, use
+explicit membership. `--invoke` starts exactly one Agent member and records the
+trigger message on the run. An Agent run cannot bypass delegation guardrails by
+setting `invoke`; it must use `mob delegate`.
+
+Equivalent HTTP operations, for clients that cannot launch the CLI:
+
+```text
+GET  /api/conversations
+POST /api/conversations
+     {"taskId":"<uuid>","kind":"direct|group","title":"optional","members":["@builder"]}
+GET  /api/conversations/<conversation-id>
+POST /api/conversations/<conversation-id>/messages
+     {"content":"...","invoke":true,"agent":"@builder","writerRequired":true}
+```
+
+Authenticate HTTP requests with `Authorization: Bearer <scoped-token>`. Never
+place the token in a URL. Ordinary messages should omit `invoke` or set it to
+`false`.
+
+## Add and define an Agent
+
+An Agent identity is a stable Actor plus a small connector profile. The
+harness, model, skills, plugins and private memory remain owned by the selected
+CLI; Mob does not copy or reinterpret them.
+
+```bash
+mob agent add \
+  --handle reviewer-two \
+  --name "Reviewer Two" \
+  --driver hermes \
+  --role "Independent implementation reviewer"
+mob agent list
+```
+
+Valid driver IDs are `pi`, `omp`, `claude`, `codex`, and `hermes`. The standard
+server image contains these CLI executables. `agent add` registers an Actor and
+connector profile; an `available` status means that identity is active, not that
+Mob has run an end-to-end model health check. Names and roles are user-defined
+but must not imply privileges the connector does not have.
+
+### MobAI Router model mapping
+
+All five built-in connectors receive a task-scoped proxy credential in the
+environment variable their harness expects. The real `MOB_AI_KEY` stays in the
+control plane. They use connector-appropriate Router transports and model aliases:
+
+| Connectors | Router transport | Model variable | Default |
+| --- | --- | --- | --- |
+| Pi, Oh My Pi, Hermes | Chat-compatible provider | `MOB_AI_MODEL` | `deepseek-v4-pro` |
+| Claude Code | Anthropic-compatible environment aliases | `MOB_AI_CLAUDE_MODEL` | `claude-opus-4-6:free` |
+| Codex | OpenAI Responses provider | `MOB_AI_CODEX_MODEL` | `gpt-5.6-sol` |
+
+`MOB_AI_BASE_URL` defaults to `https://ai.mob-ai.cn/api`. Pi and Oh My Pi use
+their OpenAI-compatible chat adapters, Hermes uses `chat_completions`, Claude
+Code receives `ANTHROPIC_*` aliases, and Codex receives an ephemeral custom
+provider with `wire_api="responses"`. Do not give every harness the same model
+name: the Router aliases and wire protocols are intentionally different.
+
+## Commands available inside an Agent run
+
+Mob injects a short-lived `MOB_RUN_TOKEN` and `MOB_API_URL` into the isolated CLI
+process. The token identifies the Agent, workspace, task, run, and exact active
+attempt. Every Agent API call rechecks the live attempt and lease; completion,
+cancellation, retry, or lease expiry revokes that token. This is still not a
+strict one-run data sandbox: knowledge is workspace-scoped, and an Agent
+identity can list conversations in which it is a member. Never print or inspect
+the credential.
+
+An Agent should use only the following collaboration surface:
+
+```bash
+mob context
+mob say "Implemented the parser; running the focused test now."
+mob delegate @reviewer "Review only the parser diff for correctness" --read-only
+mob artifact add ./report.md
+mob done "Parser fixed and focused verification passed."
+```
+
+Call `mob done` once. Use `mob say` only for meaningful progress. The Agent can
+edit its task-scoped checkout directly, but cannot receive SCM write
+credentials or approve publication.
+
+## Knowledge, repository Wiki, and files
+
+Mob is the only Wiki service. Before every run, the server updates a clean task
+checkout from its allowlisted Git remote, snapshots supported repository
+Markdown into `knowledge/raw/repositories/...`, refreshes a deterministic
+`knowledge/wiki/repositories/<repo>/index.md`, and retrieves bounded relevant
+excerpts with a provenance manifest. A dirty checkout is never reset or
+overwritten automatically.
+
+Use the same knowledge surface locally or from an Agent run:
+
+```bash
+mob knowledge list --area raw
+mob knowledge list --area wiki
+mob knowledge search "authentication boundary"
+mob knowledge retrieve "current repository architecture"
+mob knowledge read wiki/repositories/<repo>/index.md
+mob knowledge add-raw imports/design-brief.md ./design-brief.md
+mob knowledge curate decisions/agent-boundary.md ./agent-boundary.md
+mob knowledge lint
+```
+
+The web file browser is backed by a read-only, path-contained API. All listings
+omit symlinks. Repository listings additionally omit `.git`, `node_modules`,
+`.env`, `.env.*`, `.npmrc`, `.pypirc`, `credentials.json`, common credential
+directories/files, and private-key extensions. Direct reads reject a symlink in
+the root or any requested path segment, then resolve the real path and reject
+anything escaping the selected root. A preview containing a NUL byte or invalid
+UTF-8 is rejected as non-renderable. Files larger than the 512 KiB preview limit
+are truncated and returned with `truncated: true`, not rejected. This is a
+convenience viewer, not a general secret scanner or file sandbox:
+
+```text
+GET /api/files?scope=repository&taskId=<uuid>&path=docs
+GET /api/files/content?scope=repository&taskId=<uuid>&path=docs/architecture.md
+GET /api/files?scope=workspace&taskId=<uuid>&path=knowledge/wiki
+```
+
+These file endpoints require a human session. Agents should use the
+workspace-scoped knowledge endpoints instead; do not attempt to traverse
+`/data`. Workspace scope intentionally exposes only `knowledge/` and
+`documents/`; private conversation ledgers are not a file-browser surface.
+Repository scope also enforces conversation membership for tasks containing
+private conversations.
+
+## GitHub access on Railway
+
+For production, the current supported path is a repository-scoped `GH_TOKEN`
+set as a masked Railway service variable. Start with read-only Contents access;
+add write access only when the human-approved Publish branch action is required.
+Do not paste a token into a
+task, LLM prompt, repository URL, or shell command. Then open a Railway shell
+and verify without printing the credential:
+
+```bash
+gh auth status --hostname github.com
+```
+
+At container start the token is copied into a root-only runtime file and removed
+from the service environment. Server-side materialization and human-approved
+publication use it only with a root-owned control repository. Agent-owned Git
+metadata is never reused by the control plane. The token is not embedded in the
+remote URL or arguments, and CLI Agent processes run under a different OS UID.
+Interactive `gh auth login` is not a production contract.
+
+## Self-iteration workflow
+
+Mob can work on its own allowlisted repository through the same ordinary path;
+there is no privileged self-modification mode:
+
+1. A human imports/allowlists the Mob repository in the web UI or
+   `POST /api/tasks/<task-id>/imports/github`.
+2. A human creates a task against that repository in the web UI or through
+   `POST /api/tasks`, then explicitly invokes one Agent.
+3. The worker materializes the task checkout and refreshes repository knowledge.
+4. Watch the terminal events, steer only when necessary, and ask another Agent
+   for a bounded review through delegation.
+5. Inspect the changed checkout and artifacts, then explicitly approve or
+   request changes.
+6. A human may choose **Publish branch** in the web app, or run:
+
+   ```bash
+   mob task review <task-id> --accept --note "focused tests passed"
+   mob task publish <task-id> --confirm
+   ```
+
+   Mob overlays ordinary reviewed files onto a fresh checkout of the exact
+   materialized base commit, then pushes a new `mob/<task>` branch. It rejects
+   symlinks, special files, secret-shaped filenames, common secret content and
+   active Agent runs. PR, merge and deploy remain outside this release.
+7. Create the next task from observed evidence; never let an Agent silently
+   deploy or rewrite control-plane state.
+
+This loop is intentionally the same as work on every other repository. It makes
+Mob useful for modifying and reviewing itself, but it is not yet an end-to-end
+self-deployment loop.
+
+The corresponding JSON bodies are intentionally small:
+
+```text
+POST /api/tasks/<existing-task-id>/imports/github
+     {"url":"https://github.com/cdotlock/mob-agent-crew"}
+POST /api/tasks
+     {"title":"Improve Mob itself","repository":"<allowlisted-id-or-name>",
+      "baseRef":"main","initialMessage":"<current instruction>",
+      "agentId":"<optional-agent-uuid>"}
+```
+
+## Database file-ledger rebuild
+
+`mob db rebuild` is a local server-administrator command, not a remote Agent or
+web operation. Run a read-only validation first:
+
+```bash
+mob db rebuild --workspace <workspace-uuid>
+```
+
+Apply only with normal work stopped, after backing up PostgreSQL and `/data`:
+
+```bash
+mob db rebuild \
+  --workspace <workspace-uuid> \
+  --apply \
+  --confirm <workspace-uuid>
+```
+
+Apply uses one transaction and refuses an active queue, attempt, writer lease,
+or repository import. Replay is additive: it rebuilds file-backed collaboration
+rows but does not delete database-only rows. Agent connector profiles are part
+of the file ledger. Authentication records, import queues, leases, provider
+keys and session secrets remain operational state and are not reconstructed.
+The profile row does not recreate a missing `/data/agents/<actor-id>` provider
+home, so retain the full `/data` volume or regenerate those secret-free config
+files before starting recovered Agents. Read [File ledger replay](file-replay.md)
+before disaster recovery.
+
+## Add another peer CLI connector
+
+Do not add a planner abstraction or vendor behavior to the collaboration core.
+Implement the smallest adapter:
+
+1. Add its stable ID to `AgentDriverId` and implement `AgentDriver` under
+   `src/agents/`.
+2. Declare truthful capabilities: transport, steer, follow-up, cancel, resume,
+   sandbox expectation and terminal completion signal.
+3. Launch it only through the shared process supervisor with a task checkout,
+   isolated home/config/temp directories and an explicit environment allowlist.
+   Never inherit the server environment wholesale.
+4. Map native stdout/JSON-RPC events into normalized Mob events and recognize a
+   real terminal outcome. Preserve unknown native types as diagnostics.
+5. Register the connector in `createDefaultAgentDriverRegistry`, add it to the
+   human-only Agent creation allowlist, and generate provider config in that
+   Agent's own home only when required.
+6. Add focused mapping, lifecycle, cancellation and secret-redaction tests.
+7. Install the upstream CLI in the runtime image at a reviewed version and
+   verify its actual `--help`/protocol. Do not claim support merely because a
+   binary exists.
+
+Pi, Oh My Pi, Claude Code, Codex, Hermes, and any future connector remain peers
+under these rules.

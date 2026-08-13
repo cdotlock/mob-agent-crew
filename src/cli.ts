@@ -8,7 +8,7 @@ import { loadConfig } from "./config.js";
 import { createCollaborationStore, createDatabaseClient, migrateDatabase } from "./db/index.js";
 import { buildApp, ensureBootstrap } from "./server/index.js";
 import { MobWorker } from "./worker/index.js";
-import { FileWorkspaceStore } from "./storage/index.js";
+import { FileWorkspaceStore, replayWorkspaceProjection } from "./storage/index.js";
 import {
   MobApiClient,
   clearClientConfig,
@@ -70,6 +70,49 @@ taskCommands.command("list").action(async () => {
 taskCommands.command("show").argument("<task-id>").action(async (taskId: string) => {
   console.log(JSON.stringify(await (await connectedClient()).request(`/api/tasks/${encodeURIComponent(taskId)}`), null, 2));
 });
+taskCommands.command("review")
+  .argument("<task-id>")
+  .option("--accept", "accept the reviewable result")
+  .option("--request-changes", "reopen the task for a bounded follow-up")
+  .option("--reject", "reject and cancel the result")
+  .option("--note <note>", "human review note", "")
+  .action(async (taskId: string, options: {
+    accept?: boolean;
+    requestChanges?: boolean;
+    reject?: boolean;
+    note: string;
+  }) => {
+    const decisions = [
+      options.accept ? "accept" : null,
+      options.requestChanges ? "request_changes" : null,
+      options.reject ? "reject" : null,
+    ].filter((decision): decision is string => decision !== null);
+    if (decisions.length !== 1) {
+      throw new Error("Choose exactly one of --accept, --request-changes, or --reject");
+    }
+    console.log(JSON.stringify(await (await connectedClient()).request(
+      `/api/tasks/${encodeURIComponent(taskId)}/reviews`,
+      { method: "POST", body: { decision: decisions[0], note: options.note } },
+    ), null, 2));
+  });
+taskCommands.command("publish")
+  .argument("<task-id>")
+  .requiredOption("--confirm", "confirm this human-approved SCM write")
+  .option("--branch <branch>", "safe target branch under mob/")
+  .option("--message <message>", "commit message", "mob: publish reviewed task")
+  .action(async (taskId: string, options: { confirm: boolean; branch?: string; message: string }) => {
+    console.log(JSON.stringify(await (await connectedClient()).request(
+      `/api/tasks/${encodeURIComponent(taskId)}/publications`,
+      {
+        method: "POST",
+        body: {
+          confirm: options.confirm,
+          ...(options.branch ? { branch: options.branch } : {}),
+          commitMessage: options.message,
+        },
+      },
+    ), null, 2));
+  });
 
 const chatCommands = program.command("chat").description("send messages through the shared environment");
 chatCommands.command("send")
@@ -86,6 +129,21 @@ chatCommands.command("send")
   });
 
 const agentCommands = program.command("agent").description("invoke a named actor in the environment");
+agentCommands.command("list").action(async () => {
+  const bootstrap = await (await connectedClient()).request<{ agents?: unknown[] }>("/api/bootstrap");
+  console.log(JSON.stringify(bootstrap.agents ?? [], null, 2));
+});
+agentCommands.command("add")
+  .requiredOption("--handle <handle>", "stable @handle")
+  .requiredOption("--name <name>", "display name")
+  .requiredOption("--driver <driver>", "pi, omp, claude, codex, or hermes")
+  .option("--role <role>", "short collaboration role", "Coding collaborator")
+  .action(async (options: { handle: string; name: string; driver: string; role: string }) => {
+    console.log(JSON.stringify(await (await connectedClient()).request("/api/agents", {
+      method: "POST",
+      body: options,
+    }), null, 2));
+  });
 agentCommands.command("invoke")
   .argument("<task-id>")
   .argument("<agent>", "agent ID or @handle")
@@ -106,6 +164,37 @@ agentCommands.command("invoke")
     console.log(JSON.stringify(result, null, 2));
   });
 
+const conversationCommands = program.command("conversation").alias("conversations").description("work with direct and group chats");
+conversationCommands.command("list").action(async () => {
+  console.log(JSON.stringify(await (await connectedClient()).request("/api/conversations"), null, 2));
+});
+conversationCommands.command("show").argument("<conversation-id>").action(async (conversationId: string) => {
+  console.log(JSON.stringify(await (await connectedClient()).request(`/api/conversations/${encodeURIComponent(conversationId)}`), null, 2));
+});
+conversationCommands.command("create")
+  .argument("<task-id>")
+  .requiredOption("--kind <kind>", "direct or group")
+  .option("--title <title>", "group title")
+  .option("--member <member...>", "Agent/human IDs or @handles")
+  .action(async (taskId: string, options: { kind: string; title?: string; member?: string[] }) => {
+    console.log(JSON.stringify(await (await connectedClient()).request("/api/conversations", {
+      method: "POST",
+      body: { taskId, kind: options.kind, title: options.title, members: options.member ?? [] },
+    }), null, 2));
+  });
+conversationCommands.command("send")
+  .argument("<conversation-id>")
+  .argument("<message...>")
+  .option("--invoke <agent>", "explicitly start one Agent member")
+  .action(async (conversationId: string, words: string[], options: { invoke?: string }) => {
+    const content = words.join(" ").trim();
+    if (!content) throw new Error("Message is required");
+    console.log(JSON.stringify(await (await connectedClient()).request(
+      `/api/conversations/${encodeURIComponent(conversationId)}/messages`,
+      { method: "POST", body: { content, invoke: Boolean(options.invoke), agent: options.invoke } },
+    ), null, 2));
+  });
+
 const runCommands = program.command("run").description("observe and control agent runs");
 runCommands.command("status").argument("<run-id>").action(async (runId: string) => {
   console.log(JSON.stringify(await (await connectedClient()).request(`/api/runs/${encodeURIComponent(runId)}`), null, 2));
@@ -113,6 +202,19 @@ runCommands.command("status").argument("<run-id>").action(async (runId: string) 
 runCommands.command("cancel").argument("<run-id>").action(async (runId: string) => {
   console.log(JSON.stringify(await (await connectedClient()).request(`/api/runs/${encodeURIComponent(runId)}/cancel`, { method: "POST" }), null, 2));
 });
+for (const [name, type] of [["steer", "steer"], ["follow-up", "follow_up"]] as const) {
+  runCommands.command(name)
+    .argument("<run-id>")
+    .argument("<message...>")
+    .action(async (runId: string, words: string[]) => {
+      const message = words.join(" ").trim();
+      if (!message) throw new Error("Message is required");
+      console.log(JSON.stringify(await (await connectedClient()).request(
+        `/api/runs/${encodeURIComponent(runId)}/commands`,
+        { method: "POST", body: { type, message } },
+      ), null, 2));
+    });
+}
 runCommands.command("watch")
   .argument("<run-id>")
   .option("--interval <milliseconds>", "poll interval", "1500")
@@ -169,6 +271,35 @@ db.command("migrate").action(async () => {
     await sql.end();
   }
 });
+db.command("rebuild")
+  .alias("replay")
+  .description("validate or replay file-backed workspace state into PostgreSQL")
+  .requiredOption("--workspace <workspace-id>", "workspace UUID under MOB_DATA_DIR/state/workspaces")
+  .option("--apply", "apply the replay; without this flag the command is read-only")
+  .option("--confirm <workspace-id>", "required with --apply and must exactly match --workspace")
+  .action(async (options: { workspace: string; apply?: boolean; confirm?: string }) => {
+    const config = loadConfig();
+    if (options.apply && options.confirm !== options.workspace) {
+      throw new Error(`Apply mode requires --confirm ${options.workspace}`);
+    }
+    const sql = createDatabaseClient(config.databaseUrl);
+    try {
+      // Validation must be genuinely read-only. Schema migration is allowed
+      // only as part of the explicitly confirmed apply path.
+      if (options.apply) await migrateDatabase(sql);
+      const result = await replayWorkspaceProjection({
+        sql,
+        files: new FileWorkspaceStore({ dataDir: config.dataDir }),
+        workspaceId: options.workspace,
+        apply: options.apply ?? false,
+        ...(options.confirm ? { confirmation: options.confirm } : {}),
+      });
+      console.log(JSON.stringify(result, null, 2));
+      if (!result.valid) process.exitCode = 2;
+    } finally {
+      await sql.end();
+    }
+  });
 
 program.command("context").description("print the current shared task context").action(async () => {
   const claims = readRunClaims();

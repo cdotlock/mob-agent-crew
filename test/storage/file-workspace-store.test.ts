@@ -6,6 +6,8 @@ import type {
   Actor,
   Approval,
   Artifact,
+  Conversation,
+  ConversationMembership,
   Delegation,
   Message,
   Repository,
@@ -91,6 +93,7 @@ const message: Message = {
   id: "message-1",
   workspaceId: workspace.id,
   taskId: task.id,
+  conversationId: task.id,
   actorId: actor.id,
   sourceRunId: null,
   kind: "comment",
@@ -120,6 +123,8 @@ const run: Run = {
   id: "run-1",
   workspaceId: workspace.id,
   taskId: task.id,
+  conversationId: task.id,
+  triggerMessageId: message.id,
   agentActorId: actor.id,
   requestedByActorId: actor.id,
   delegationId: delegation.id,
@@ -207,8 +212,29 @@ const document: WorkspaceDocument = {
   updatedAt: later,
 };
 
+const conversation: Conversation = {
+  id: task.id,
+  workspaceId: workspace.id,
+  taskId: task.id,
+  kind: "group",
+  title: task.title,
+  createdByActorId: actor.id,
+  isPrimary: true,
+  createdAt: at,
+  updatedAt: later,
+};
+
+const conversationMembership: ConversationMembership = {
+  workspaceId: workspace.id,
+  conversationId: conversation.id,
+  actorId: actor.id,
+  joinedAt: at,
+};
+
 const thread: TaskThread = {
   task,
+  conversations: [conversation],
+  conversationMemberships: [conversationMembership],
   messages: [message],
   delegations: [delegation],
   runs: [run],
@@ -228,7 +254,7 @@ describe("FileWorkspaceStore", () => {
     await store.writeDocument(document);
     const result = await store.exportTaskThread(thread);
 
-    expect(result.written).toBe(8);
+    expect(result.written).toBe(10);
     const root = join(dataDir, "state", "workspaces", workspace.id);
     await expect(readFile(join(root, "workspace.json"), "utf8")).resolves.toContain(
       '"entity": "workspace"',
@@ -247,6 +273,7 @@ describe("FileWorkspaceStore", () => {
     expect(await readdir(taskRoot)).toEqual([
       "approvals",
       "artifacts",
+      "conversations",
       "delegations",
       "messages",
       "runs",
@@ -264,6 +291,10 @@ describe("FileWorkspaceStore", () => {
     expect(await store.readRepository(workspace.id, repository.id)).toEqual(repository);
     expect(await store.readDocument(workspace.id, document.id)).toEqual(document);
     expect(await store.readTask(workspace.id, task.id)).toEqual(task);
+    expect(await store.readConversation(workspace.id, task.id, conversation.id)).toEqual(conversation);
+    expect(await store.readConversationMemberships(workspace.id, task.id, conversation.id)).toEqual([
+      conversationMembership,
+    ]);
     expect(await store.readMessage(workspace.id, task.id, message.id)).toEqual(message);
     expect(await store.readRun(workspace.id, task.id, run.id)).toEqual(run);
     expect(await store.readAttempt(workspace.id, task.id, run.id, attempt.id)).toEqual({
@@ -343,7 +374,7 @@ describe("FileWorkspaceStore", () => {
 
     const result = await store.repairTaskThread(thread);
 
-    expect(result.written).toBe(8);
+    expect(result.written).toBe(10);
     expect(result.removed).toBe(1);
     expect(await store.readTaskThread(workspace.id, task.id)).toEqual({
       ...thread,

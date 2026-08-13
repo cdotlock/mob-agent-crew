@@ -34,6 +34,24 @@ export class ClaudeCodeDriver implements AgentDriver {
   }
 
   run(input: AgentRunInput): Promise<AgentRun> {
+    const merged = mergeRunEnvironment(this.#options.env, input.env);
+    const routerBaseUrl = merged.MOB_AI_BASE_URL?.replace(/\/$/u, "");
+    const routerModel = merged.MOB_AI_CLAUDE_MODEL ?? "claude-opus-4-6:free";
+    const env = {
+      ...merged,
+      ...(merged.MOB_AI_KEY && routerBaseUrl
+        ? {
+            ANTHROPIC_AUTH_TOKEN: merged.MOB_AI_KEY,
+            ANTHROPIC_BASE_URL: routerBaseUrl,
+            ANTHROPIC_MODEL: routerModel,
+            ANTHROPIC_DEFAULT_OPUS_MODEL: routerModel,
+            ANTHROPIC_DEFAULT_SONNET_MODEL: routerModel,
+            ANTHROPIC_DEFAULT_HAIKU_MODEL: routerModel,
+            CLAUDE_CODE_SUBAGENT_MODEL: routerModel,
+            CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
+          }
+        : {}),
+    };
     const args = [
       "-p",
       input.prompt,
@@ -56,7 +74,7 @@ export class ClaudeCodeDriver implements AgentDriver {
       mapper: mapClaudeEvent,
       command: this.#options.command ?? "claude",
       args,
-      env: mergeRunEnvironment(this.#options.env, input.env),
+      env,
       ...(this.#options.envAllowlist
         ? { envAllowlist: this.#options.envAllowlist }
         : {}),

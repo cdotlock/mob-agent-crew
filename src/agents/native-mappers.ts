@@ -291,6 +291,90 @@ export function mapOmpEvent(frame: unknown): NativeEventMapping {
   return { events: [] };
 }
 
+/** Map the documented Hermes TUI-gateway event envelope into Mob events. */
+export function mapHermesEvent(frame: unknown): NativeEventMapping {
+  const envelope = asRecord(frame);
+  const params = envelope.method === "event"
+    ? asRecord(envelope.params)
+    : envelope;
+  const type = stringValue(params.type) ?? "unknown";
+  const payload = asRecord(params.payload);
+  const sessionId = stringValue(params.session_id);
+  const data = {
+    ...(sessionId ? { session_id: sessionId } : {}),
+    ...payload,
+  };
+
+  if (type === "message.start") {
+    return mapping(draft("turn.started", type, undefined, data));
+  }
+  if (type === "message.delta") {
+    return mapping(
+      draft("message.delta", type, stringValue(payload.text) ?? "", data),
+    );
+  }
+  if (type === "message.complete") {
+    const text = stringValue(payload.text);
+    const status = stringValue(payload.status) ?? "complete";
+    const terminalSession = sessionId ? { sessionId } : {};
+    if (status === "complete") {
+      const events: AgentEventDraft[] = [];
+      if (text !== undefined) {
+        events.push(draft("message.completed", type, text, data));
+      }
+      const usage = asRecord(payload.usage);
+      if (Object.keys(usage).length > 0) {
+        events.push(draft("usage.updated", type, undefined, usage));
+      }
+      events.push(draft("turn.completed", type, text, data));
+      return {
+        events,
+        terminal: {
+          outcome: "completed",
+          ...(text ? { finalMessage: text } : {}),
+          ...terminalSession,
+        },
+      };
+    }
+
+    const error = errorText(payload.error) ?? text ??
+      (status === "interrupted"
+        ? "Hermes turn was interrupted"
+        : `Hermes turn ended with status '${status}'`);
+    return mapping(
+      draft("turn.failed", type, error, data),
+      { outcome: "failed", error, ...terminalSession },
+    );
+  }
+  if (type === "tool.start") {
+    return mapping(
+      draft("tool.started", type, stringValue(payload.name), data),
+    );
+  }
+  if (type === "tool.progress") {
+    return mapping(draft("tool.progress", type, undefined, data));
+  }
+  if (type === "tool.complete") {
+    return mapping(
+      draft("tool.completed", type, stringValue(payload.name), data),
+    );
+  }
+  if (type === "error") {
+    const error = errorText(payload.error ?? payload.message) ??
+      "Hermes gateway error";
+    return mapping(
+      draft("error", type, error, data),
+      {
+        outcome: "failed",
+        error,
+        ...(sessionId ? { sessionId } : {}),
+      },
+    );
+  }
+
+  return { events: [] };
+}
+
 function mapCodexItem(nativeType: string, item: Record<string, unknown>): NativeEventMapping {
   const itemType = stringValue(item.type) ?? "unknown";
   const phase = nativeType.split(".")[1];

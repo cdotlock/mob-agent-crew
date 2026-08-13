@@ -13,7 +13,7 @@ flowchart LR
     API --> Files["/data file state\nwork + knowledge + artifacts"]
     API --> PG["PostgreSQL\nindex + queue + lease + session"]
     API --> Worker["Embedded executor\nsmall-server default"]
-    Worker --> Any["Opaque agent CLI\nPi / OMP / Claude / Codex / future"]
+    Worker --> Any["Opaque agent CLI\nPi / OMP / Claude / Codex / Hermes / future"]
 ```
 
 Mob deliberately does not own an agent's harness, model choice, skills, prompt
@@ -25,13 +25,15 @@ not the domain model.
 
 1. **Actors** — stable identities for humans and agents.
 2. **Files** — readable work history, tasks, events, artifacts and knowledge.
-3. **Commands** — message, invoke, delegate, cancel, publish and complete.
+3. **Commands** — message, invoke, delegate, cancel and complete.
 4. **Events** — normalized observable activity and terminal outcomes.
 
 Every entry point uses the same authenticated HTTP surface. The web app uses a
 session cookie; the external `mob` CLI uses the same scoped session as a Bearer
-token; an active executor receives a short-lived token restricted to one run and
-one task.
+token. An active executor receives a short-lived Agent token carrying workspace,
+task and run claims. Task routes enforce its task claim, while shared knowledge
+is workspace-scoped and conversation visibility follows Actor membership; it is
+not a strict one-run capability sandbox.
 
 ```text
 mob login --server <url> --email <email> --password-stdin
@@ -50,6 +52,7 @@ The workspace state lives under the persistent data volume:
 /data/state/workspaces/<workspace-id>/
 ├── workspace.json
 ├── actors/<actor-id>.json
+├── agents/<actor-id>/profile.json
 ├── repositories/<repository-id>.json
 ├── documents/<document-id>.json
 ├── knowledge/
@@ -59,6 +62,9 @@ The workspace state lives under the persistent data volume:
 │   └── manifests/                   provenance and run context selections
 └── tasks/<task-id>/
     ├── task.json
+    ├── conversations/<conversation-id>/
+    │   ├── conversation.json
+    │   └── members/<actor-id>.json
     ├── messages/<time>-<id>.md
     ├── delegations/<id>.json
     ├── runs/<run-id>/
@@ -74,6 +80,29 @@ header. Other records use stable JSON. Writes use a same-directory temporary
 file and atomic rename. Runtime lease tokens, passwords, provider keys and other
 operational secrets are not workspace files.
 
+Secret-free CLI provider files live separately under `/data/agents/<actor-id>`.
+They are generated from environment configuration and are not part of the
+workspace replay ledger. The built-in mapping is deliberately per harness:
+Pi/OMP/Hermes use the Router chat model, Claude Code uses an Anthropic model
+alias, and Codex uses a Responses model.
+
+In production, provider calls go through a run-token-authenticated local MobAI
+proxy. The real Router key stays in the control process. CLI processes run under
+a dedicated OS UID and temporarily own only the active task checkout. They
+cannot read control credential files, workspace ledgers, artifacts, or trusted
+Git metadata. GitHub credentials are used only by control-plane clone/publish
+commands after human approval.
+
+Git has two deliberately separate locations. `/data/control/tasks/<task-id>` is
+root-only and contains the trusted bare repository plus the exact materialized
+base commit. `/data/tasks/<task-id>` is the Agent-owned working copy and its
+`.git` directory is always treated as hostile input. The control plane never
+runs Git against that `.git`. A clean task is rebuilt from a credential-free
+bundle; a dirty task is preserved. Publication copies only ordinary files into
+a fresh root-only checkout at the recorded base, rejects symlinks, special
+files, secret-shaped names and common secret content, then commits and pushes
+from that fresh checkout.
+
 ## File authority migration
 
 The file protocol is the target authority for user-owned work. PostgreSQL stays
@@ -86,9 +115,13 @@ The migration is intentionally staged:
 2. Persist every new message, run, event and artifact to files.
 3. Keep API reads on the PostgreSQL projection while comparing it with file
    replay.
-4. Prove that an empty projection can be rebuilt solely from files.
-5. Only then declare files the production authority and make replay the recovery
-   path.
+4. Validate and replay file-backed collaboration rows with `mob db rebuild`.
+   Dry-run is the default; apply requires an exact workspace confirmation and an
+   idle workspace. Operational auth, import-queue and lease tables are
+   deliberately preserved. Agent connector profiles are replayed from files.
+   See [File ledger replay](file-replay.md).
+5. Prove disaster recovery together with a separate operational credential and
+   connector backup before declaring files the complete production authority.
 
 This avoids pretending that a best-effort dual write is already a completed
 source-of-truth cutover.
@@ -107,6 +140,17 @@ MobWiki service or repository is required.
   direct access to control-plane state or SCM credentials.
 
 ## Collaboration and execution
+
+Each task has a primary group conversation whose ID equals the task ID, so the
+original task-thread API remains compatible. Additional direct or group
+conversations share the task's repository and run guardrails but keep separate
+membership and transcripts. Direct-chat messages, runs, terminal events and
+artifacts require conversation membership; the primary group remains visible
+to workspace collaborators. Sending a message is only communication; a human
+must explicitly invoke one Agent (or use the legacy task `@mention` command) to
+start a run. Every run records the exact trigger message. The worker treats
+that message, or a delegation's bounded deliverable, as the current instruction
+instead of replaying a stale task description.
 
 An agent can invoke another registered actor through `mob delegate`; the
 environment launches or routes the receiving actor and records a separate run.
@@ -127,9 +171,13 @@ core environment.
 - Fewer than ten administrator-allowlisted trusted repositories.
 - One writable workspace lease per task.
 - Agent subprocesses never receive SCM write credentials.
-- Only a human approval may publish normal code repository changes.
-- Process and workspace separation reduce accidents; the current small-server
-  deployment is not a hostile multi-tenant sandbox.
+- Agents stop at task-checkout changes and artifacts. After accepting the
+  result, a human may explicitly publish a new `mob/` branch; merge and deploy
+  remain outside Mob.
+- A dedicated Agent UID, root-only control repository, untrusted task copy and
+  local provider proxy protect control credentials. This is still a
+  trusted-repository, small-team boundary rather than a hostile multi-tenant
+  sandbox.
 
 The full boundary decision is recorded in
 [ADR-001](adr/001-file-native-agent-environment.md).

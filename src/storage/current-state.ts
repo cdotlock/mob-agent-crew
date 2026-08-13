@@ -15,8 +15,9 @@ export async function writeWorkspaceFileState(
   files: FileWorkspaceStore,
   workspace: Workspace,
 ): Promise<void> {
-  const [actors, repositories, documents, tasks] = await Promise.all([
+  const [actors, agentProfiles, repositories, documents, tasks] = await Promise.all([
     store.listActors(workspace.id),
+    store.listAgentProfiles(workspace.id),
     store.listRepositories(workspace.id),
     store.listWorkspaceDocuments(workspace.id),
     store.listTasks(workspace.id, 500),
@@ -24,6 +25,7 @@ export async function writeWorkspaceFileState(
   await files.writeWorkspace(workspace);
   await Promise.all([
     ...actors.map((actor) => files.writeActor(actor)),
+    ...agentProfiles.map((profile) => files.writeAgentProfile(profile)),
     ...repositories.map((repository) => files.writeRepository(repository)),
     ...documents.map((document) => files.writeDocument(document)),
   ]);

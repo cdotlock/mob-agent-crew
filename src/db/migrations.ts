@@ -360,6 +360,165 @@ CREATE TRIGGER approval_human_role BEFORE INSERT OR UPDATE ON approvals
   FOR EACH ROW EXECUTE FUNCTION mob_assert_actor_roles();
 `,
   },
+  {
+    version: 2,
+    name: "lightweight_conversations",
+    sql: String.raw`
+CREATE TABLE conversations (
+  id uuid PRIMARY KEY,
+  workspace_id uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  task_id uuid NOT NULL,
+  kind text NOT NULL CHECK (kind IN ('direct', 'group')),
+  title text CHECK (title IS NULL OR length(btrim(title)) > 0),
+  created_by_actor_id uuid NOT NULL,
+  is_primary boolean NOT NULL DEFAULT false,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  FOREIGN KEY (workspace_id, task_id) REFERENCES tasks(workspace_id, id) ON DELETE CASCADE,
+  FOREIGN KEY (workspace_id, created_by_actor_id) REFERENCES actors(workspace_id, id) ON DELETE RESTRICT,
+  UNIQUE (workspace_id, id),
+  CHECK (NOT is_primary OR kind = 'group')
+);
+CREATE UNIQUE INDEX conversations_task_primary_idx
+  ON conversations (task_id) WHERE is_primary;
+CREATE INDEX conversations_workspace_updated_idx
+  ON conversations (workspace_id, updated_at DESC, id DESC);
+
+CREATE TABLE conversation_memberships (
+  workspace_id uuid NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  conversation_id uuid NOT NULL,
+  actor_id uuid NOT NULL,
+  joined_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (conversation_id, actor_id),
+  FOREIGN KEY (workspace_id, conversation_id) REFERENCES conversations(workspace_id, id) ON DELETE CASCADE,
+  FOREIGN KEY (workspace_id, actor_id) REFERENCES actors(workspace_id, id) ON DELETE CASCADE
+);
+CREATE INDEX conversation_memberships_actor_idx
+  ON conversation_memberships (workspace_id, actor_id, joined_at DESC);
+
+-- A task's primary conversation deliberately reuses the task UUID. This gives
+-- legacy task threads a deterministic projection without adding another lookup.
+INSERT INTO conversations (
+  id, workspace_id, task_id, kind, title, created_by_actor_id, is_primary,
+  created_at, updated_at
+)
+SELECT
+  id, workspace_id, id, 'group', title, created_by_actor_id, true,
+  created_at, updated_at
+FROM tasks;
+
+INSERT INTO conversation_memberships (workspace_id, conversation_id, actor_id, joined_at)
+SELECT participants.workspace_id, participants.task_id, participants.actor_id, min(participants.joined_at)
+FROM (
+  SELECT workspace_id, id AS task_id, created_by_actor_id AS actor_id, created_at AS joined_at FROM tasks
+  UNION ALL
+  SELECT workspace_id, id, assigned_actor_id, created_at FROM tasks WHERE assigned_actor_id IS NOT NULL
+  UNION ALL
+  SELECT workspace_id, task_id, actor_id, created_at FROM messages
+  UNION ALL
+  SELECT mm.workspace_id, m.task_id, mm.actor_id, mm.created_at
+    FROM message_mentions mm JOIN messages m ON m.id = mm.message_id
+  UNION ALL
+  SELECT workspace_id, task_id, agent_actor_id, created_at FROM runs
+  UNION ALL
+  SELECT workspace_id, task_id, requested_by_actor_id, created_at FROM runs
+) AS participants
+GROUP BY participants.workspace_id, participants.task_id, participants.actor_id;
+
+ALTER TABLE messages ADD COLUMN conversation_id uuid;
+UPDATE messages SET conversation_id = task_id;
+ALTER TABLE messages ALTER COLUMN conversation_id SET NOT NULL;
+ALTER TABLE messages ADD CONSTRAINT messages_conversation_fk
+  FOREIGN KEY (workspace_id, conversation_id) REFERENCES conversations(workspace_id, id) ON DELETE CASCADE;
+CREATE INDEX messages_conversation_created_idx
+  ON messages (conversation_id, created_at, id);
+
+ALTER TABLE runs ADD COLUMN conversation_id uuid;
+UPDATE runs SET conversation_id = task_id;
+ALTER TABLE runs ALTER COLUMN conversation_id SET NOT NULL;
+ALTER TABLE runs ADD CONSTRAINT runs_conversation_fk
+  FOREIGN KEY (workspace_id, conversation_id) REFERENCES conversations(workspace_id, id) ON DELETE CASCADE;
+ALTER TABLE runs ADD COLUMN trigger_message_id uuid;
+UPDATE runs r
+SET trigger_message_id = (
+  SELECT m.id
+  FROM messages m
+  WHERE m.task_id = r.task_id AND m.created_at <= r.created_at
+  ORDER BY m.created_at DESC, m.id DESC
+  LIMIT 1
+);
+ALTER TABLE runs ADD CONSTRAINT runs_trigger_message_fk
+  FOREIGN KEY (workspace_id, trigger_message_id) REFERENCES messages(workspace_id, id)
+    ON DELETE SET NULL (trigger_message_id);
+CREATE INDEX runs_conversation_created_idx
+  ON runs (conversation_id, created_at, id);
+
+-- Keep v1 INSERT statements valid during a one-process Railway rollout and a
+-- rollback. Old binaries do not know the new conversation columns, so the
+-- database supplies the task's deterministic primary conversation.
+CREATE FUNCTION mob_create_primary_conversation() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  INSERT INTO conversations (
+    id, workspace_id, task_id, kind, title, created_by_actor_id, is_primary,
+    created_at, updated_at
+  ) VALUES (
+    NEW.id, NEW.workspace_id, NEW.id, 'group', NEW.title,
+    NEW.created_by_actor_id, true, NEW.created_at, NEW.updated_at
+  ) ON CONFLICT (id) DO NOTHING;
+  INSERT INTO conversation_memberships (workspace_id, conversation_id, actor_id, joined_at)
+  VALUES (NEW.workspace_id, NEW.id, NEW.created_by_actor_id, NEW.created_at)
+  ON CONFLICT DO NOTHING;
+  IF NEW.assigned_actor_id IS NOT NULL THEN
+    INSERT INTO conversation_memberships (workspace_id, conversation_id, actor_id, joined_at)
+    VALUES (NEW.workspace_id, NEW.id, NEW.assigned_actor_id, NEW.created_at)
+    ON CONFLICT DO NOTHING;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+CREATE TRIGGER task_primary_conversation
+  AFTER INSERT ON tasks FOR EACH ROW EXECUTE FUNCTION mob_create_primary_conversation();
+
+CREATE FUNCTION mob_default_conversation_columns() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF NEW.conversation_id IS NULL THEN NEW.conversation_id := NEW.task_id; END IF;
+  RETURN NEW;
+END;
+$$;
+CREATE TRIGGER message_default_conversation
+  BEFORE INSERT ON messages FOR EACH ROW EXECUTE FUNCTION mob_default_conversation_columns();
+CREATE TRIGGER run_default_conversation
+  BEFORE INSERT ON runs FOR EACH ROW EXECUTE FUNCTION mob_default_conversation_columns();
+
+CREATE FUNCTION mob_join_primary_conversation() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF NEW.conversation_id = NEW.task_id THEN
+    INSERT INTO conversation_memberships (workspace_id, conversation_id, actor_id)
+    VALUES (NEW.workspace_id, NEW.conversation_id, NEW.actor_id)
+    ON CONFLICT DO NOTHING;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+CREATE TRIGGER message_join_primary_conversation
+  AFTER INSERT ON messages FOR EACH ROW EXECUTE FUNCTION mob_join_primary_conversation();
+
+CREATE FUNCTION mob_join_primary_run_actors() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF NEW.conversation_id = NEW.task_id THEN
+    INSERT INTO conversation_memberships (workspace_id, conversation_id, actor_id)
+    VALUES
+      (NEW.workspace_id, NEW.conversation_id, NEW.agent_actor_id),
+      (NEW.workspace_id, NEW.conversation_id, NEW.requested_by_actor_id)
+    ON CONFLICT DO NOTHING;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+CREATE TRIGGER run_join_primary_conversation
+  AFTER INSERT ON runs FOR EACH ROW EXECUTE FUNCTION mob_join_primary_run_actors();
+`,
+  },
 ] as const;
 
 export type MigrationClient = Pick<postgres.Sql, "unsafe" | "begin">;

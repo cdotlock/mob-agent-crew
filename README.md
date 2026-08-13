@@ -5,7 +5,7 @@ agents share tasks, messages, delegations, artifacts, knowledge, and observable
 runs.
 
 Mob does not own an agent's harness, model, skills, or private memory. Pi, Oh My
-Pi, Claude Code, Codex, and future local or cloud agents are opaque participants
+Pi, Claude Code, Codex, Hermes, and future local or cloud agents are opaque participants
 connected to the same Actor + Files + Commands + Events protocol.
 
 The platform treats Claude Code, Codex, Pi, Oh My Pi, and future terminal agents as replaceable CLI runtimes. Every agent receives the same collaboration surface through the `mob` CLI:
@@ -16,17 +16,23 @@ Human @mentions Agent A
   -> Agent A posts findings with `mob say`
   -> Agent A delegates a bounded subtask with `mob delegate @agent-b`
   -> Agent B replies in the same task
-  -> a human reviews the diff and approves publication
+  -> a human reviews the diff and separately approves a new mob/ branch
 ```
+
+All built-in CLIs use MobAI Router, but not through one forced wire format: Pi,
+Oh My Pi, and Hermes use the chat model (`MOB_AI_MODEL`); Claude Code uses the
+Anthropic alias (`MOB_AI_CLAUDE_MODEL`); Codex uses the Responses model
+(`MOB_AI_CODEX_MODEL`).
 
 ## First-release boundary
 
 - One small server and PostgreSQL
 - Fewer than ten allowlisted, trusted repositories
 - One embedded worker by default; one active CLI process at a time
-- Task-scoped Git worktrees and one writable lease per task
+- Root-only control repositories plus isolated task-scoped Agent working copies
+- One writable lease per task and human-only publication
 - Simple browser UI for task threads, agent roster, live run events, and artifacts
-- No Kubernetes, Redis, shared writable agent directories, automatic merge, or hostile-code security claim
+- No Kubernetes, Redis, shared writable agent directories, automatic merge, or hostile multi-tenant security claim
 
 ## Use the environment from another computer
 
@@ -49,6 +55,18 @@ mob run watch <run-id>
 The client stores only the server URL and scoped session token in
 `~/.config/mob/config.json` with mode `0600` (or at `MOB_CONFIG_PATH`).
 
+Install the external CLI without root from a trusted checkout:
+
+```bash
+git clone https://github.com/cdotlock/mob-agent-crew.git
+cd mob-agent-crew
+sh scripts/install-cli.sh
+```
+
+For direct/group chats, live steering, Agent definition, GitHub access,
+self-iteration, file browsing, and the exact HTTP contracts, give
+[the Mob control protocol](docs/llm-control.md) to the controlling LLM.
+
 ## Built-in file knowledge
 
 Mob includes the useful file protocol from the former MobWiki direction without
@@ -68,10 +86,14 @@ run starts, Mob automatically selects a bounded set of relevant excerpts and
 records the context manifest.
 
 All collaboration state is also projected to readable, stable files under
-`/data/state/workspaces/<id>/`. PostgreSQL currently remains the live queue,
-lease, session and API projection while file replay/rebuild is completed; see
-[ADR-001](docs/adr/001-file-native-agent-environment.md) for the migration
-boundary.
+`/data/state/workspaces/<id>/`. PostgreSQL remains the live queue, lease,
+session and API projection. A guarded, additive replay can validate or rebuild
+file-backed collaboration rows, including Agent connector profile rows, with
+`mob db rebuild`; operational auth and lease state remains
+database/environment-owned. Provider homes under `/data/agents` still belong to
+the volume and must be retained or regenerated. See
+[the replay runbook](docs/file-replay.md) and
+[ADR-001](docs/adr/001-file-native-agent-environment.md).
 
 See [the solution brief](docs/solution-brief.md) and [architecture](docs/architecture.md).
 

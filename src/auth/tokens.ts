@@ -15,6 +15,7 @@ const sessionClaimsSchema = baseClaimsSchema.extend({
 const runClaimsSchema = baseClaimsSchema.extend({
   kind: z.literal("run"),
   runId: z.string().uuid(),
+  attemptId: z.string().uuid(),
   taskId: z.string().uuid(),
 });
 

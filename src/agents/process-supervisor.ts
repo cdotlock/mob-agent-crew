@@ -1,7 +1,11 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { chown, mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import {
+  configuredAgentIdentity,
+  terminateAgentIdentityProcesses,
+} from "../workspace/agent-access.js";
 import { deferred, type Deferred } from "./async-queue.js";
 
 export const DEFAULT_ENV_ALLOWLIST = [
@@ -95,6 +99,7 @@ export class SupervisedProcess {
   readonly exit: Promise<ProcessExit>;
   readonly #exitDeferred: Deferred<ProcessExit>;
   readonly #killGraceMs: number;
+  readonly #runIdentity: { uid: number; gid: number } | undefined;
   #timeout: NodeJS.Timeout | undefined;
   #cancelPromise: Promise<void> | undefined;
   #exited = false;
@@ -106,12 +111,14 @@ export class SupervisedProcess {
     homeDirectory: string,
     exitDeferred: Deferred<ProcessExit>,
     killGraceMs: number,
+    runIdentity: { uid: number; gid: number } | undefined,
   ) {
     this.child = child;
     this.homeDirectory = homeDirectory;
     this.#exitDeferred = exitDeferred;
     this.exit = exitDeferred.promise;
     this.#killGraceMs = killGraceMs;
+    this.#runIdentity = runIdentity;
 
     child.once("close", (code, signal) => {
       this.#exited = true;
@@ -221,6 +228,13 @@ export class SupervisedProcess {
     if (this.#cleaned) return;
     this.#cleaned = true;
     if (this.#timeout) clearTimeout(this.#timeout);
+    try {
+      await terminateAgentIdentityProcesses(this.#runIdentity);
+    } catch (error) {
+      // The next workspace handoff independently repeats this sweep and fails
+      // closed if a process survived. Do not strand the current run result.
+      console.error("failed to clear residual Agent processes", error);
+    }
     await rm(this.homeDirectory, { recursive: true, force: true });
   }
 }
@@ -228,6 +242,10 @@ export class SupervisedProcess {
 export async function spawnSupervisedProcess(
   options: SpawnSupervisedProcessOptions,
 ): Promise<SupervisedProcess> {
+  const runIdentity = configuredAgentIdentity();
+  // Clear any daemon that escaped the previous CLI's process group before a
+  // new HOME or task subprocess becomes available to the shared Agent UID.
+  await terminateAgentIdentityProcesses(runIdentity);
   const homeDirectory = await mkdtemp(
     join(tmpdir(), options.homePrefix ?? "mob-agent-"),
   );
@@ -236,6 +254,14 @@ export async function spawnSupervisedProcess(
     options.env,
     options.envAllowlist,
   );
+  if (runIdentity) {
+    await Promise.all([
+      chown(homeDirectory, runIdentity.uid, runIdentity.gid),
+      chown(join(homeDirectory, ".config"), runIdentity.uid, runIdentity.gid),
+      chown(join(homeDirectory, ".cache"), runIdentity.uid, runIdentity.gid),
+      chown(join(homeDirectory, "tmp"), runIdentity.uid, runIdentity.gid),
+    ]);
+  }
   const exitDeferred = deferred<ProcessExit>();
 
   let child: ChildProcessWithoutNullStreams;
@@ -246,9 +272,11 @@ export async function spawnSupervisedProcess(
       detached: process.platform !== "win32",
       windowsHide: true,
       stdio: ["pipe", "pipe", "pipe"],
+      ...(runIdentity ? runIdentity : {}),
     });
     await waitForSpawn(child);
   } catch (error) {
+    await terminateAgentIdentityProcesses(runIdentity).catch(() => undefined);
     await rm(homeDirectory, { recursive: true, force: true });
     throw error;
   }
@@ -258,6 +286,7 @@ export async function spawnSupervisedProcess(
     homeDirectory,
     exitDeferred,
     options.killGraceMs ?? 2_000,
+    runIdentity,
   );
   if (options.timeoutMs !== undefined) {
     supervised.armTimeout(options.timeoutMs, {

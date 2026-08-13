@@ -6,10 +6,20 @@ import type {
   Artifact,
   ArtifactKind,
   BootstrapData,
+  ConversationDetail,
+  ConversationMember,
+  ConversationSummary,
   DelegationInput,
   ImportedContext,
+  FileContents,
+  FileListing,
+  FileScope,
+  KnowledgeEntry,
+  NewAgentInput,
+  NewConversationInput,
   NewTaskInput,
   RunStatus,
+  RunEvent,
   TaskDetail,
   TaskResolution,
   TaskStatus,
@@ -90,7 +100,7 @@ const taskStatuses = [
   "cancelled",
 ] as const;
 
-const resolutions = ["unreviewed", "accepted", "rejected", "pr_created"] as const;
+const resolutions = ["unreviewed", "accepted", "rejected", "branch_published", "pr_created"] as const;
 const agentStatuses = ["available", "working", "reviewing", "offline", "error"] as const;
 const runStatuses = [
   "queued",
@@ -174,6 +184,18 @@ function normalizeAgent(value: unknown, index = 0): AgentProfile {
   };
 }
 
+function normalizeConversationMember(value: unknown, index = 0): ConversationMember {
+  const item = object(value);
+  const name = text(item, ["displayName", "display_name", "name"], `Member ${index + 1}`);
+  return {
+    id: text(item, ["id", "actorId", "actor_id"], `member-${index + 1}`),
+    name,
+    handle: text(item, ["handle"], name.toLowerCase().replace(/[^a-z0-9_-]+/g, "-")),
+    kind: text(item, ["kind"]) === "agent" ? "agent" : "human",
+    initials: text(item, ["initials"], initials(name)),
+  };
+}
+
 function normalizeMessage(value: unknown, index = 0): ThreadMessage {
   const item = object(value);
   const actor = object(item.actor);
@@ -203,7 +225,7 @@ function normalizeRun(value: unknown, index = 0): AgentRun {
   const normalizedStatus = rawStatus.toLowerCase().replace(/[\s-]+/g, "_");
   return {
     id: text(item, ["id", "runId", "run_id"], `run-${index + 1}`),
-    agentId: text(item, ["agentId", "agent_id", "actorId", "actor_id"], "unknown-agent"),
+    agentId: text(item, ["agentId", "agent_id", "agentActorId", "agent_actor_id", "actorId", "actor_id"], "unknown-agent"),
     role: text(item, ["role", "intent", "label"], "Agent run"),
     status: statusAliases[normalizedStatus] ?? enumValue<RunStatus>(item.status, runStatuses, "queued"),
     attempt: Math.max(1, number(item, ["attempt", "attemptNumber", "attempt_number"], 1)),
@@ -211,6 +233,24 @@ function normalizeRun(value: unknown, index = 0): AgentRun {
     finishedAt: text(item, ["finishedAt", "finished_at", "completedAt", "completed_at"]) || null,
     summary: text(item, ["summary", "result", "errorMessage", "error_message"]),
     parentRunId: text(item, ["parentRunId", "parent_run_id"]) || null,
+  };
+}
+
+function normalizeConversation(value: unknown, index = 0): ConversationDetail {
+  const item = object(value);
+  const last = item.lastMessage ?? item.last_message;
+  const lastMessage = isRecord(last) ? normalizeMessage(last) : null;
+  return {
+    id: text(item, ["id", "conversationId", "conversation_id"], `conversation-${index + 1}`),
+    taskId: text(item, ["taskId", "task_id"]),
+    kind: text(item, ["kind"]) === "direct" ? "direct" : "group",
+    title: text(item, ["title"]) || null,
+    isPrimary: item.isPrimary === true || item.is_primary === true,
+    updatedAt: text(item, ["updatedAt", "updated_at", "createdAt", "created_at"], new Date().toISOString()),
+    members: array(item.members).map(normalizeConversationMember),
+    lastMessage,
+    messages: array(item.messages).map(normalizeMessage),
+    runs: array(item.runs).map(normalizeRun),
   };
 }
 
@@ -317,6 +357,44 @@ export async function fetchBootstrap(): Promise<BootstrapData> {
   return normalizeBootstrap(await request("/api/bootstrap"));
 }
 
+export async function fetchConversations(): Promise<ConversationSummary[]> {
+  const value = unbox(await request("/api/conversations"));
+  return array(value.conversations).map(normalizeConversation);
+}
+
+export async function fetchConversation(conversationId: string): Promise<ConversationDetail> {
+  return normalizeConversation(await request(`/api/conversations/${encodeURIComponent(conversationId)}`));
+}
+
+export async function createConversation(input: NewConversationInput): Promise<ConversationDetail> {
+  return normalizeConversation(await request("/api/conversations", {
+    method: "POST",
+    body: JSON.stringify(input),
+  }));
+}
+
+export async function postConversationMessage(
+  conversationId: string,
+  content: string,
+  options: { invoke?: boolean; agent?: string } = {},
+): Promise<{ message: ThreadMessage; runs: AgentRun[] }> {
+  const value = unbox(await request(`/api/conversations/${encodeURIComponent(conversationId)}/messages`, {
+    method: "POST",
+    body: JSON.stringify({ content, ...options }),
+  }));
+  return {
+    message: normalizeMessage(value.message ?? value),
+    runs: array(value.queuedRuns ?? value.queued_runs ?? value.runs).map(normalizeRun),
+  };
+}
+
+export async function createAgent(input: NewAgentInput): Promise<void> {
+  await request("/api/agents", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
 export async function createSession(email: string, password: string): Promise<void> {
   await request("/api/session", {
     method: "POST",
@@ -326,6 +404,91 @@ export async function createSession(email: string, password: string): Promise<vo
 
 export async function fetchTask(task: TaskSummary): Promise<TaskDetail> {
   return normalizeTaskDetail(await request(`/api/tasks/${encodeURIComponent(task.id)}`), task);
+}
+
+export async function fetchRunEvents(runId: string, after = 0): Promise<{ cursor: number; events: RunEvent[] }> {
+  const value = object(await request(`/api/runs/${encodeURIComponent(runId)}/events?after=${after}`));
+  const events = array(value.events).map((entry) => {
+    const event = object(entry);
+    return {
+      sequence: number(event, ["sequence"]),
+      type: text(event, ["type"], "event"),
+      payload: object(event.payload),
+      createdAt: text(event, ["createdAt", "created_at"], new Date().toISOString()),
+    };
+  });
+  return { cursor: number(value, ["cursor"], after), events };
+}
+
+export async function sendRunCommand(runId: string, type: "steer" | "follow_up", message: string): Promise<void> {
+  await request(`/api/runs/${encodeURIComponent(runId)}/commands`, {
+    method: "POST",
+    body: JSON.stringify({ type, message }),
+  });
+}
+
+export async function fetchFiles(scope: FileScope, taskId: string, path = ""): Promise<FileListing> {
+  const query = new URLSearchParams({ scope, taskId, path });
+  const value = object(await request(`/api/files?${query.toString()}`));
+  return {
+    scope,
+    path: text(value, ["path"]),
+    entries: array(value.entries).map((item) => {
+      const entry = object(item);
+      return {
+        name: text(entry, ["name"]),
+        path: text(entry, ["path"]),
+        kind: text(entry, ["kind"]) === "directory" ? "directory" : "file",
+        bytes: typeof entry.bytes === "number" ? entry.bytes : null,
+        updatedAt: text(entry, ["updatedAt", "updated_at"], new Date().toISOString()),
+      };
+    }),
+  };
+}
+
+export async function fetchFile(scope: FileScope, taskId: string, path: string): Promise<FileContents> {
+  const query = new URLSearchParams({ scope, taskId, path });
+  const value = object(await request(`/api/files/content?${query.toString()}`));
+  return {
+    scope,
+    path: text(value, ["path"]),
+    name: text(value, ["name"]),
+    bytes: number(value, ["bytes"]),
+    language: text(value, ["language"], "text"),
+    content: text(value, ["content"]),
+    truncated: value.truncated === true,
+  };
+}
+
+export async function fetchKnowledge(area?: "raw" | "wiki"): Promise<KnowledgeEntry[]> {
+  const query = area ? `?area=${area}` : "";
+  const value = object(await request(`/api/knowledge${query}`));
+  return array(value.entries).map((item) => {
+    const entry = object(item);
+    return {
+      path: text(entry, ["path"]),
+      area: text(entry, ["area"]) === "raw" ? "raw" : "wiki",
+      title: text(entry, ["title", "path"]),
+      bytes: number(entry, ["bytes"]),
+      revision: text(entry, ["revision"]),
+      updatedAt: text(entry, ["updatedAt", "updated_at"], new Date().toISOString()),
+    };
+  });
+}
+
+export async function fetchKnowledgeFile(path: string): Promise<FileContents> {
+  const query = new URLSearchParams({ path });
+  const value = object(await request(`/api/knowledge/file?${query.toString()}`));
+  const content = text(value, ["content"]);
+  return {
+    scope: "workspace",
+    path: text(value, ["path"], path),
+    name: path.split("/").at(-1) ?? path,
+    bytes: number(value, ["bytes"], new TextEncoder().encode(content).length),
+    language: "markdown",
+    content,
+    truncated: false,
+  };
 }
 
 export async function createTask(input: NewTaskInput): Promise<TaskDetail> {
@@ -393,6 +556,29 @@ export async function reviewTask(
     method: "POST",
     body: JSON.stringify({ decision, note }),
   });
+}
+
+export interface TaskPublication {
+  branch: string;
+  commit: string;
+  changedFiles: string[];
+}
+
+export async function publishTask(taskId: string, branch?: string): Promise<TaskPublication> {
+  const value = await request(`/api/tasks/${encodeURIComponent(taskId)}/publications`, {
+    method: "POST",
+    body: JSON.stringify({
+      confirm: true,
+      ...(branch ? { branch } : {}),
+      commitMessage: "mob: publish reviewed task",
+    }),
+  });
+  const root = unbox(value);
+  return {
+    branch: text(root, ["branch"]),
+    commit: text(root, ["commit"]),
+    changedFiles: array(root.changedFiles ?? root.changed_files).map(String),
+  };
 }
 
 function normalizeImportedContext(value: unknown, fallback: Partial<ImportedContext>): ImportedContext {

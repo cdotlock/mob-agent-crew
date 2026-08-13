@@ -3,6 +3,7 @@ export type ActorId = string;
 export type UserAuthRecordId = string;
 export type RepositoryId = string;
 export type TaskId = string;
+export type ConversationId = string;
 export type MessageId = string;
 export type DelegationId = string;
 export type RunId = string;
@@ -23,6 +24,7 @@ export type TaskStatus =
   | "completed"
   | "cancelled";
 export type MessageKind = "comment" | "progress" | "result" | "system";
+export type ConversationKind = "direct" | "group";
 export type DelegationStatus =
   | "queued"
   | "accepted"
@@ -146,10 +148,37 @@ export interface Task {
   updatedAt: Date;
 }
 
+/**
+ * A lightweight chat surface over a task execution context.
+ *
+ * The task owns repository/run guardrails; the conversation only owns who can
+ * read/write a transcript. Every task has one primary group conversation for
+ * compatibility with the original task-thread API.
+ */
+export interface Conversation {
+  id: ConversationId;
+  workspaceId: WorkspaceId;
+  taskId: TaskId;
+  kind: ConversationKind;
+  title: string | null;
+  createdByActorId: ActorId;
+  isPrimary: boolean;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface ConversationMembership {
+  workspaceId: WorkspaceId;
+  conversationId: ConversationId;
+  actorId: ActorId;
+  joinedAt: Date;
+}
+
 export interface Message {
   id: MessageId;
   workspaceId: WorkspaceId;
   taskId: TaskId;
+  conversationId: ConversationId;
   actorId: ActorId;
   sourceRunId: RunId | null;
   kind: MessageKind;
@@ -179,6 +208,8 @@ export interface Run {
   id: RunId;
   workspaceId: WorkspaceId;
   taskId: TaskId;
+  conversationId: ConversationId;
+  triggerMessageId: MessageId | null;
   agentActorId: ActorId;
   requestedByActorId: ActorId;
   delegationId: DelegationId | null;
@@ -271,6 +302,8 @@ export interface Approval {
 
 export interface TaskThread {
   task: Task;
+  conversations: Conversation[];
+  conversationMemberships: ConversationMembership[];
   messages: Message[];
   delegations: Delegation[];
   runs: Run[];
@@ -278,4 +311,11 @@ export interface TaskThread {
   events: RunEvent[];
   artifacts: Artifact[];
   approvals: Approval[];
+}
+
+export interface ConversationThread {
+  conversation: Conversation;
+  members: ConversationMembership[];
+  messages: Message[];
+  runs: Run[];
 }

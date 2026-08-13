@@ -1,4 +1,10 @@
-export type AgentDriverId = "mock" | "codex" | "claude" | "pi" | "omp";
+export type AgentDriverId =
+  | "mock"
+  | "codex"
+  | "claude"
+  | "pi"
+  | "omp"
+  | "hermes";
 
 export type AgentTransport = "in-process" | "one-shot" | "duplex-jsonl";
 

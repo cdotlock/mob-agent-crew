@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { loadEnvFile } from "node:process";
 import { z } from "zod";
@@ -32,8 +32,14 @@ const environmentSchema = z.object({
   MOB_ADMIN_NAME: z.string().min(1).default("Workspace Admin"),
   MOB_BOOTSTRAP_REPOSITORY_URL: z.string().url().default("https://github.com/cdotlock/mob-agent-crew"),
   MOB_AI_KEY: z.string().startsWith("mob-").optional(),
+  MOB_AI_KEY_FILE: z.string().min(1).optional(),
   MOB_AI_BASE_URL: z.string().url().default("https://ai.mob-ai.cn/api"),
   MOB_AI_MODEL: z.string().min(1).default("deepseek-v4-pro"),
+  MOB_AI_CLAUDE_MODEL: z.string().min(1).default("claude-opus-4-6:free"),
+  MOB_AI_CODEX_MODEL: z.string().min(1).default("gpt-5.6-sol"),
+  MOB_RELEASE_REVISION: z.string().min(1).max(128).optional(),
+  RAILWAY_GIT_COMMIT_SHA: z.string().min(1).max(128).optional(),
+  RAILWAY_DEPLOYMENT_ID: z.string().min(1).max(128).optional(),
 });
 
 export type AppConfig = {
@@ -54,10 +60,16 @@ export type AppConfig = {
   mobAiKey?: string;
   mobAiBaseUrl: string;
   mobAiModel: string;
+  mobAiClaudeModel?: string;
+  mobAiCodexModel?: string;
+  releaseRevision?: string;
+  deploymentId?: string;
 };
 
 export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppConfig {
   const parsed = environmentSchema.parse(environment);
+  const mobAiKey = parsed.MOB_AI_KEY ?? readOptionalSecretFile(parsed.MOB_AI_KEY_FILE);
+  const releaseRevision = parsed.MOB_RELEASE_REVISION ?? parsed.RAILWAY_GIT_COMMIT_SHA;
 
   if (
     parsed.NODE_ENV === "production" &&
@@ -81,8 +93,18 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
     ...(parsed.MOB_ADMIN_PASSWORD ? { adminPassword: parsed.MOB_ADMIN_PASSWORD } : {}),
     adminName: parsed.MOB_ADMIN_NAME,
     bootstrapRepositoryUrl: parsed.MOB_BOOTSTRAP_REPOSITORY_URL,
-    ...(parsed.MOB_AI_KEY ? { mobAiKey: parsed.MOB_AI_KEY } : {}),
+    ...(mobAiKey ? { mobAiKey } : {}),
     mobAiBaseUrl: parsed.MOB_AI_BASE_URL,
     mobAiModel: parsed.MOB_AI_MODEL,
+    mobAiClaudeModel: parsed.MOB_AI_CLAUDE_MODEL,
+    mobAiCodexModel: parsed.MOB_AI_CODEX_MODEL,
+    ...(releaseRevision ? { releaseRevision } : {}),
+    ...(parsed.RAILWAY_DEPLOYMENT_ID ? { deploymentId: parsed.RAILWAY_DEPLOYMENT_ID } : {}),
   };
+}
+
+function readOptionalSecretFile(path: string | undefined): string | undefined {
+  if (!path) return undefined;
+  const value = readFileSync(path, "utf8").trim();
+  return value || undefined;
 }
