@@ -11,6 +11,16 @@ COPY src ./src
 COPY web ./web
 RUN pnpm build
 
+FROM node:22-bookworm-slim AS deepseek-harness
+
+ARG DEEPSEEK_HARNESS_VERSION=0.1.0-rc.6
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential python3 \
+    && npm install -g "@deepseek-ai/dsh@${DEEPSEEK_HARNESS_VERSION}" \
+    && test "$(dsh --version)" = "${DEEPSEEK_HARNESS_VERSION}" \
+    && node -e "require('/usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/node-pty')" \
+    && rm -rf /var/lib/apt/lists/*
+
 FROM node:22-bookworm-slim AS runtime
 
 ARG CLAUDE_CODE_VERSION=2.1.220
@@ -39,7 +49,6 @@ RUN groupadd --gid 10001 mob-agent \
 
 RUN npm install -g --ignore-scripts "@earendil-works/pi-coding-agent@${PI_VERSION}" \
     && npm install -g --ignore-scripts --omit=optional "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
-    && npm install -g --ignore-scripts "@deepseek-ai/dsh@${DEEPSEEK_HARNESS_VERSION}" \
     && case "${TARGETARCH}" in \
       amd64) CLAUDE_PLATFORM_PACKAGE=@anthropic-ai/claude-code-linux-x64 ;; \
       arm64) CLAUDE_PLATFORM_PACKAGE=@anthropic-ai/claude-code-linux-arm64 ;; \
@@ -47,6 +56,9 @@ RUN npm install -g --ignore-scripts "@earendil-works/pi-coding-agent@${PI_VERSIO
     esac \
     && npm install --prefix /usr/local/lib/node_modules/@anthropic-ai/claude-code \
       --no-save "${CLAUDE_PLATFORM_PACKAGE}@${CLAUDE_CODE_VERSION}"
+
+COPY --from=deepseek-harness /usr/local/lib/node_modules/@deepseek-ai/dsh /usr/local/lib/node_modules/@deepseek-ai/dsh
+RUN ln -s /usr/local/lib/node_modules/@deepseek-ai/dsh/lib/bin.js /usr/local/bin/dsh
 
 # Install the immutable official OMP release asset. The moving omp.sh installer
 # is intentionally not used: it is both non-reproducible and rejects some
