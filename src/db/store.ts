@@ -1241,6 +1241,7 @@ export class CollaborationStore {
       const runRows = await tx<DbRow[]>`SELECT * FROM runs WHERE id = ${input.runId} FOR UPDATE`;
       const run = mapRun(one(runRows, "Run"));
       await requireActor(tx, run.workspaceId, input.requestedByActorId);
+      if (run.status !== "queued" && run.status !== "running") return run;
       assertRunTransition(run.status, "cancelled");
       const updatedRows = await tx<DbRow[]>`
         UPDATE runs

@@ -5,6 +5,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { issueSessionToken } from "../src/auth/tokens.js";
 import type { AppConfig } from "../src/config.js";
 import type { CollaborationStore } from "../src/db/store.js";
+import { DomainRuleError } from "../src/domain/rules.js";
+import type { Run } from "../src/domain/model.js";
 import { buildApp } from "../src/server/app.js";
 import type { FileWorkspaceStore } from "../src/storage/index.js";
 import type { MobWorker } from "../src/worker/worker.js";
@@ -134,6 +136,75 @@ describe("runtime control surfaces", () => {
     expect(member.statusCode).toBe(200);
   });
 
+  it("returns the true terminal run when cancellation races with failure", async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), "mob-runtime-cancel-race-"));
+    temporaryDirectories.push(dataDir);
+    const failedRun = runWithStatus("failed");
+    const store = {
+      sql: vi.fn(async () => [{
+        task_id: TASK_ID,
+        workspace_id: WORKSPACE_ID,
+        conversation_id: CONVERSATION_ID,
+      }]),
+      canActorAccessConversation: vi.fn(async () => true),
+      cancelRun: vi.fn(async () => failedRun),
+      getTaskThread: vi.fn(async () => ({ task: { id: TASK_ID } })),
+    } as unknown as CollaborationStore;
+    const worker = {
+      cancelRun: vi.fn(async () => true),
+    } as unknown as MobWorker;
+    const files = {
+      repairTaskThread: vi.fn(async () => undefined),
+    } as unknown as FileWorkspaceStore;
+    const app = await buildApp({ config: config(dataDir), store, files, worker });
+    apps.push(app);
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/runs/${RUN_ID}/cancel`,
+      headers: { authorization: authorizationFor(HUMAN_ID) },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ id: RUN_ID, status: "failed" });
+    expect(worker.cancelRun).toHaveBeenCalledWith(RUN_ID);
+    expect(store.cancelRun).toHaveBeenCalledWith({ runId: RUN_ID, requestedByActorId: HUMAN_ID });
+  });
+
+  it("maps domain rule failures to conflict responses", async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), "mob-runtime-domain-error-"));
+    temporaryDirectories.push(dataDir);
+    const store = {
+      sql: vi.fn(async () => [{
+        task_id: TASK_ID,
+        workspace_id: WORKSPACE_ID,
+        conversation_id: CONVERSATION_ID,
+      }]),
+      canActorAccessConversation: vi.fn(async () => true),
+      cancelRun: vi.fn(async () => {
+        throw new DomainRuleError("invalid_run_transition", "Run cannot be cancelled now.");
+      }),
+    } as unknown as CollaborationStore;
+    const app = await buildApp({
+      config: config(dataDir),
+      store,
+      files: { workspaceRoot: vi.fn() } as unknown as FileWorkspaceStore,
+    });
+    apps.push(app);
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/runs/${RUN_ID}/cancel`,
+      headers: { authorization: authorizationFor(HUMAN_ID) },
+    });
+
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toEqual({
+      error: "invalid_run_transition",
+      message: "Run cannot be cancelled now.",
+    });
+  });
+
   it("blocks direct-chat artifact downloads and repository browsing for non-members", async () => {
     const dataDir = await mkdtemp(join(tmpdir(), "mob-artifact-acl-"));
     temporaryDirectories.push(dataDir);
@@ -230,6 +301,27 @@ describe("runtime control surfaces", () => {
 
 function authorizationFor(actorId: string): string {
   return `Bearer ${issueSessionToken({ actorId, workspaceId: WORKSPACE_ID }, SECRET)}`;
+}
+
+function runWithStatus(status: Run["status"]): Run {
+  const now = new Date("2026-08-13T00:00:00.000Z");
+  return {
+    id: RUN_ID,
+    workspaceId: WORKSPACE_ID,
+    taskId: TASK_ID,
+    conversationId: CONVERSATION_ID,
+    triggerMessageId: null,
+    agentActorId: "77777777-7777-4777-8777-777777777777",
+    requestedByActorId: HUMAN_ID,
+    delegationId: null,
+    status,
+    priority: 0,
+    writerRequired: true,
+    latestAttemptNumber: 1,
+    createdAt: now,
+    updatedAt: now,
+    completedAt: now,
+  };
 }
 
 function config(dataDir: string): AppConfig {

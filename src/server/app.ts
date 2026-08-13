@@ -13,7 +13,7 @@ import type { CollaborationStore } from "../db/store.js";
 import { StoreError } from "../db/store.js";
 import { hashPassword, verifyPassword } from "../auth/passwords.js";
 import { issueSessionToken, verifyAnyToken, verifyToken, type TokenClaims } from "../auth/tokens.js";
-import { extractMentionHandles, normalizeGitHubRepositoryUrl } from "../domain/rules.js";
+import { DomainRuleError, extractMentionHandles, normalizeGitHubRepositoryUrl } from "../domain/rules.js";
 import type { Actor, ConversationThread } from "../domain/model.js";
 import { parseMarkdownImport } from "../imports/context-imports.js";
 import type { MobWorker } from "../worker/worker.js";
@@ -172,6 +172,9 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
             ? 403
             : 409;
       return reply.code(status).send({ error: error.code, message: error.message });
+    }
+    if (error instanceof DomainRuleError) {
+      return reply.code(409).send({ error: error.code, message: error.message });
     }
     app.log.error(error);
     return reply.code(500).send({ error: "internal_error", message: "The request could not be completed." });
