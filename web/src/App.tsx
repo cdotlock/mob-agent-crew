@@ -541,6 +541,8 @@ function ThreadPane({
     );
   }
   const participants = agents.filter((agent) => task.participantIds.includes(agent.id));
+  const activeRun = [...task.runs].reverse().find((run) => !terminalRunStatuses.has(run.status));
+  const activeAgent = activeRun ? agents.find((agent) => agent.id === activeRun.agentId) : null;
   return (
     <main className="thread-pane pane" id="main-content">
       <header className="thread-header">
@@ -568,6 +570,17 @@ function ThreadPane({
       </div>
 
       {actionError ? <div className="inline-alert" role="alert"><WarningCircle /> <span>{actionError}</span></div> : null}
+
+      {activeRun ? (
+        <div className="run-live-banner" role="status" aria-live="polite">
+          <SpinnerGap className="spin" />
+          <span>
+            <strong>{activeAgent?.name ?? "Agent"} is {activeRun.status === "queued" ? "queued" : "working"}</strong>
+            <small>{activeRun.summary || "Preparing the task…"}</small>
+          </span>
+          <time>{runDuration(activeRun)}</time>
+        </div>
+      ) : null}
 
       <section className="thread-scroll" aria-label="Shared task thread">
         <div className="thread-intro">
@@ -639,7 +652,7 @@ function RunTimeline({
       <div className="inspector-heading"><span>Run timeline</span><small>{task.runs.length}</small></div>
       {task.runs.length ? (
         <ol className="run-timeline">
-          {task.runs.map((run) => {
+          {[...task.runs].reverse().map((run) => {
             const agent = agents.find((entry) => entry.id === run.agentId);
             const isActive = !terminalRunStatuses.has(run.status);
             return (
@@ -691,6 +704,7 @@ function ArtifactCard({
         <CaretRight className="artifact-caret" />
       </button>
       <div className="artifact-meta"><span>{agent?.name ?? "Agent"}</span><span>{artifact.revision}</span><time>{relativeTime(artifact.createdAt)}</time></div>
+      {artifact.downloadUrl ? <a className="artifact-download" href={artifact.downloadUrl}><ArrowRight /> Download file</a> : null}
       {expanded ? (
         <pre className={classNames("artifact-preview", isCode && "code-preview")}>
           {artifact.content.split("\n").map((line, index) => (
@@ -1001,6 +1015,38 @@ export function App() {
   }, [selectedTask?.id, source]);
 
   useEffect(() => {
+    if (source !== "api" || !selectedTask) return;
+    let stopped = false;
+    let inFlight = false;
+    const task = selectedTask;
+    const refresh = async () => {
+      if (stopped || inFlight || document.visibilityState === "hidden") return;
+      inFlight = true;
+      try {
+        const next = await fetchTask(task);
+        if (stopped) return;
+        setDetailCache((current) => ({ ...current, [task.id]: next }));
+        setTasks((current) => current.map((item) => item.id === task.id ? {
+          ...item,
+          status: next.status,
+          updatedAt: next.updatedAt,
+          summary: next.messages.at(-1)?.content ?? item.summary,
+        } : item));
+      } catch {
+        // Keep the last good task snapshot; explicit actions still surface request errors.
+      } finally {
+        inFlight = false;
+      }
+    };
+    void refresh();
+    const interval = window.setInterval(() => void refresh(), 2_500);
+    return () => {
+      stopped = true;
+      window.clearInterval(interval);
+    };
+  }, [source, selectedTask?.id]);
+
+  useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
       if (event.key.toLowerCase() === "n" && !event.metaKey && !event.ctrlKey && !event.altKey) {
         const target = event.target as HTMLElement | null;
@@ -1059,6 +1105,8 @@ export function App() {
       if (source === "api") {
         const saved = await postMessage(detail.id, content);
         updateDetail(detail.id, (current) => ({ ...current, messages: current.messages.map((message) => message.id === optimisticId ? saved : message) }));
+        const refreshed = await fetchTask(detail);
+        setDetailCache((current) => ({ ...current, [detail.id]: refreshed }));
       } else {
         const mentioned = agents.find((agent) => new RegExp(`@${agent.name}\\b`, "i").test(content));
         if (mentioned) {
@@ -1209,6 +1257,7 @@ export function App() {
       revision: detail?.baseRef ?? "task-context",
       content: context.content,
       language: context.kind === "markdown" ? "markdown" : "text",
+      downloadUrl: null,
     };
   }
 

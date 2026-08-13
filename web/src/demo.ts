@@ -232,6 +232,7 @@ const webhookTask: TaskDetail = {
       content:
         "Concurrent retries can receive the same attempt key within one millisecond. Preserve the public helper, add an internal monotonic suffix, and cover simultaneous delivery attempts.",
       language: "markdown",
+      downloadUrl: null,
     },
     {
       id: "artifact-patch",
@@ -257,6 +258,7 @@ const webhookTask: TaskDetail = {
         "+}",
       ].join("\n"),
       language: "diff",
+      downloadUrl: null,
     },
     {
       id: "artifact-tests",
@@ -269,6 +271,7 @@ const webhookTask: TaskDetail = {
       content:
         '{\n  "focused": { "runs": 100, "passed": 100 },\n  "full": { "passed": 148, "failed": 0 },\n  "durationSeconds": 31.4\n}',
       language: "json",
+      downloadUrl: null,
     },
   ],
 };
@@ -383,6 +386,7 @@ const serializerTask: TaskDetail = {
       revision: "release/1.8@a18be21",
       content: "Error: credential home is not initialized for profile agent-patch\nexit code: 1",
       language: "text",
+      downloadUrl: null,
     },
   ],
 };

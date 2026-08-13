@@ -98,6 +98,7 @@ export interface Artifact {
   revision: string;
   content: string;
   language: string;
+  downloadUrl: string | null;
 }
 
 export interface TaskDetail extends TaskSummary {

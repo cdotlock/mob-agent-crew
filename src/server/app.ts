@@ -1,5 +1,7 @@
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { resolve } from "node:path";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { basename, extname, resolve } from "node:path";
 import cookie from "@fastify/cookie";
 import multipart from "@fastify/multipart";
 import staticPlugin from "@fastify/static";
@@ -231,6 +233,12 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     ]);
     const repo = repositories.find((item) => item.id === thread.task.repositoryId);
     const actorMap = new Map(actors.map((item) => [item.id, item]));
+    const attemptByRun = new Map(thread.attempts.map((attempt) => [attempt.runId, attempt]));
+    const activityByRun = new Map<string, string>();
+    for (const event of thread.events) {
+      const summary = summarizeRunEvent(event.type, event.payload);
+      if (summary) activityByRun.set(event.runId, summary);
+    }
     return {
       ...thread.task,
       repository: repo?.name,
@@ -242,8 +250,43 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
         actorKind: actorMap.get(message.actorId)?.kind,
         runId: message.sourceRunId,
       })),
-      runs: thread.runs.map((run) => ({ ...run, agentId: run.agentActorId, attempt: run.latestAttemptNumber })),
-      artifacts: thread.artifacts,
+      runs: thread.runs.map((run) => {
+        const attempt = attemptByRun.get(run.id);
+        return {
+          ...run,
+          agentId: run.agentActorId,
+          attempt: run.latestAttemptNumber,
+          startedAt: attempt?.startedAt ?? null,
+          finishedAt: attempt?.completedAt ?? run.completedAt,
+          summary: activityByRun.get(run.id) ?? runStatusSummary(run.status),
+        };
+      }),
+      artifacts: await Promise.all(thread.artifacts.map(async (artifact) => {
+        let content = "";
+        try {
+          if (artifact.uri.startsWith("file:")) {
+            content = (await readFile(artifact.uri.slice(5), "utf8")).slice(0, 100_000);
+          } else if (artifact.uri.startsWith("document:")) {
+            const rows = await store.sql<Array<{ content: string }>>`
+              SELECT content FROM workspace_documents
+              WHERE id = ${artifact.uri.slice(9)} AND workspace_id = ${actor.workspaceId}
+            `;
+            content = rows[0]?.content ?? "";
+          }
+        } catch {
+          content = "";
+        }
+        return {
+          ...artifact,
+          producerAgentId: artifact.actorId,
+          summary: typeof artifact.metadata.summary === "string"
+            ? artifact.metadata.summary
+            : artifact.mediaType ?? "Published artifact",
+          revision: typeof artifact.metadata.revision === "string" ? artifact.metadata.revision : "unversioned",
+          content,
+          downloadUrl: `/api/artifacts/${artifact.id}/download`,
+        };
+      })),
     };
   });
 
@@ -311,19 +354,72 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
 
   app.post<{ Params: { id: string } }>("/api/tasks/:id/artifacts", async (request, reply) => {
     const actor = requireActor(request);
+    if (actor.kind === "run" && actor.taskId !== request.params.id) {
+      throw new StoreError("task_scope_violation", "Run tokens may only publish to their own task.");
+    }
     const part = await request.file();
-    if (!part) return reply.code(400).send({ error: "file_required", message: "Choose a Markdown file." });
-    const parsed = parseMarkdownImport(part.filename, (await part.toBuffer()).toString("utf8"));
-    const document = await store.createWorkspaceDocument({
-      workspaceId: actor.workspaceId, name: parsed.filename, content: parsed.content,
-      source: `task:${request.params.id}`, uploadedByActorId: actor.actorId,
+    if (!part) return reply.code(400).send({ error: "file_required", message: "Choose a file." });
+    const contents = await part.toBuffer();
+    if (actor.kind === "session") {
+      const parsed = parseMarkdownImport(part.filename, contents.toString("utf8"));
+      const document = await store.createWorkspaceDocument({
+        workspaceId: actor.workspaceId, name: parsed.filename, content: parsed.content,
+        source: `task:${request.params.id}`, uploadedByActorId: actor.actorId,
+      });
+      await store.createArtifact({
+        taskId: request.params.id, actorId: actor.actorId,
+        kind: "file", name: parsed.filename, uri: `document:${document.id}`, mediaType: "text/markdown", byteSize: BigInt(parsed.bytes),
+        metadata: { title: parsed.title, summary: `${parsed.bytes} bytes Markdown context` },
+      });
+      return { context: { ...document, kind: "markdown", summary: `${parsed.bytes} bytes Markdown context` } };
+    }
+
+    const filename = safeArtifactFilename(part.filename);
+    const directory = resolve(config.dataDir, "artifacts", request.params.id);
+    await mkdir(directory, { recursive: true });
+    const path = resolve(directory, `${randomUUID()}-${filename}`);
+    await writeFile(path, contents, { mode: 0o600 });
+    const extension = extname(filename).toLowerCase();
+    const artifact = await store.createArtifact({
+      taskId: request.params.id,
+      actorId: actor.actorId,
+      sourceRunId: actor.runId,
+      kind: extension === ".patch" || extension === ".diff" ? "patch" : extension === ".log" ? "log" : "file",
+      name: filename,
+      uri: `file:${path}`,
+      mediaType: part.mimetype || "application/octet-stream",
+      byteSize: BigInt(contents.byteLength),
+      sha256: createHash("sha256").update(contents).digest("hex"),
+      metadata: { summary: `${contents.byteLength} byte Agent deliverable` },
     });
-    await store.createArtifact({
-      taskId: request.params.id, actorId: actor.actorId, sourceRunId: actor.kind === "run" ? actor.runId : null,
-      kind: "file", name: parsed.filename, uri: `document:${document.id}`, mediaType: "text/markdown", byteSize: BigInt(parsed.bytes),
-      metadata: { title: parsed.title },
-    });
-    return { context: { ...document, kind: "markdown", summary: `${parsed.bytes} bytes Markdown context` } };
+    return { artifact: { ...artifact, downloadUrl: `/api/artifacts/${artifact.id}/download` } };
+  });
+
+  app.get<{ Params: { id: string } }>("/api/artifacts/:id/download", async (request, reply) => {
+    const actor = requireActor(request);
+    const rows = await store.sql<Array<{ workspace_id: string; name: string; uri: string; media_type: string | null }>>`
+      SELECT workspace_id, name, uri, media_type FROM artifacts WHERE id = ${request.params.id}
+    `;
+    const artifact = rows[0];
+    if (!artifact || artifact.workspace_id !== actor.workspaceId) throw new StoreError("not_found", "Artifact was not found.");
+    let contents: Buffer;
+    if (artifact.uri.startsWith("file:")) {
+      const root = resolve(config.dataDir, "artifacts");
+      const path = resolve(artifact.uri.slice(5));
+      if (!path.startsWith(`${root}/`)) throw new StoreError("not_found", "Artifact was not found.");
+      contents = await readFile(path);
+    } else if (artifact.uri.startsWith("document:")) {
+      const documents = await store.sql<Array<{ content: string }>>`
+        SELECT content FROM workspace_documents
+        WHERE id = ${artifact.uri.slice(9)} AND workspace_id = ${actor.workspaceId}
+      `;
+      if (!documents[0]) throw new StoreError("not_found", "Artifact was not found.");
+      contents = Buffer.from(documents[0].content, "utf8");
+    } else {
+      throw new StoreError("not_found", "Artifact was not found.");
+    }
+    reply.header("Content-Disposition", `attachment; filename="${safeArtifactFilename(artifact.name)}"`);
+    return reply.type(artifact.media_type ?? "application/octet-stream").send(contents);
   });
 
   app.post<{ Params: { id: string } }>("/api/tasks/:id/imports/github", async (request) => {
@@ -341,6 +437,37 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     app.setNotFoundHandler((request, reply) => request.url.startsWith("/api/") ? reply.code(404).send({ error: "not_found" }) : reply.sendFile("index.html"));
   }
   return app;
+}
+
+function summarizeRunEvent(type: string, payload: Readonly<Record<string, unknown>>): string | null {
+  const message = typeof payload.message === "string" ? payload.message : null;
+  switch (type) {
+    case "runtime.started": return "Starting agent process…";
+    case "runtime.ready": return "Agent runtime is ready.";
+    case "turn.started": return "Agent is thinking…";
+    case "message.delta": return "Agent is responding…";
+    case "tool.started": return `Using ${message ?? "a tool"}…`;
+    case "tool.completed": return "Tool finished; agent is continuing…";
+    case "turn.completed": return "Agent finished its turn.";
+    case "error": return message ?? "Agent reported an error.";
+    default: return null;
+  }
+}
+
+function runStatusSummary(status: string): string {
+  if (status === "queued") return "Queued for the worker.";
+  if (status === "running") return "Agent is working…";
+  if (status === "succeeded") return "Agent run succeeded.";
+  if (status === "failed") return "Agent run failed.";
+  return "Agent run was cancelled.";
+}
+
+function safeArtifactFilename(value: string): string {
+  const filename = basename(value).replace(/[^A-Za-z0-9._-]+/gu, "-").replace(/^-+|-+$/gu, "");
+  if (!filename || filename === "." || filename === "..") {
+    throw new StoreError("invalid_artifact_name", "Artifact filename is invalid.");
+  }
+  return filename.slice(0, 180);
 }
 
 function requireActor(request: FastifyRequest): TokenClaims {

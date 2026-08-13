@@ -107,6 +107,7 @@ const artifactKinds = ["patch", "diff", "report", "plan", "log", "file"] as cons
 
 function normalizeTaskStatus(value: unknown): TaskStatus {
   const aliases: Record<string, TaskStatus> = {
+    active: "running",
     review: "review_ready",
     ready_for_review: "review_ready",
     done: "completed",
@@ -228,6 +229,7 @@ function normalizeArtifact(value: unknown, index = 0): Artifact {
     revision: text(item, ["revision", "baseRevision", "base_revision", "sha"], "unversioned"),
     content: text(item, ["content", "preview", "text"]),
     language: text(item, ["language", "format"], kind === "patch" || kind === "diff" ? "diff" : "text"),
+    downloadUrl: text(item, ["downloadUrl", "download_url"]) || null,
   };
 }
 

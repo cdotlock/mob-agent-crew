@@ -102,7 +102,8 @@ export class MobWorker {
       `You are participating as ${role || "a coding agent"} in a shared Mob Agent Crew task.`,
       `Task: ${thread.task.title}`,
       thread.task.description ? `Description: ${thread.task.description}` : "",
-      "Use the mob CLI for collaboration. Post concise progress, delegate only bounded deliverables, and finish with mob done.",
+      "Start the requested work immediately. Do not explore the Mob platform or inspect mob --help/context unless the user explicitly asks.",
+      "Use mob say only for meaningful progress, mob delegate only for a bounded handoff, mob artifact add for deliverables, and mob done once when finished.",
       "Never print environment variables, tokens, or credentials. Do not inspect runtime plumbing unless the task explicitly asks for it.",
       transcript ? `Shared thread:\n${transcript}` : "",
     ]
@@ -133,6 +134,9 @@ export class MobWorker {
 
   async #execute(claim: LeaseClaim): Promise<void> {
     let nativeRun: AgentRun | undefined;
+    let leaseLost = false;
+    let renewingLease = false;
+    let leaseHeartbeat: ReturnType<typeof setInterval> | undefined;
     try {
       const profile = await this.#loadProfile(claim);
       if (profile.driver !== "mock" && !this.#options.drivers.has(profile.driver)) {
@@ -141,7 +145,26 @@ export class MobWorker {
       const driver = this.#options.drivers.get(profile.driver);
       await this.#options.store.markAttemptRunning(claim);
 
+      const leaseMs = this.#options.leaseMs ?? 60_000;
+      leaseHeartbeat = setInterval(async () => {
+        if (renewingLease) return;
+        renewingLease = true;
+        try {
+          const renewed = await this.#options.store.renewLease(claim, leaseMs);
+          if (!renewed) {
+            leaseLost = true;
+            if (nativeRun) await nativeRun.cancel("Worker lease was lost");
+          }
+        } catch (error) {
+          console.error(`failed to renew lease for run ${claim.runId}`, error);
+        } finally {
+          renewingLease = false;
+        }
+      }, Math.max(1_000, Math.floor(leaseMs / 3)));
+      leaseHeartbeat.unref();
+
       const taskDir = await this.#prepareTaskDirectory(claim);
+      if (leaseLost) throw new Error("Worker lease was lost while preparing the task workspace");
       const token = issueRunToken(
         {
           actorId: claim.agentActorId,
@@ -182,19 +205,41 @@ export class MobWorker {
         });
       }
       const result = await nativeRun.result;
-      const status = result.outcome === "completed" ? "succeeded" : result.outcome === "cancelled" ? "cancelled" : "failed";
+      const threadAfterRun = await this.#options.store.getTaskThread(claim.taskId);
+      const resultAlreadyPosted = threadAfterRun.messages.some(
+        (message) => message.sourceRunId === claim.runId && message.kind === "result",
+      );
+      const missingResult = result.outcome === "completed" && !result.finalMessage && !resultAlreadyPosted;
+      const status = missingResult
+        ? "failed"
+        : result.outcome === "completed"
+          ? "succeeded"
+          : result.outcome === "cancelled"
+            ? "cancelled"
+            : "failed";
       await this.#options.store.completeAttempt({
         claim,
         status,
-        ...(result.error ? { failureMessage: result.error } : {}),
-        ...(result.outcome === "timed_out" ? { failureCode: "timeout" } : {}),
+        ...(missingResult
+          ? { failureCode: "missing_result", failureMessage: "Agent exited without posting mob done or returning a final message." }
+          : result.error
+            ? { failureMessage: result.error }
+            : {}),
+        ...(!missingResult && result.outcome === "timed_out" ? { failureCode: "timeout" } : {}),
       });
 
+      if (missingResult) {
+        await this.#options.store.createMessage({
+          taskId: claim.taskId,
+          actorId: claim.agentActorId,
+          sourceRunId: claim.runId,
+          kind: "progress",
+          body: "I stopped without publishing a final result. The run has been marked failed so it can be retried safely.",
+          enqueueMentionedAgents: false,
+        });
+      }
+
       if (result.finalMessage) {
-        const thread = await this.#options.store.getTaskThread(claim.taskId);
-        const resultAlreadyPosted = thread.messages.some(
-          (message) => message.sourceRunId === claim.runId && message.kind === "result",
-        );
         if (!resultAlreadyPosted) {
           await this.#options.store.createMessage({
             taskId: claim.taskId,
@@ -219,6 +264,7 @@ export class MobWorker {
         console.error("failed to record worker failure", completionError);
       }
     } finally {
+      if (leaseHeartbeat) clearInterval(leaseHeartbeat);
       this.#active.delete(claim.runId);
       if (nativeRun) await nativeRun.forceKill().catch(() => undefined);
     }

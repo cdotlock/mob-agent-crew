@@ -949,6 +949,46 @@ kbd {
   font-size: 11px;
 }
 
+.run-live-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 48px;
+  padding: 8px 16px;
+  border-bottom: 1px solid rgba(91, 184, 255, 0.22);
+  background: rgba(29, 78, 216, 0.1);
+  color: #dbeafe;
+}
+
+.run-live-banner > svg {
+  flex: 0 0 auto;
+  color: #5bb8ff;
+}
+
+.run-live-banner > span {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.run-live-banner strong,
+.run-live-banner small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.run-live-banner small,
+.run-live-banner time {
+  color: var(--text-muted);
+  font-size: 0.75rem;
+}
+
+.run-live-banner time {
+  margin-left: auto;
+  white-space: nowrap;
+}
+
 .inline-alert svg {
   width: 16px;
   height: 16px;
@@ -1814,6 +1854,25 @@ kbd {
   padding: 0 8px 7px 46px;
   color: var(--faint);
   font-size: 7px;
+}
+
+.artifact-download {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin: 0 12px 10px;
+  color: var(--blue);
+  font-size: 10px;
+  text-decoration: none;
+}
+
+.artifact-download:hover {
+  text-decoration: underline;
+}
+
+.artifact-download svg {
+  width: 12px;
+  height: 12px;
 }
 
 .artifact-meta span + span::before,
