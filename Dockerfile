@@ -20,6 +20,7 @@ ARG CODEX_PACKAGE_LINUX_ARM64_SHA256=600d444443e8ec04397586965fde7de77de7795842f
 ARG GH_VERSION=2.94.0
 ARG HERMES_VERSION=0.19.0
 ARG HERMES_WHEEL_SHA256=bd0bac012aee38a60894781f4597dc29ee7bedb3448540249921f10d3bef327f
+ARG DEEPSEEK_HARNESS_VERSION=0.1.0-rc.6
 ARG PI_VERSION=0.84.1
 ARG OMP_VERSION=17.3.0
 ARG OMP_LINUX_AMD64_SHA256=287f07366f29896ef1e345423dab79b82a8dc0c1593383e20dfdd62a9dd2e799
@@ -38,6 +39,7 @@ RUN groupadd --gid 10001 mob-agent \
 
 RUN npm install -g --ignore-scripts "@earendil-works/pi-coding-agent@${PI_VERSION}" \
     && npm install -g --ignore-scripts --omit=optional "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
+    && npm install -g --ignore-scripts "@deepseek-ai/dsh@${DEEPSEEK_HARNESS_VERSION}" \
     && case "${TARGETARCH}" in \
       amd64) CLAUDE_PLATFORM_PACKAGE=@anthropic-ai/claude-code-linux-x64 ;; \
       arm64) CLAUDE_PLATFORM_PACKAGE=@anthropic-ai/claude-code-linux-arm64 ;; \
@@ -120,6 +122,10 @@ RUN node /usr/local/lib/node_modules/@anthropic-ai/claude-code/install.cjs \
     && codex exec --help >/dev/null \
     && test -x /opt/codex/codex-path/rg \
     && test -x /opt/codex/codex-resources/bwrap \
+    && command -v dsh \
+    && test "$(dsh --version)" = "${DEEPSEEK_HARNESS_VERSION}" \
+    && DSH_HOME=/tmp/dsh-smoke dsh --profile headless --dump-default-config >/dev/null \
+    && rm -rf /tmp/dsh-smoke \
     && command -v gh \
     && gh --version
 
