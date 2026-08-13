@@ -15,6 +15,8 @@ FROM node:22-bookworm-slim AS runtime
 
 ARG CLAUDE_CODE_VERSION=2.1.220
 ARG CODEX_VERSION=0.142.5
+ARG CODEX_LINUX_AMD64_SHA256=cb933ec3cb61bf4b5fc88eecf5e6149829faa6172535b6ef0afb0154beb4aab8
+ARG CODEX_LINUX_ARM64_SHA256=b18c75c49645918fae23beba0ab41c05f07941601510a2451ba97fe519573c38
 ARG GH_VERSION=2.94.0
 ARG HERMES_VERSION=0.19.0
 ARG HERMES_WHEEL_SHA256=bd0bac012aee38a60894781f4597dc29ee7bedb3448540249921f10d3bef327f
@@ -69,9 +71,21 @@ RUN curl -fsSL "https://files.pythonhosted.org/packages/e5/30/c85be8290e9565dc3c
     && chmod 0755 /usr/local/bin/hermes-python \
     && rm "/tmp/hermes_agent-${HERMES_VERSION}-py3-none-any.whl"
 
-# The official Codex installer resolves this release and verifies its digest.
-RUN curl -fsSL https://chatgpt.com/codex/install.sh \
-    | CODEX_RELEASE="${CODEX_VERSION}" CODEX_NON_INTERACTIVE=1 CODEX_INSTALL_DIR=/usr/local/bin CODEX_HOME=/opt/codex sh
+# Install the immutable official Codex binary. The standalone installer expects
+# newer companion assets that are absent from the reviewed 0.142.5 release.
+RUN case "${TARGETARCH}" in \
+      amd64) CODEX_ARCH=x86_64; CODEX_SHA256="${CODEX_LINUX_AMD64_SHA256}" ;; \
+      arm64) CODEX_ARCH=aarch64; CODEX_SHA256="${CODEX_LINUX_ARM64_SHA256}" ;; \
+      *) echo "Unsupported Codex architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac \
+    && CODEX_ASSET="codex-${CODEX_ARCH}-unknown-linux-musl" \
+    && curl -fL --retry 5 --retry-all-errors --connect-timeout 20 \
+      "https://github.com/openai/codex/releases/download/rust-v${CODEX_VERSION}/${CODEX_ASSET}.tar.gz" \
+      -o /tmp/codex.tar.gz \
+    && echo "${CODEX_SHA256}  /tmp/codex.tar.gz" | sha256sum -c - \
+    && tar -xzf /tmp/codex.tar.gz -C /tmp \
+    && install -m 0755 "/tmp/${CODEX_ASSET}" /usr/local/bin/codex \
+    && rm -f /tmp/codex.tar.gz "/tmp/${CODEX_ASSET}"
 
 # Install GitHub CLI from its immutable official release and verify its asset
 # against the release checksum list. TARGETARCH is amd64 or arm64 on Railway.
