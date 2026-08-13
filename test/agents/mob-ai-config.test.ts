@@ -80,7 +80,7 @@ describe("MobAI provider configuration", () => {
     }
     expect((await stat(directory)).mode & 0o777).toBe(0o755);
     const deepSeekPatch = await readFile(join(directory, "dsh.cordis.patch.yml"), "utf8");
-    expect(deepSeekPatch).toContain("name: mob-agent-crew-dsh-plugin");
+    expect(deepSeekPatch).toContain("name: /opt/mob/deepseek-harness-plugin/index.js");
     expect(deepSeekPatch).not.toContain("mob-security-regression-secret");
   });
 
