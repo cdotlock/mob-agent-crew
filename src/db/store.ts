@@ -773,13 +773,13 @@ export class CollaborationStore {
     const [membershipRows, lastMessageRows] = await Promise.all([
       this.sql<DbRow[]>`
         SELECT * FROM conversation_memberships
-        WHERE conversation_id = ANY(${this.sql.array(conversationIds)})
+        WHERE conversation_id = ANY(${this.sql.array(conversationIds)}::uuid[])
         ORDER BY joined_at, actor_id
       `,
       this.sql<DbRow[]>`
         SELECT DISTINCT ON (conversation_id) *
         FROM messages
-        WHERE conversation_id = ANY(${this.sql.array(conversationIds)})
+        WHERE conversation_id = ANY(${this.sql.array(conversationIds)}::uuid[])
         ORDER BY conversation_id, created_at DESC, id DESC
       `,
     ]);
@@ -986,7 +986,7 @@ export class CollaborationStore {
           const mentionedMemberRows = await tx<Array<{ actor_id: string }>>`
             SELECT actor_id FROM conversation_memberships
             WHERE conversation_id = ${conversation.id}
-              AND actor_id = ANY(${tx.array(mentionedActors.map((actor) => actor.id))})
+              AND actor_id = ANY(${tx.array(mentionedActors.map((actor) => actor.id))}::uuid[])
           `;
           const memberIds = new Set(mentionedMemberRows.map((row) => row.actor_id));
           const outsideMembers = mentionedActors.filter((actor) => !memberIds.has(actor.id));
@@ -1131,7 +1131,7 @@ export class CollaborationStore {
         const membershipRows = await tx<Array<{ actor_id: string }>>`
           SELECT actor_id FROM conversation_memberships
           WHERE conversation_id = ${conversation.id}
-            AND actor_id = ANY(${tx.array([input.requestedByActorId, agent.id])})
+            AND actor_id = ANY(${tx.array([input.requestedByActorId, agent.id])}::uuid[])
         `;
         const memberIds = new Set(membershipRows.map((row) => row.actor_id));
         if (!memberIds.has(input.requestedByActorId) || !memberIds.has(agent.id)) {
