@@ -57,7 +57,7 @@ const demoFiles: DemoFile[] = [
     scope: "repository",
     path: "src/agents/registry.ts",
     language: "typescript",
-    content: "// Thin connector registry\n// pi · omp · claude · codex · hermes\nexport class AgentDriverRegistry { /* connector lookup */ }",
+    content: "// Thin connector registry\n// pi · omp · claude · codex · hermes · deepseek\nexport class AgentDriverRegistry { /* connector lookup */ }",
   },
   {
     scope: "workspace",

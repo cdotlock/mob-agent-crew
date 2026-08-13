@@ -136,7 +136,7 @@ agentCommands.command("list").action(async () => {
 agentCommands.command("add")
   .requiredOption("--handle <handle>", "stable @handle")
   .requiredOption("--name <name>", "display name")
-  .requiredOption("--driver <driver>", "pi, omp, claude, codex, or hermes")
+  .requiredOption("--driver <driver>", "pi, omp, claude, codex, hermes, or deepseek")
   .option("--role <role>", "short collaboration role", "Coding collaborator")
   .action(async (options: { handle: string; name: string; driver: string; role: string }) => {
     console.log(JSON.stringify(await (await connectedClient()).request("/api/agents", {
