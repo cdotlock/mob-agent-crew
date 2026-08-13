@@ -82,6 +82,9 @@ export class CodexExecDriver implements AgentDriver {
       ...(this.#options.maxFrameBytes !== undefined
         ? { maxFrameBytes: this.#options.maxFrameBytes }
         : {}),
+      // Codex treats any non-TTY stdin as optional prompt context and blocks
+      // on read_to_end even though the prompt is already positional.
+      closeStdinAfterSpawn: true,
       homePrefix: "mob-codex-",
     });
   }

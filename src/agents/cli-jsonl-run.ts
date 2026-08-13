@@ -34,6 +34,8 @@ export interface SpawnOneShotJsonlRunOptions
   readonly driver: AgentDriverId;
   readonly input: AgentRunInput;
   readonly mapper: NativeMapper;
+  /** Close an otherwise-unused stdin pipe once output listeners are attached. */
+  readonly closeStdinAfterSpawn?: boolean;
   readonly cancelGraceMs?: number;
   readonly maxFrameBytes?: number;
 }
@@ -52,7 +54,7 @@ export async function spawnOneShotJsonlRun(
       : {}),
     ...(options.homePrefix ? { homePrefix: options.homePrefix } : {}),
   });
-  return new OneShotJsonlRun({
+  const run = new OneShotJsonlRun({
     driver: options.driver,
     input: options.input,
     process,
@@ -64,6 +66,8 @@ export async function spawnOneShotJsonlRun(
       ? { maxFrameBytes: options.maxFrameBytes }
       : {}),
   });
+  if (options.closeStdinAfterSpawn) process.closeStdin();
+  return run;
 }
 
 export class OneShotJsonlRun implements AgentRun {
