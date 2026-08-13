@@ -119,6 +119,16 @@ requires_openai_auth = false
   config:
     provider: deepseek-official
     model: ${yamlString(input.model)}
+- insert:
+    - id: mob-agent-crew
+      name: mob-agent-crew-dsh-plugin
+      config:
+        executable: mob
+        timeoutMs: 30000
+        maxOutputBytes: 1048576
+        fileApiBaseUrl: ''
+        fileApiTokenEnv: MOB_DSH_TOKEN
+        allowInsecureFileApi: false
 `;
   await writeReadableProviderFile(
     join(directory, "dsh.cordis.patch.yml"),
