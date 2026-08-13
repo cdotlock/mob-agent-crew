@@ -34,7 +34,9 @@ export class HermesDriver implements AgentDriver {
 
   run(input: AgentRunInput): Promise<AgentRun> {
     const merged = mergeRunEnvironment(this.#options.env, input.env);
-    const hermesHome = merged.HERMES_HOME ?? merged.PI_CODING_AGENT_DIR;
+    const hermesHome = input.profileDirectory
+      ? undefined
+      : merged.HERMES_HOME ?? merged.PI_CODING_AGENT_DIR;
     const env = {
       ...merged,
       ...(hermesHome ? { HERMES_HOME: hermesHome } : {}),
@@ -63,6 +65,15 @@ export class HermesDriver implements AgentDriver {
         : {}),
       ...(this.#options.maxFrameBytes !== undefined
         ? { maxFrameBytes: this.#options.maxFrameBytes }
+        : {}),
+      ...(input.profileDirectory
+        ? {
+            profileSeed: {
+              sourceDirectory: input.profileDirectory,
+              files: ["config.yaml"],
+              environmentVariables: ["HERMES_HOME", "PI_CODING_AGENT_DIR"],
+            },
+          }
         : {}),
       homePrefix: "mob-hermes-",
     });

@@ -56,6 +56,15 @@ export class OmpRpcDriver implements AgentDriver {
       ...(this.#options.maxFrameBytes !== undefined
         ? { maxFrameBytes: this.#options.maxFrameBytes }
         : {}),
+      ...(input.profileDirectory
+        ? {
+            profileSeed: {
+              sourceDirectory: input.profileDirectory,
+              files: ["models.yml"],
+              environmentVariables: ["PI_CODING_AGENT_DIR"],
+            },
+          }
+        : {}),
       homePrefix: "mob-omp-",
     });
   }

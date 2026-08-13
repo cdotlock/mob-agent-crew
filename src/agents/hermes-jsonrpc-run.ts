@@ -47,6 +47,7 @@ export async function spawnHermesJsonRpcRun(
     cwd: options.input.cwd,
     ...(options.env ? { env: options.env } : {}),
     ...(options.envAllowlist ? { envAllowlist: options.envAllowlist } : {}),
+    ...(options.profileSeed ? { profileSeed: options.profileSeed } : {}),
     ...(options.killGraceMs !== undefined
       ? { killGraceMs: options.killGraceMs }
       : {}),

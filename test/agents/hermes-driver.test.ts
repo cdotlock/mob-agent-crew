@@ -1,4 +1,4 @@
-import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -31,19 +31,23 @@ describe("Hermes TUI-gateway connector", () => {
 
   it("creates one session and maps streaming/tool/terminal events", async () => {
     const fixture = await createFakeGateway("complete");
+    const profile = join(fixture.directory, "profile");
+    await mkdir(profile);
+    await writeFile(join(profile, "config.yaml"), "model: test\n", { mode: 0o444 });
     const driver = new HermesDriver({
       command: fixture.command,
-      env: { FAKE_CAPTURE_PATH: fixture.capturePath },
+      env: {
+        FAKE_CAPTURE_PATH: fixture.capturePath,
+        FAKE_ENVIRONMENT_PATH: fixture.environmentPath,
+      },
     });
     const run = await driver.run({
       jobId: "job-hermes",
       attemptId: "attempt-hermes",
       prompt: "inspect this repository",
       cwd: fixture.directory,
-      env: {
-        PI_CODING_AGENT_DIR: join(fixture.directory, "profile"),
-        MOB_AI_KEY: "test-key",
-      },
+      profileDirectory: profile,
+      env: { MOB_AI_KEY: "test-key" },
     });
 
     const result = await run.result;
@@ -90,6 +94,16 @@ describe("Hermes TUI-gateway connector", () => {
     expect(requests[1]).toMatchObject({
       params: { session_id: "live-1", text: "inspect this repository" },
     });
+    const observedEnvironment = JSON.parse(await readFile(fixture.environmentPath, "utf8")) as {
+      hermesHome: string;
+      piHome: string;
+      config: string;
+      writable: boolean;
+    };
+    expect(observedEnvironment.hermesHome).toBe(observedEnvironment.piHome);
+    expect(observedEnvironment.hermesHome).not.toBe(profile);
+    expect(observedEnvironment.config).toBe("model: test\n");
+    expect(observedEnvironment.writable).toBe(true);
   });
 
   it("uses session.interrupt before the process-group cancellation fallback", async () => {
@@ -140,14 +154,24 @@ async function nextKind(
 
 async function createFakeGateway(
   mode: "complete" | "wait",
-): Promise<{ directory: string; command: string; capturePath: string }> {
+): Promise<{ directory: string; command: string; capturePath: string; environmentPath: string }> {
   const directory = await mkdtemp(join(tmpdir(), "mob-hermes-driver-"));
   directories.push(directory);
   const command = join(directory, "fake-hermes-gateway.mjs");
   const capturePath = join(directory, "requests.jsonl");
+  const environmentPath = join(directory, "environment.json");
   const script = `#!/usr/bin/env node
-import { appendFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
+if (process.env.FAKE_ENVIRONMENT_PATH && process.env.HERMES_HOME) {
+  mkdirSync(process.env.HERMES_HOME + "/sessions");
+  writeFileSync(process.env.FAKE_ENVIRONMENT_PATH, JSON.stringify({
+    hermesHome: process.env.HERMES_HOME,
+    piHome: process.env.PI_CODING_AGENT_DIR,
+    config: readFileSync(process.env.HERMES_HOME + "/config.yaml", "utf8"),
+    writable: true,
+  }));
+}
 const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
 const emit = (type, payload = undefined) => send({
   jsonrpc: "2.0",
@@ -188,5 +212,5 @@ input.on("line", (line) => {
 `;
   await writeFile(command, script, { mode: 0o700 });
   await chmod(command, 0o700);
-  return { directory, command, capturePath };
+  return { directory, command, capturePath, environmentPath };
 }

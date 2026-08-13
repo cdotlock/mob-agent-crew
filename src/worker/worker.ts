@@ -1,5 +1,12 @@
 import { join } from "node:path";
-import type { AgentCommand, AgentCommandAck, AgentDriverId, AgentDriverRegistry, AgentRun } from "../agents/index.js";
+import {
+  type AgentCommand,
+  type AgentCommandAck,
+  type AgentDriverId,
+  type AgentDriverRegistry,
+  type AgentRun,
+  writeMobAiProviderConfig,
+} from "../agents/index.js";
 import type { AppConfig } from "../config.js";
 import type { CollaborationStore } from "../db/store.js";
 import type { LeaseClaim } from "../domain/model.js";
@@ -124,6 +131,10 @@ export class MobWorker {
     `;
     const profile = rows[0];
     if (!profile) throw new Error(`Agent profile ${claim.agentActorId} was not found`);
+    const expectedHome = join(this.#options.config.dataDir, "agents", claim.agentActorId);
+    if (profile.home !== expectedHome) {
+      throw new Error(`Agent profile ${claim.agentActorId} has an invalid home directory`);
+    }
     return profile;
   }
 
@@ -273,14 +284,24 @@ export class MobWorker {
       );
       runtimeSecrets.push(token);
 
+      if (profile.driver !== "mock") {
+        await writeMobAiProviderConfig({
+          directory: profile.home,
+          baseUrl: `http://127.0.0.1:${this.#options.config.port}/api/provider`,
+          model: this.#options.config.mobAiModel,
+          claudeModel: this.#options.config.mobAiClaudeModel,
+          codexModel: this.#options.config.mobAiCodexModel,
+        });
+      }
+
       nativeRun = await driver.run({
         jobId: claim.runId,
         attemptId: claim.attemptId,
         prompt: await this.#buildPrompt(claim, profile.role),
         cwd: taskDir,
         timeoutMs: 30 * 60_000,
+        ...(profile.driver !== "mock" ? { profileDirectory: profile.home } : {}),
         env: {
-          PI_CODING_AGENT_DIR: profile.home,
           ...agentRuntimeProviderEnvironment(this.#options.config, token),
           MOB_AI_MODEL: this.#options.config.mobAiModel,
           MOB_AI_CLAUDE_MODEL: this.#options.config.mobAiClaudeModel ?? "claude-opus-4-6:free",

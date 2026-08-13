@@ -65,6 +65,15 @@ export class PiRpcDriver implements AgentDriver {
       ...(this.#options.maxFrameBytes !== undefined
         ? { maxFrameBytes: this.#options.maxFrameBytes }
         : {}),
+      ...(input.profileDirectory
+        ? {
+            profileSeed: {
+              sourceDirectory: input.profileDirectory,
+              files: ["models.json"],
+              environmentVariables: ["PI_CODING_AGENT_DIR"],
+            },
+          }
+        : {}),
       homePrefix: "mob-pi-",
     });
   }

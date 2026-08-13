@@ -1,7 +1,8 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { chown, mkdir, mkdtemp, rm } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
+import { chown, lstat, mkdir, mkdtemp, open, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join, resolve } from "node:path";
 import {
   configuredAgentIdentity,
   terminateAgentIdentityProcesses,
@@ -50,6 +51,11 @@ export interface SpawnSupervisedProcessOptions {
   readonly timeoutGraceMs?: number;
   readonly killGraceMs?: number;
   readonly homePrefix?: string;
+  readonly profileSeed?: {
+    readonly sourceDirectory: string;
+    readonly files: readonly string[];
+    readonly environmentVariables: readonly string[];
+  };
   readonly onTimeout?: (process: SupervisedProcess) => void | Promise<void>;
 }
 
@@ -249,18 +255,45 @@ export async function spawnSupervisedProcess(
   const homeDirectory = await mkdtemp(
     join(tmpdir(), options.homePrefix ?? "mob-agent-"),
   );
-  const env = await createIsolatedProcessEnvironment(
-    homeDirectory,
-    options.env,
-    options.envAllowlist,
-  );
-  if (runIdentity) {
-    await Promise.all([
-      chown(homeDirectory, runIdentity.uid, runIdentity.gid),
-      chown(join(homeDirectory, ".config"), runIdentity.uid, runIdentity.gid),
-      chown(join(homeDirectory, ".cache"), runIdentity.uid, runIdentity.gid),
-      chown(join(homeDirectory, "tmp"), runIdentity.uid, runIdentity.gid),
-    ]);
+  let profileDirectory: string | undefined;
+  let env: NodeJS.ProcessEnv;
+  try {
+    profileDirectory = options.profileSeed
+      ? await seedIsolatedProfile(homeDirectory, options.profileSeed)
+      : undefined;
+    env = await createIsolatedProcessEnvironment(
+      homeDirectory,
+      options.env,
+      options.envAllowlist,
+    );
+  } catch (error) {
+    await rm(homeDirectory, { recursive: true, force: true });
+    throw error;
+  }
+  if (profileDirectory) {
+    for (const name of options.profileSeed?.environmentVariables ?? []) {
+      env[name] = profileDirectory;
+    }
+  }
+  try {
+    if (runIdentity) {
+      const paths = [
+        chown(homeDirectory, runIdentity.uid, runIdentity.gid),
+        chown(join(homeDirectory, ".config"), runIdentity.uid, runIdentity.gid),
+        chown(join(homeDirectory, ".cache"), runIdentity.uid, runIdentity.gid),
+        chown(join(homeDirectory, "tmp"), runIdentity.uid, runIdentity.gid),
+      ];
+      if (profileDirectory) {
+        paths.push(chown(profileDirectory, runIdentity.uid, runIdentity.gid));
+        for (const file of options.profileSeed?.files ?? []) {
+          paths.push(chown(join(profileDirectory, file), runIdentity.uid, runIdentity.gid));
+        }
+      }
+      await Promise.all(paths);
+    }
+  } catch (error) {
+    await rm(homeDirectory, { recursive: true, force: true });
+    throw error;
   }
   const exitDeferred = deferred<ProcessExit>();
 
@@ -295,6 +328,47 @@ export async function spawnSupervisedProcess(
     });
   }
   return supervised;
+}
+
+async function seedIsolatedProfile(
+  homeDirectory: string,
+  seed: NonNullable<SpawnSupervisedProcessOptions["profileSeed"]>,
+): Promise<string> {
+  const sourceDirectory = resolve(seed.sourceDirectory);
+  const sourceInformation = await lstat(sourceDirectory);
+  if (!sourceInformation.isDirectory() || sourceInformation.isSymbolicLink()) {
+    throw new Error("Agent profile source must be a real directory");
+  }
+
+  const destinationDirectory = join(homeDirectory, "agent");
+  await mkdir(destinationDirectory, { mode: 0o700 });
+  for (const filename of seed.files) {
+    if (filename !== basename(filename) || filename === "." || filename === "..") {
+      throw new Error(`Invalid Agent profile filename: ${filename}`);
+    }
+    const sourcePath = join(sourceDirectory, filename);
+    const sourceHandle = await open(sourcePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    let contents: Buffer;
+    try {
+      const information = await sourceHandle.stat();
+      if (!information.isFile()) throw new Error(`Agent profile file is not regular: ${filename}`);
+      if (information.size > 1024 * 1024) throw new Error(`Agent profile file is too large: ${filename}`);
+      contents = await sourceHandle.readFile();
+    } finally {
+      await sourceHandle.close();
+    }
+    const destinationHandle = await open(
+      join(destinationDirectory, filename),
+      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
+      0o600,
+    );
+    try {
+      await destinationHandle.writeFile(contents);
+    } finally {
+      await destinationHandle.close();
+    }
+  }
+  return destinationDirectory;
 }
 
 function waitForSpawn(child: ChildProcessWithoutNullStreams): Promise<void> {

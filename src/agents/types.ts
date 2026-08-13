@@ -60,6 +60,12 @@ export interface AgentRunInput {
   readonly cwd: string;
   readonly timeoutMs?: number;
   /**
+   * Control-owned, secret-free CLI configuration source. Drivers that need a
+   * writable state directory copy only their own config into the run's
+   * disposable HOME; the source directory is never exposed as writable.
+   */
+  readonly profileDirectory?: string;
+  /**
    * Explicit environment additions for this run. The process supervisor never
    * inherits the ambient environment wholesale.
    */
