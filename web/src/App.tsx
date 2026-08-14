@@ -675,18 +675,20 @@ function ThreadPane({
         </div>
       </header>
 
-      {actionError ? <div className="inline-alert" role="alert"><WarningCircle /> <span>{actionError}</span></div> : null}
+      <div className="thread-status-stack">
+        {actionError ? <div className="inline-alert" role="alert"><WarningCircle /> <span>{actionError}</span></div> : null}
 
-      {activeRun ? (
-        <div className="run-live-banner" role="status" aria-live="polite">
-          <SpinnerGap className="spin" />
-          <span>
-            <strong>{activeAgent?.name ?? "Agent"} is {activeRun.status === "queued" ? "queued" : "working"}</strong>
-            <small>{activeRun.summary || "Preparing its workspace…"}</small>
-          </span>
-          <time>{runDuration(activeRun)}</time>
-        </div>
-      ) : null}
+        {activeRun ? (
+          <div className="run-live-banner" role="status" aria-live="polite">
+            <SpinnerGap className="spin" />
+            <span>
+              <strong>{activeAgent?.name ?? "Agent"} is {activeRun.status === "queued" ? "queued" : "working"}</strong>
+              <small>{activeRun.summary || "Preparing its workspace…"}</small>
+            </span>
+            <time>{runDuration(activeRun)}</time>
+          </div>
+        ) : null}
+      </div>
 
       <section className="thread-scroll" aria-label="Chat messages">
         {transcript.messages.length ? transcript.messages.map((message) => (
