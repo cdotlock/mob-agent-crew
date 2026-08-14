@@ -33,7 +33,8 @@ Hermes explicitly documents that it does **not** implement `--mode rpc`.
 The connector speaks JSON-RPC 2.0 over LF-delimited stdio:
 
 1. wait for `gateway.ready`;
-2. call `session.create` with the task worktree as `cwd`;
+2. call `session.create` with the selected repository's execution worktree (or
+   the conversation scratch directory) as `cwd`;
 3. call `prompt.submit`;
 4. stream `message.delta`, `tool.start`, `tool.progress`, and `tool.complete`;
 5. treat `message.complete` as the terminal turn event;
@@ -42,10 +43,11 @@ The connector speaks JSON-RPC 2.0 over LF-delimited stdio:
 
 Follow-up and session resume are not advertised yet. A Mob run currently ends
 on its first terminal event, so claiming multi-turn follow-up would be false.
-Approval, clarification, sudo, or secret prompts also fail closed because the
-worker has no interactive response bridge. Headless tasks run with Hermes'
-documented `HERMES_YOLO_MODE=1`; Hermes' hardline deny floor still applies,
-and Mob's task worktree plus one-writer lease remain the outer boundary.
+Approval, sudo, or secret prompts also fail closed because the worker has no
+interactive response bridge. User clarification happens in the shared chat
+before or during a continuation. Headless work runs with Hermes' documented
+`HERMES_YOLO_MODE=1`; Hermes' hardline deny floor still applies, and Mob's
+isolated execution worktree plus one-writer lease remain the outer boundary.
 
 ## MobAI Router
 
@@ -83,8 +85,8 @@ verified repository-authentication path is a masked Railway `GH_TOKEN`, which
 the control plane copies into root-only runtime storage and uses through GitHub
 CLI's credential helper. Interactive `gh auth login` is not a supported
 production contract. Agent subprocesses run under another UID and do not
-receive SCM credentials. A human may separately approve publishing a reviewed
-task to a new `mob/` branch.
+receive SCM credentials. A human may separately approve publishing reviewed
+repository work to a new `mob/` branch.
 
 ## Official sources
 

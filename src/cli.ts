@@ -2,7 +2,7 @@
 import { readFile } from "node:fs/promises";
 import { hostname } from "node:os";
 import { basename } from "node:path";
-import { Command } from "commander";
+import { Command, Option } from "commander";
 import { createDefaultAgentDriverRegistry, MockDriver } from "./agents/index.js";
 import { loadConfig } from "./config.js";
 import { createCollaborationStore, createDatabaseClient, migrateDatabase } from "./db/index.js";
@@ -11,7 +11,6 @@ import { MobWorker } from "./worker/index.js";
 import { FileWorkspaceStore, replayWorkspaceProjection } from "./storage/index.js";
 import {
   MobApiClient,
-  MobApiError,
   clearClientConfig,
   importWikiDirectory,
   loadClientConfig,
@@ -66,7 +65,7 @@ interface AgentConfigureOptions {
 
 const program = new Command()
   .name("mob")
-  .description("Shared collaboration for humans and CLI coding agents")
+  .description("Conversation-first collaboration for people and CLI agents")
   .version("0.1.0");
 
 program.command("start").description("start the web app and embedded worker").action(() => runServer(true));
@@ -108,74 +107,102 @@ program.command("logout").description("remove this computer's Mob credential").a
   console.log((await clearClientConfig()) ? "Mob credential removed." : "No Mob credential was stored.");
 });
 
-const taskCommands = program.command("task").description("work with tasks in the connected Mob environment");
-taskCommands.command("list").action(async () => {
-  const client = await connectedClient();
-  const bootstrap = await client.request<{ tasks?: unknown[] }>("/api/bootstrap");
-  console.log(JSON.stringify(bootstrap.tasks ?? [], null, 2));
+const chatCommands = program.command("chat")
+  .aliases(["conversation", "conversations"])
+  .description("create and use direct or group conversations");
+chatCommands.command("list").description("list conversations visible to this account").action(async () => {
+  console.log(JSON.stringify(await (await connectedClient()).request("/api/conversations"), null, 2));
 });
-taskCommands.command("show").argument("<task-id>").action(async (taskId: string) => {
-  console.log(JSON.stringify(await (await connectedClient()).request(`/api/tasks/${encodeURIComponent(taskId)}`), null, 2));
-});
-taskCommands.command("review")
-  .argument("<task-id>")
-  .option("--accept", "accept the reviewable result")
-  .option("--request-changes", "reopen the task for a bounded follow-up")
-  .option("--reject", "reject and cancel the result")
-  .option("--note <note>", "human review note", "")
-  .action(async (taskId: string, options: {
-    accept?: boolean;
-    requestChanges?: boolean;
-    reject?: boolean;
-    note: string;
-  }) => {
-    const decisions = [
-      options.accept ? "accept" : null,
-      options.requestChanges ? "request_changes" : null,
-      options.reject ? "reject" : null,
-    ].filter((decision): decision is string => decision !== null);
-    if (decisions.length !== 1) {
-      throw new Error("Choose exactly one of --accept, --request-changes, or --reject");
-    }
+chatCommands.command("show")
+  .description("show one conversation, its members, messages, and runs")
+  .argument("<conversation-id>")
+  .action(async (conversationId: string) => {
     console.log(JSON.stringify(await (await connectedClient()).request(
-      `/api/tasks/${encodeURIComponent(taskId)}/reviews`,
-      { method: "POST", body: { decision: decisions[0], note: options.note } },
+      `/api/conversations/${encodeURIComponent(conversationId)}`,
     ), null, 2));
   });
-taskCommands.command("publish")
-  .argument("<task-id>")
-  .requiredOption("--confirm", "confirm this human-approved SCM write")
-  .option("--branch <branch>", "safe target branch under mob/")
-  .option("--message <message>", "commit message", "mob: publish reviewed task")
-  .action(async (taskId: string, options: { confirm: boolean; branch?: string; message: string }) => {
-    console.log(JSON.stringify(await (await connectedClient()).request(
-      `/api/tasks/${encodeURIComponent(taskId)}/publications`,
+chatCommands.command("new")
+  .alias("create")
+  .description("start a repository-optional direct or group conversation")
+  .requiredOption("--kind <kind>", "direct or group")
+  .option("--title <title>", "group title")
+  .option("--member <member...>", "Agent/human IDs or @handles")
+  .option("--repository <repository-id>", "optional active repository ID")
+  .action(async (options: { kind: string; title?: string; member?: string[]; repository?: string }) => {
+    if (options.kind !== "direct" && options.kind !== "group") {
+      throw new Error("--kind must be 'direct' or 'group'");
+    }
+    console.log(JSON.stringify(await (await connectedClient()).request("/api/conversations", {
+      method: "POST",
+      body: {
+        kind: options.kind,
+        title: options.title,
+        members: options.member ?? [],
+        ...(options.repository ? { activeRepositoryId: options.repository } : {}),
+      },
+    }), null, 2));
+  });
+chatCommands.command("send")
+  .description("post chat; a direct Agent or a group @mention wakes the employee automatically")
+  .argument("<conversation-id>")
+  .argument("<message...>")
+  .option("--repository <repository-id>", "use this repository for the Agent response or work")
+  .addOption(new Option("--invoke <agent>", "deprecated compatibility option").hideHelp())
+  .action(async (
+    conversationId: string,
+    words: string[],
+    options: { repository?: string; invoke?: string },
+  ) => {
+    let content = words.join(" ").trim();
+    if (!content) throw new Error("Message is required");
+    const client = await connectedClient();
+    if (options.invoke) {
+      const response = await client.request<AgentListResponse>("/api/agents");
+      content = `@${findAgent(response.agents ?? [], options.invoke).handle} ${content}`;
+    }
+    const result = await client.request(
+      `/api/conversations/${encodeURIComponent(conversationId)}/messages`,
       {
         method: "POST",
         body: {
-          confirm: options.confirm,
-          ...(options.branch ? { branch: options.branch } : {}),
-          commitMessage: options.message,
+          content,
+          ...(options.repository ? { repositoryId: options.repository } : {}),
         },
+      },
+    );
+    console.log(JSON.stringify(result, null, 2));
+  });
+
+const repositoryCommands = program.command("repo")
+  .alias("repository")
+  .description("list, import, or select repositories without leaving a conversation");
+repositoryCommands.command("list").action(async () => {
+  console.log(JSON.stringify(await (await connectedClient()).request("/api/repositories"), null, 2));
+});
+repositoryCommands.command("import")
+  .description("register a trusted Git repository; clone it on first Agent work")
+  .argument("<url>")
+  .action(async (url: string) => {
+    console.log(JSON.stringify(await (await connectedClient()).request("/api/repositories/import", {
+      method: "POST",
+      body: { url },
+    }), null, 2));
+  });
+repositoryCommands.command("use")
+  .description("set a conversation's active repository; use 'none' to return to scratch")
+  .argument("<conversation-id>")
+  .argument("<repository-id>", "repository ID or none")
+  .action(async (conversationId: string, repositoryId: string) => {
+    console.log(JSON.stringify(await (await connectedClient()).request(
+      `/api/conversations/${encodeURIComponent(conversationId)}`,
+      {
+        method: "PATCH",
+        body: { activeRepositoryId: repositoryId === "none" ? null : repositoryId },
       },
     ), null, 2));
   });
 
-const chatCommands = program.command("chat").description("send messages through the shared environment");
-chatCommands.command("send")
-  .argument("<task-id>")
-  .argument("<message...>")
-  .action(async (taskId: string, words: string[]) => {
-    const content = words.join(" ").trim();
-    if (!content) throw new Error("Message is required");
-    const result = await (await connectedClient()).request(`/api/conversations/${encodeURIComponent(taskId)}/messages`, {
-      method: "POST",
-      body: { content, invoke: false },
-    });
-    console.log(JSON.stringify(result, null, 2));
-  });
-
-const agentCommands = program.command("agent").description("invoke a named actor in the environment");
+const agentCommands = program.command("agent").description("list and configure named Agent employees");
 agentCommands.command("list").action(async () => {
   const response = await (await connectedClient()).request<AgentListResponse>("/api/agents");
   console.log(JSON.stringify(response.agents ?? [], null, 2));
@@ -184,7 +211,7 @@ agentCommands.command("add")
   .requiredOption("--handle <handle>", "stable @handle")
   .requiredOption("--name <name>", "display name")
   .requiredOption("--driver <driver>", "pi, omp, claude, codex, hermes, or deepseek")
-  .option("--role <role>", "short collaboration role", "Coding collaborator")
+  .option("--role <role>", "short employee role", "Team collaborator")
   .option("--model <model>", "MobAI model ID; omit to use the harness default")
   .option("--skill <skill>", "skill reference (repeatable)", collectOption)
   .option("--plugin <plugin>", "installed shared plugin reference (repeatable)", collectOption)
@@ -264,41 +291,21 @@ agentCommands.command("configure")
       },
     }), null, 2));
   });
-agentCommands.command("invoke")
-  .argument("<task-id>")
+agentCommands.command("invoke", { hidden: true })
+  .argument("<conversation-id>")
   .argument("<agent>", "agent ID or @handle")
   .argument("<request...>")
-  .action(async (taskId: string, agent: string, words: string[]) => {
+  .action(async (conversationId: string, agent: string, words: string[]) => {
+    const request = words.join(" ").trim();
+    if (!request) throw new Error("Agent instruction is required");
     const client = await connectedClient();
     const response = await client.request<AgentListResponse>("/api/agents");
-    const needle = agent.replace(/^@/u, "").toLowerCase();
-    const matched = (response.agents ?? []).find((item) =>
-      item.id === agent || item.handle?.toLowerCase() === needle || item.name?.toLowerCase() === needle,
-    );
-    if (!matched?.handle) throw new Error(`Agent '${agent}' was not found`);
-    const content = words.join(" ").trim();
-    if (!content) throw new Error("Agent instruction is required");
-    const invoke = () => client.request(`/api/conversations/${encodeURIComponent(taskId)}/messages`, {
-      method: "POST",
-      body: { content, invoke: true, agent: matched.id },
-    });
-    let result: unknown;
-    try {
-      result = await invoke();
-    } catch (error) {
-      if (!(error instanceof MobApiError) || error.status !== 409 || error.code !== "task_closed") throw error;
-      await client.request(`/api/tasks/${encodeURIComponent(taskId)}/reviews`, {
-        method: "POST",
-        body: {
-          decision: "request_changes",
-          note: "Reopened by mob agent invoke for an explicit follow-up instruction.",
-        },
-      });
-      result = await invoke();
-    }
-    console.log(JSON.stringify(result, null, 2));
+    const matched = findAgent(response.agents ?? [], agent);
+    console.log(JSON.stringify(await client.request(
+      `/api/conversations/${encodeURIComponent(conversationId)}/messages`,
+      { method: "POST", body: { content: `@${matched.handle} ${request}` } },
+    ), null, 2));
   });
-
 const modelCommands = program.command("model").description("discover models exposed by the connected Mob environment");
 modelCommands.command("list").action(async () => {
   console.log(JSON.stringify(await (await connectedClient()).request("/api/models"), null, 2));
@@ -308,37 +315,6 @@ const capabilityCommands = program.command("capability").alias("catalog").descri
 capabilityCommands.command("list").action(async () => {
   console.log(JSON.stringify(await (await connectedClient()).request("/api/capabilities/catalog"), null, 2));
 });
-
-const conversationCommands = program.command("conversation").alias("conversations").description("work with direct and group chats");
-conversationCommands.command("list").action(async () => {
-  console.log(JSON.stringify(await (await connectedClient()).request("/api/conversations"), null, 2));
-});
-conversationCommands.command("show").argument("<conversation-id>").action(async (conversationId: string) => {
-  console.log(JSON.stringify(await (await connectedClient()).request(`/api/conversations/${encodeURIComponent(conversationId)}`), null, 2));
-});
-conversationCommands.command("create")
-  .argument("<task-id>")
-  .requiredOption("--kind <kind>", "direct or group")
-  .option("--title <title>", "group title")
-  .option("--member <member...>", "Agent/human IDs or @handles")
-  .action(async (taskId: string, options: { kind: string; title?: string; member?: string[] }) => {
-    console.log(JSON.stringify(await (await connectedClient()).request("/api/conversations", {
-      method: "POST",
-      body: { taskId, kind: options.kind, title: options.title, members: options.member ?? [] },
-    }), null, 2));
-  });
-conversationCommands.command("send")
-  .argument("<conversation-id>")
-  .argument("<message...>")
-  .option("--invoke <agent>", "explicitly start one Agent member")
-  .action(async (conversationId: string, words: string[], options: { invoke?: string }) => {
-    const content = words.join(" ").trim();
-    if (!content) throw new Error("Message is required");
-    console.log(JSON.stringify(await (await connectedClient()).request(
-      `/api/conversations/${encodeURIComponent(conversationId)}/messages`,
-      { method: "POST", body: { content, invoke: Boolean(options.invoke), agent: options.invoke } },
-    ), null, 2));
-  });
 
 const runCommands = program.command("run").description("observe and control agent runs");
 runCommands.command("status").argument("<run-id>").action(async (runId: string) => {
@@ -378,6 +354,59 @@ runCommands.command("watch")
       }
       await delay(interval);
     }
+  });
+
+const taskCommands = program.command("task").description("legacy execution review and publication administration");
+taskCommands.command("list").action(async () => {
+  const client = await connectedClient();
+  const bootstrap = await client.request<{ tasks?: unknown[] }>("/api/bootstrap");
+  console.log(JSON.stringify(bootstrap.tasks ?? [], null, 2));
+});
+taskCommands.command("show").argument("<task-id>").action(async (taskId: string) => {
+  console.log(JSON.stringify(await (await connectedClient()).request(`/api/tasks/${encodeURIComponent(taskId)}`), null, 2));
+});
+taskCommands.command("review")
+  .argument("<task-id>")
+  .option("--accept", "accept the reviewable result")
+  .option("--request-changes", "reopen the task for a bounded follow-up")
+  .option("--reject", "reject and cancel the result")
+  .option("--note <note>", "human review note", "")
+  .action(async (taskId: string, options: {
+    accept?: boolean;
+    requestChanges?: boolean;
+    reject?: boolean;
+    note: string;
+  }) => {
+    const decisions = [
+      options.accept ? "accept" : null,
+      options.requestChanges ? "request_changes" : null,
+      options.reject ? "reject" : null,
+    ].filter((decision): decision is string => decision !== null);
+    if (decisions.length !== 1) {
+      throw new Error("Choose exactly one of --accept, --request-changes, or --reject");
+    }
+    console.log(JSON.stringify(await (await connectedClient()).request(
+      `/api/tasks/${encodeURIComponent(taskId)}/reviews`,
+      { method: "POST", body: { decision: decisions[0], note: options.note } },
+    ), null, 2));
+  });
+taskCommands.command("publish")
+  .argument("<task-id>")
+  .requiredOption("--confirm", "confirm this human-approved SCM write")
+  .option("--branch <branch>", "safe target branch under mob/")
+  .option("--message <message>", "commit message", "mob: publish reviewed task")
+  .action(async (taskId: string, options: { confirm: boolean; branch?: string; message: string }) => {
+    console.log(JSON.stringify(await (await connectedClient()).request(
+      `/api/tasks/${encodeURIComponent(taskId)}/publications`,
+      {
+        method: "POST",
+        body: {
+          confirm: options.confirm,
+          ...(options.branch ? { branch: options.branch } : {}),
+          commitMessage: options.message,
+        },
+      },
+    ), null, 2));
   });
 
 const knowledgeCommands = program.command("knowledge").alias("wiki").description("read and maintain workspace knowledge files");
@@ -466,12 +495,12 @@ db.command("rebuild")
     }
   });
 
-program.command("context").description("print the current shared task context").action(async () => {
+program.command("context").description("print the active conversation and execution context").action(async () => {
   const claims = readRunClaims();
   console.log(JSON.stringify(await api(`/api/tasks/${claims.taskId}`), null, 2));
 });
 
-program.command("say").argument("<message>").description("post a message to the shared task").action(async (message: string) => {
+program.command("say").argument("<message>").description("post progress to the active conversation").action(async (message: string) => {
   const claims = readRunClaims();
   console.log(JSON.stringify(await api(`/api/tasks/${claims.taskId}/messages`, { method: "POST", body: JSON.stringify({ content: message }) }), null, 2));
 });
@@ -496,7 +525,7 @@ artifact.command("add").argument("<path>").description("publish a file artifact"
   console.log(JSON.stringify(await api(`/api/tasks/${claims.taskId}/artifacts`, { method: "POST", body: form }), null, 2));
 });
 
-program.command("done").argument("<summary>").description("post the run's final summary").action(async (summary: string) => {
+program.command("done").argument("<summary>").description("post the run's final summary to the conversation").action(async (summary: string) => {
   const claims = readRunClaims();
   await api(`/api/tasks/${claims.taskId}/messages`, { method: "POST", body: JSON.stringify({ content: summary, kind: "result" }) });
   console.log("Summary posted.");
@@ -514,9 +543,9 @@ async function createRuntime() {
   const drivers = createDefaultAgentDriverRegistry({
     mock: new MockDriver({
       delegate: async (input, context) => {
-        context.emit({ kind: "message.delta", message: "Reading the shared task context…" });
+        context.emit({ kind: "message.delta", message: "Reading the shared conversation context…" });
         return {
-          finalMessage: `I reviewed the shared task and completed this run.\n\nRequested work:\n${input.prompt.slice(0, 900)}`,
+          finalMessage: `I reviewed the shared conversation and completed this run.\n\nRequested work:\n${input.prompt.slice(0, 900)}`,
         };
       },
     }),

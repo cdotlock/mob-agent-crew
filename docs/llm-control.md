@@ -19,14 +19,27 @@ orchestration privilege.
 
 Keep these invariants:
 
-- A task owns the repository checkout, guardrails and primary group chat.
-- A direct or group conversation owns membership and a separate transcript.
-- Sending chat text does not necessarily invoke an Agent. Use an explicit
-  invoke command when work should start.
+- Conversation is the user-facing unit. It is either a direct chat or a group;
+  there is no separate "primary group" class and creating one requires neither
+  a Task nor a repository.
+- A direct chat has exactly two actors. If the other actor is an Agent, the
+  human message wakes that employee; human-to-human direct chat stays ordinary.
+  In a group, only an explicit `@handle` wakes that Agent; a message with no
+  Agent mention is ordinary chat.
+- Waking an Agent is not the same as ordering a coding run. The Agent reads the
+  transcript and decides whether to answer, ask for clarification, or begin
+  longer work. Before long work it should acknowledge the plan in chat, and it
+  must continue accepting human messages while working.
+- Repositories are a workspace list, not chat containers. A conversation starts
+  in scratch by default and may select or switch its active repository whenever
+  work needs one. Mob creates the isolated worktree automatically at execution
+  time.
 - An active Agent may ask another Agent for a bounded deliverable only through
   `mob delegate`; it must not invoke another vendor CLI directly.
-- One task has one writable workspace lease at a time. A human may separately
-  approve and publish a reviewed result to a new `mob/` branch; Agents cannot.
+- Internally, Mob may create a hidden execution Task to own a checkout, budget,
+  and single-writer lease. This is an implementation/admin record, not a
+  prerequisite for chatting. A human may separately approve and publish a
+  reviewed result to a new `mob/` branch; Agents cannot.
 - Never put a password, Mob token, provider key or GitHub token in a prompt,
   chat message, command argument, artifact, or workspace file.
 
@@ -94,29 +107,29 @@ inside an LLM session.
 Discover stable IDs first; do not guess them:
 
 ```bash
-mob task list
-mob task show <task-id>
+mob chat list
 mob agent list
 mob model list
-mob conversation list
+mob repo list
 ```
 
 `mob model list` reads the server-side model catalog. It returns public model
 metadata and protocol compatibility only; Router credentials remain inside the
 control plane.
 
-The task chat is the backward-compatible primary group conversation:
+Start a chat first. No Task ID or repository is required:
 
 ```bash
-mob chat send <task-id> "Here is context only; do not start work yet."
-mob agent invoke <task-id> @builder "Inspect the failure and implement the smallest safe fix."
+mob chat new --kind direct --member @builder
+mob chat new --kind group --title "Release room" --member @builder @reviewer
+mob chat send <conversation-id> "先帮我理解这个问题，并告诉我还缺什么信息。"
 ```
 
-`agent invoke` selects the Agent explicitly, posts the instruction to the
-primary task chat, and returns the queued run. If that task was completed or
-cancelled, the command first records a human `request_changes` decision and
-retries the invocation once. Save the returned run ID and observe normalized
-events:
+In a direct chat, the sole Agent wakes automatically. In a group, mention the
+employee you want: `mob chat send <id> "@builder 请先评估，再决定是否开始。"`.
+Do not pass `--invoke`; wake-up semantics belong to the conversation. The
+response may contain a delivery/run ID when work was queued. Save that run ID
+only when you need the advanced observation/control commands:
 
 ```bash
 mob run status <run-id>
@@ -130,43 +143,83 @@ mob run cancel <run-id>
 worker and only if its connector implements the capability. A `409` rejection
 is a real connector/lifecycle limitation, not permission to start a hidden
 second process. `run watch` stops at `succeeded`, `failed`, or `cancelled`.
+The normal way to intervene is simply to keep talking in the same chat; Mob
+routes an applicable message to the active employee. `run steer` is the precise
+advanced control surface for automation and debugging.
 
 ## Direct and group conversations
 
-Every task has a primary group conversation whose ID equals the task ID. Create
-an additional private/direct or group transcript under that task:
+All chats share one transcript and event model. `direct` means exactly two
+actors, whether human-to-human or human-to-Agent. `group` means explicit members
+and ordinary team conversation. Create either without first creating a Task:
 
 ```bash
-mob conversation create <task-id> --kind direct --member @builder
-mob conversation create <task-id> --kind group \
+mob chat new --kind direct --member @builder
+mob chat new --kind group \
   --title "Release review" --member @builder @reviewer
 
-mob conversation show <conversation-id>
-mob conversation send <conversation-id> "Discussion only; do not execute."
-mob conversation send <conversation-id> \
-  --invoke @reviewer \
-  "Review the current patch and return blocking risks."
+mob chat show <conversation-id>
+mob chat send <direct-id> "你先看一下上下文，告诉我建议。"
+mob chat send <group-id> "今天先讨论优先级。"
+mob chat send <group-id> "@reviewer 请评估风险；先回复我，再决定是否需要长程工作。"
 ```
 
-For `direct`, Mob enforces exactly one human and one Agent. For `group`, use
-explicit membership. `--invoke` starts exactly one Agent member and records the
-trigger message on the run. An Agent run cannot bypass delegation guardrails by
-setting `invoke`; it must use `mob delegate`.
+`conversation` and `conversations` remain aliases of `chat`, and `create` is an
+alias of `new`, so existing external controllers do not need an immediate
+rename. They must stop supplying Task IDs and `--invoke`.
+
+The wake-up only asks the named employee to handle the message. The Agent may
+answer conversationally, clarify scope, or start longer work. For longer work,
+the right-hand workspace shows the actual process, tools, output and status.
+Humans can send another chat message at any time; they do not wait for a sealed
+"task" to finish.
+
+Repositories remain independent of this chat lifecycle:
+
+```bash
+mob repo list
+mob repo import https://github.com/your-org/your-repo
+mob repo use <conversation-id> <repository-id>
+mob chat send <conversation-id> "请在这个仓库处理刚才的问题。"
+
+# one-message selection, useful for an external controller
+mob chat send <conversation-id> --repository <repository-id> \
+  "@builder 请检查这个仓库，先说计划再开始。"
+
+# return the conversation to a repository-free scratch environment
+mob repo use <conversation-id> none
+```
+
+On first repository work Mob refreshes the trusted control clone and creates a
+conversation/execution-scoped worktree automatically. Switching the selected
+repository affects future work; it does not rewrite earlier transcript history.
+A human may also paste one GitHub repository root URL directly into the wake-up
+message. Mob imports/allowlists that URL, selects it for the turn, and leaves the
+rest of the message as the Agent instruction. Repository import still respects
+the trusted-repository boundary.
 
 Equivalent HTTP operations, for clients that cannot launch the CLI:
 
 ```text
 GET  /api/conversations
 POST /api/conversations
-     {"taskId":"<uuid>","kind":"direct|group","title":"optional","members":["@builder"]}
+     {"kind":"direct|group","title":"optional","members":["@builder"],
+      "activeRepositoryId":"<optional-repository-uuid>"}
 GET  /api/conversations/<conversation-id>
+PATCH /api/conversations/<conversation-id>
+      {"activeRepositoryId":"<repository-uuid-or-null>"}
 POST /api/conversations/<conversation-id>/messages
-     {"content":"...","invoke":true,"agent":"@builder","writerRequired":true}
+     {"content":"...","repositoryId":"<optional-repository-uuid>"}
+
+GET  /api/repositories
+POST /api/repositories/import
+     {"url":"https://github.com/owner/repository"}
 ```
 
 Authenticate HTTP requests with `Authorization: Bearer <scoped-token>`. Never
-place the token in a URL. Ordinary messages should omit `invoke` or set it to
-`false`.
+place the token in a URL. Do not send `taskId`, `invoke`, `agent`, or
+`writerRequired` for ordinary external chat control; membership, direct/group
+kind, mentions, and selected repository provide the semantics.
 
 ## Add and define an Agent
 
@@ -283,12 +336,12 @@ Router aliases and wire protocols are intentionally different.
 ## Commands available inside an Agent run
 
 Mob injects a short-lived `MOB_RUN_TOKEN` and `MOB_API_URL` into the isolated CLI
-process. The token identifies the Agent, workspace, task, run, and exact active
-attempt. Every Agent API call rechecks the live attempt and lease; completion,
-cancellation, retry, or lease expiry revokes that token. This is still not a
-strict one-run data sandbox: knowledge is workspace-scoped, and an Agent
-identity can list conversations in which it is a member. Never print or inspect
-the credential.
+process. The token identifies the Agent, conversation, hidden execution scope,
+run, and exact active attempt. Every Agent API call rechecks the live attempt
+and lease; completion, cancellation, retry, or lease expiry revokes that token.
+This is still not a strict one-run data sandbox: knowledge is workspace-scoped,
+and an Agent identity can list conversations in which it is a member. Never
+print or inspect the credential.
 
 An Agent should use only the following collaboration surface:
 
@@ -300,18 +353,20 @@ mob artifact add ./report.md
 mob done "Parser fixed and focused verification passed."
 ```
 
-Call `mob done` once. Use `mob say` only for meaningful progress. The Agent can
-edit its task-scoped checkout directly, but cannot receive SCM write
+Call `mob done` once. Use `mob say` for useful progress, including a short
+acknowledgement before long work. The Agent can edit its isolated checkout
+directly after a repository is selected, but cannot receive SCM write
 credentials or approve publication.
 
 ## Knowledge, repository Wiki, and files
 
-Mob is the only Wiki service. Before every run, the server updates a clean task
-checkout from its allowlisted Git remote, snapshots supported repository
-Markdown into `knowledge/raw/repositories/...`, refreshes a deterministic
-`knowledge/wiki/repositories/<repo>/index.md`, and retrieves bounded relevant
-excerpts with a provenance manifest. A dirty checkout is never reset or
-overwritten automatically.
+Mob is the only Wiki service. A repository is optional for conversation-only
+responses. When work selects one, the server updates its trusted control clone,
+creates or reuses the isolated execution worktree, snapshots supported
+repository Markdown into `knowledge/raw/repositories/...`, refreshes a
+deterministic `knowledge/wiki/repositories/<repo>/index.md`, and retrieves
+bounded relevant excerpts with a provenance manifest. A dirty worktree is never
+reset or overwritten automatically.
 
 Use the same knowledge surface locally or from an Agent run:
 
@@ -405,12 +460,15 @@ Interactive `gh auth login` is not a production contract.
 Mob can work on its own allowlisted repository through the same ordinary path;
 there is no privileged self-modification mode:
 
-1. A human imports/allowlists the Mob repository in the web UI or
-   `POST /api/tasks/<task-id>/imports/github`.
-2. A human creates a task against that repository in the web UI or through
-   `POST /api/tasks`, then explicitly invokes one Agent.
-3. The worker materializes the task checkout and refreshes repository knowledge.
-4. Watch the terminal events, steer only when necessary, and ask another Agent
+1. A human imports/allowlists the Mob repository from the repository list or
+   `POST /api/repositories/import`.
+2. In an ordinary direct or group chat, select that repository and ask an Agent
+   to inspect the issue. In a group, use its `@handle`; in a direct chat no
+   mention is necessary.
+3. The Agent may clarify first. When it begins implementation, the worker
+   materializes the isolated worktree and refreshes repository knowledge.
+4. Keep talking in the same conversation, observe terminal events, use precise
+   steering only when necessary, and ask another Agent
    for a bounded review through delegation.
 5. Inspect the changed checkout and artifacts, then explicitly approve or
    request changes.
@@ -425,22 +483,24 @@ there is no privileged self-modification mode:
    materialized base commit, then pushes a new `mob/<task>` branch. It rejects
    symlinks, special files, secret-shaped filenames, common secret content and
    active Agent runs. PR, merge and deploy remain outside this release.
-7. Create the next task from observed evidence; never let an Agent silently
-   deploy or rewrite control-plane state.
+7. Continue in the same conversation or start another direct/group chat from
+   observed evidence; never let an Agent silently deploy or rewrite
+   control-plane state.
 
 This loop is intentionally the same as work on every other repository. It makes
 Mob useful for modifying and reviewing itself, but it is not yet an end-to-end
-self-deployment loop.
+self-deployment loop. `mob task review` and `mob task publish` below are legacy
+execution/admin commands; they are not how a conversation begins.
 
 The corresponding JSON bodies are intentionally small:
 
 ```text
-POST /api/tasks/<existing-task-id>/imports/github
+POST /api/repositories/import
      {"url":"https://github.com/cdotlock/mob-agent-crew"}
-POST /api/tasks
-     {"title":"Improve Mob itself","repository":"<allowlisted-id-or-name>",
-      "baseRef":"main","initialMessage":"<current instruction>",
-      "agentId":"<optional-agent-uuid>"}
+PATCH /api/conversations/<conversation-id>
+      {"activeRepositoryId":"<repository-id>"}
+POST /api/conversations/<conversation-id>/messages
+     {"content":"@builder 请先检查 Mob 自身的问题，回复计划后再开始修改。"}
 ```
 
 ## Database file-ledger rebuild

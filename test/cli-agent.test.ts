@@ -13,23 +13,95 @@ afterEach(async () => {
 });
 
 describe("mob agent CLI", () => {
-  it("keeps chat separate from execution on the primary conversation", async () => {
+  it("presents conversation-first help without task or invoke requirements", async () => {
+    const topLevel = await runCli("http://127.0.0.1:1", ["--help"]);
+    const chat = await runCli("http://127.0.0.1:1", ["chat", "--help"]);
+
+    expect(topLevel.stdout).toContain("Conversation-first collaboration");
+    expect(topLevel.stdout).toContain("chat|conversation");
+    expect(topLevel.stdout).toContain("legacy execution review and publication administration");
+    expect(chat.stdout).toContain("new|create");
+    expect(chat.stdout).toContain("send [options] <conversation-id> <message...>");
+    expect(chat.stdout).not.toContain("task-id");
+    expect(chat.stdout).not.toContain("--invoke");
+  });
+
+  it("lists conversations as the primary chat surface", async () => {
     const requests: RecordedRequest[] = [];
     const server = await listen(async (request, response) => {
       requests.push(await record(request));
-      replyJson(response, { message: { id: "message-1" }, runs: [] });
+      replyJson(response, { conversations: [{ id: "conversation-1", kind: "group" }] });
     });
 
-    await runCli(server, ["chat", "send", "task-1", "@builder", "context only"]);
+    const result = await runCli(server, ["chat", "list"]);
+
+    expect(requests).toEqual([expect.objectContaining({ method: "GET", path: "/api/conversations" })]);
+    expect(JSON.parse(result.stdout)).toMatchObject({ conversations: [{ id: "conversation-1" }] });
+  });
+
+  it("creates a repository-optional conversation without a task", async () => {
+    const requests: RecordedRequest[] = [];
+    const server = await listen(async (request, response) => {
+      requests.push(await record(request));
+      replyJson(response, { conversation: { id: "conversation-1", kind: "direct" } });
+    });
+
+    await runCli(server, [
+      "chat", "new", "--kind", "direct", "--member", "@builder", "--repository", "repository-1",
+    ]);
 
     expect(requests).toEqual([expect.objectContaining({
       method: "POST",
-      path: "/api/conversations/task-1/messages",
-      body: { content: "@builder context only", invoke: false },
+      path: "/api/conversations",
+      body: {
+        kind: "direct",
+        members: ["@builder"],
+        activeRepositoryId: "repository-1",
+      },
     })]);
   });
 
-  it("uses an explicit primary-conversation invocation instead of implicit mention side effects", async () => {
+  it("sends semantic chat without task or invoke flags", async () => {
+    const requests: RecordedRequest[] = [];
+    const server = await listen(async (request, response) => {
+      requests.push(await record(request));
+      replyJson(response, { message: { id: "message-1" }, deliveries: [{ action: "queued_run" }] });
+    });
+
+    await runCli(server, [
+      "chat", "send", "conversation-1", "@builder", "先看看问题，必要时再开始长程工作",
+      "--repository", "repository-2",
+    ]);
+
+    expect(requests).toEqual([expect.objectContaining({
+      method: "POST",
+      path: "/api/conversations/conversation-1/messages",
+      body: {
+        content: "@builder 先看看问题，必要时再开始长程工作",
+        repositoryId: "repository-2",
+      },
+    })]);
+  });
+
+  it("keeps conversation create as a compatibility alias for chat new", async () => {
+    const requests: RecordedRequest[] = [];
+    const server = await listen(async (request, response) => {
+      requests.push(await record(request));
+      replyJson(response, { conversation: { id: "conversation-2", kind: "group" } });
+    });
+
+    await runCli(server, [
+      "conversation", "create", "--kind", "group", "--title", "Release", "--member", "@builder", "@reviewer",
+    ]);
+
+    expect(requests).toEqual([expect.objectContaining({
+      method: "POST",
+      path: "/api/conversations",
+      body: { kind: "group", title: "Release", members: ["@builder", "@reviewer"] },
+    })]);
+  });
+
+  it("translates the old conversation invoke option into an ordinary @mention", async () => {
     const requests: RecordedRequest[] = [];
     const server = await listen(async (request, response) => {
       const recorded = await record(request);
@@ -37,62 +109,71 @@ describe("mob agent CLI", () => {
       if (recorded.method === "GET") {
         replyJson(response, { agents: [{ id: "agent-1", handle: "builder", name: "Builder", role: "Builder" }] });
       } else {
-        replyJson(response, { message: { id: "message-1" }, runs: [{ id: "run-1" }] });
+        replyJson(response, { message: { id: "message-1" } });
       }
     });
 
-    await runCli(server, ["agent", "invoke", "task-1", "@builder", "inspect", "this"]);
+    await runCli(server, [
+      "conversation", "send", "conversation-1", "--invoke", "agent-1", "review", "this",
+    ]);
 
     expect(requests).toEqual([
       expect.objectContaining({ method: "GET", path: "/api/agents" }),
       expect.objectContaining({
         method: "POST",
-        path: "/api/conversations/task-1/messages",
-        body: { content: "inspect this", invoke: true, agent: "agent-1" },
+        path: "/api/conversations/conversation-1/messages",
+        body: { content: "@builder review this" },
       }),
     ]);
   });
 
-  it("reopens a closed task once before retrying an explicit Agent invocation", async () => {
+  it("keeps the old hidden agent invoke command as a semantic-chat bridge", async () => {
     const requests: RecordedRequest[] = [];
-    let invocationCount = 0;
     const server = await listen(async (request, response) => {
       const recorded = await record(request);
       requests.push(recorded);
       if (recorded.method === "GET") {
         replyJson(response, { agents: [{ id: "agent-1", handle: "builder", name: "Builder", role: "Builder" }] });
-        return;
+      } else {
+        replyJson(response, { message: { id: "message-1" } });
       }
-      if (recorded.path === "/api/conversations/task-1/messages" && invocationCount++ === 0) {
-        replyJson(
-          response,
-          { error: "task_closed", message: "Request changes before starting another Agent run." },
-          409,
-        );
-        return;
-      }
-      replyJson(response, recorded.path.endsWith("/reviews")
-        ? { task: { id: "task-1", status: "open" } }
-        : { message: { id: "message-1" }, runs: [{ id: "run-1" }] });
     });
 
-    await runCli(server, ["agent", "invoke", "task-1", "@builder", "continue", "carefully"]);
+    await runCli(server, ["agent", "invoke", "conversation-1", "@builder", "inspect", "this"]);
 
     expect(requests).toEqual([
       expect.objectContaining({ method: "GET", path: "/api/agents" }),
-      expect.objectContaining({ method: "POST", path: "/api/conversations/task-1/messages" }),
       expect.objectContaining({
         method: "POST",
-        path: "/api/tasks/task-1/reviews",
-        body: {
-          decision: "request_changes",
-          note: "Reopened by mob agent invoke for an explicit follow-up instruction.",
-        },
+        path: "/api/conversations/conversation-1/messages",
+        body: { content: "@builder inspect this" },
+      }),
+    ]);
+  });
+
+  it("lists, imports, and selects repositories independently of chat creation", async () => {
+    const requests: RecordedRequest[] = [];
+    const server = await listen(async (request, response) => {
+      const recorded = await record(request);
+      requests.push(recorded);
+      replyJson(response, { ok: true });
+    });
+
+    await runCli(server, ["repo", "list"]);
+    await runCli(server, ["repo", "import", "https://github.com/cdotlock/mob-agent-crew"]);
+    await runCli(server, ["repo", "use", "conversation-1", "repository-1"]);
+
+    expect(requests).toEqual([
+      expect.objectContaining({ method: "GET", path: "/api/repositories" }),
+      expect.objectContaining({
+        method: "POST",
+        path: "/api/repositories/import",
+        body: { url: "https://github.com/cdotlock/mob-agent-crew" },
       }),
       expect.objectContaining({
-        method: "POST",
-        path: "/api/conversations/task-1/messages",
-        body: { content: "continue carefully", invoke: true, agent: "agent-1" },
+        method: "PATCH",
+        path: "/api/conversations/conversation-1",
+        body: { activeRepositoryId: "repository-1" },
       }),
     ]);
   });
@@ -135,7 +216,7 @@ describe("mob agent CLI", () => {
         handle: "reviewer",
         name: "Reviewer",
         driver: "hermes",
-        role: "Coding collaborator",
+        role: "Team collaborator",
         modelId: "deepseek-v4-pro",
         skillRefs: ["review:typescript", "workflow:focused-tests"],
         environment: { reference: "railway:engineering", values: {} },

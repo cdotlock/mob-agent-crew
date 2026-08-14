@@ -24,22 +24,24 @@ not the domain model.
 ## Four protocol primitives
 
 1. **Actors** — stable identities for humans and agents.
-2. **Files** — readable work history, tasks, events, artifacts and knowledge.
-3. **Commands** — message, invoke, delegate, cancel and complete.
+2. **Files** — readable conversations, execution history, events, artifacts and knowledge.
+3. **Commands** — message, select repository, delegate, steer, cancel and complete.
 4. **Events** — normalized observable activity and terminal outcomes.
 
 Every entry point uses the same authenticated HTTP surface. The web app uses a
 session cookie; the external `mob` CLI uses the same scoped session as a Bearer
 token. An active executor receives a short-lived Agent token carrying workspace,
-task and run claims. Task routes enforce its task claim, while shared knowledge
-is workspace-scoped and conversation visibility follows Actor membership; it is
-not a strict one-run capability sandbox.
+conversation, hidden execution and run claims. Execution routes enforce those
+claims, while shared knowledge is workspace-scoped and conversation visibility
+follows Actor membership; it is not a strict one-run capability sandbox.
 
 ```text
 mob login --server <url> --email <email> --password-stdin
-mob task list
-mob chat send <task-id> "@builder investigate this"
-mob agent invoke <task-id> reviewer "review the result"
+mob chat list
+mob chat new --kind direct --member @builder
+mob chat send <conversation-id> "先帮我分析这个问题"
+mob repo import https://github.com/owner/repository
+mob repo use <conversation-id> <repository-id>
 mob run watch <run-id>
 mob knowledge search "writer lease"
 ```
@@ -55,17 +57,17 @@ The workspace state lives under the persistent data volume:
 ├── agents/<actor-id>/profile.json
 ├── repositories/<repository-id>.json
 ├── documents/<document-id>.json
+├── conversations/<conversation-id>/
+│   ├── conversation.json
+│   ├── members/<actor-id>.json
+│   └── messages/<time>-<id>.md
 ├── knowledge/
 │   ├── raw/                         immutable source material
 │   ├── wiki/                        curated Markdown knowledge
 │   ├── cache/                       disposable search projection
 │   └── manifests/                   provenance and run context selections
-└── tasks/<task-id>/
+└── tasks/<task-id>/                 hidden execution/admin state
     ├── task.json
-    ├── conversations/<conversation-id>/
-    │   ├── conversation.json
-    │   └── members/<actor-id>.json
-    ├── messages/<time>-<id>.md
     ├── delegations/<id>.json
     ├── runs/<run-id>/
     │   ├── run.json
@@ -88,7 +90,7 @@ Anthropic model alias, and Codex uses a Responses model.
 
 In production, provider calls go through a run-token-authenticated local MobAI
 proxy. The real Router key stays in the control process. CLI processes run under
-a dedicated OS UID and temporarily own only the active task checkout. They
+a dedicated OS UID and temporarily own only the active execution checkout. They
 cannot read control credential files, workspace ledgers, artifacts, or trusted
 Git metadata. GitHub credentials are used only by control-plane clone/publish
 commands after human approval.
@@ -134,23 +136,32 @@ MobWiki service or repository is required.
 - Uploaded Markdown is retained in `knowledge/raw/`.
 - Agents or people curate durable pages in `knowledge/wiki/` through Mob commands.
 - Search is a small rebuildable keyword index; no vector database is required.
-- Before a run, Mob searches recent task text, selects bounded excerpts, and
+- Before a run, Mob searches recent conversation text, selects bounded excerpts, and
   records exact paths and revisions in a context manifest.
 - A later Curator automation can use the same ordinary commands. It does not get
   direct access to control-plane state or SCM credentials.
 
 ## Collaboration and execution
 
-Each task has a primary group conversation whose ID equals the task ID, so the
-original task-thread API remains compatible. Additional direct or group
-conversations share the task's repository and run guardrails but keep separate
-membership and transcripts. Direct-chat messages, runs, terminal events and
-artifacts require conversation membership; the primary group remains visible
-to workspace collaborators. Sending a message is only communication; a human
-must explicitly invoke one Agent (or use the legacy task `@mention` command) to
-start a run. Every run records the exact trigger message. The worker treats
-that message, or a delegation's bounded deliverable, as the current instruction
-instead of replaying a stale task description.
+Conversation is the public collaboration object. It is either a direct chat or
+a group; neither requires a Task or repository. A direct chat contains exactly
+two actors; it stays ordinary for two humans and wakes the peer when that peer
+is an Agent. A group message wakes only explicitly mentioned Agents; a message
+without an Agent mention is ordinary chat. Every wake records its exact trigger
+message. The Agent reads the same transcript and decides whether to answer,
+clarify, or begin longer work.
+Long work first acknowledges intent in chat and remains observable and
+interruptible from the same conversation.
+
+Repositories form an independent workspace list. A conversation is scratch by
+default and can select or switch an active repository at any time. When a
+message wakes an Agent, Mob creates a hidden execution record for the turn,
+guardrails, budget and lease. It uses scratch for a conversational response, or
+materializes the isolated worktree automatically when a repository was
+selected. The worker treats the trigger message, relevant transcript, or a
+delegation's bounded deliverable as the current instruction instead of replaying
+a stale Task description. Legacy task-backed primary conversations remain
+readable during migration but are not a separate user-facing chat type.
 
 An agent can invoke another registered actor through `mob delegate`; the
 environment launches or routes the receiving actor and records a separate run.
@@ -169,7 +180,7 @@ core environment.
 ## Git and security boundary
 
 - Fewer than ten administrator-allowlisted trusted repositories.
-- One writable workspace lease per task.
+- One writable workspace lease per hidden execution scope.
 - Agent subprocesses never receive SCM write credentials.
 - Agents stop at task-checkout changes and artifacts. After accepting the
   result, a human may explicitly publish a new `mob/` branch; merge and deploy

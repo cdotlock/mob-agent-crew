@@ -1,8 +1,9 @@
 # Mob Agent Crew
 
-Mob Agent Crew is a small-team, file-native environment where people and coding
-agents share tasks, messages, delegations, artifacts, knowledge, and observable
-runs.
+Mob Agent Crew is a small-team, file-native environment where people and named
+Agent employees share direct chats, group chats, files, knowledge, and
+observable work. Conversation is the front door; a repository and an execution
+workspace are attached only when the conversation actually needs them.
 
 Mob does not own an agent's harness, model, skills, or private memory. Pi, Oh My
 Pi, Claude Code, Codex, Hermes, DeepSeek Harness, and future local or cloud
@@ -10,16 +11,20 @@ agents are opaque participants connected to the same Actor + Files + Commands +
 Events protocol.
 
 The platform treats Claude Code, Codex, Pi, Oh My Pi, Hermes, DeepSeek Harness,
-and future terminal agents as replaceable CLI runtimes. Every agent receives
-the same collaboration surface through the `mob` CLI:
+and future terminal agents as replaceable CLI runtimes. Every Agent has a stable
+identity and a configurable harness, model, Skills, Plugins, and Environment,
+while receiving the same collaboration surface through the `mob` CLI:
 
 ```text
-Human @mentions Agent A
-  -> Agent A reads the task thread with `mob context`
-  -> Agent A posts findings with `mob say`
-  -> Agent A delegates a bounded subtask with `mob delegate @agent-b`
-  -> Agent B replies in the same task
-  -> a human reviews the diff and separately approves a new mob/ branch
+Human opens a direct chat, or @mentions Agent A in a group
+  -> Agent A reads that conversation and decides whether to answer, clarify,
+     or begin longer work
+  -> when code is needed, the conversation selects/imports the repository and
+     Mob creates an isolated worktree automatically
+  -> progress and terminal events appear beside the chat; humans can keep
+     talking and steer an active run
+  -> Agent A may delegate a bounded part to Agent B
+  -> a human separately reviews and approves any SCM publication
 ```
 
 All built-in CLIs use MobAI Router, but not through one forced wire format: Pi,
@@ -37,9 +42,9 @@ See [the DeepSeek Harness plugin guide](docs/deepseek-harness-plugin.md).
 - One small server and PostgreSQL
 - Fewer than ten allowlisted, trusted repositories
 - One embedded worker by default; one active CLI process at a time
-- Root-only control repositories plus isolated task-scoped Agent working copies
-- One writable lease per task and human-only publication
-- Simple browser UI for task threads, agent roster, live run events, and artifacts
+- Root-only control repositories plus isolated execution-scoped Agent worktrees
+- One writable lease per execution workspace and human-only publication
+- Simple browser UI for direct/group chats, Agent roster, live work, and artifacts
 - No Kubernetes, Redis, shared writable agent directories, automatic merge, or hostile multi-tenant security claim
 
 ## Use the environment from another computer
@@ -54,9 +59,13 @@ printf '%s' "$MOB_PASSWORD" | mob login \
   --email you@example.com \
   --password-stdin
 
-mob task list
-mob chat send <task-id> "Context note only; this does not start an Agent."
-mob agent invoke <task-id> @builder "inspect this repository"
+mob chat list
+mob chat new --kind direct --member @builder
+mob chat send <conversation-id> "先帮我判断这个问题，必要时再开始工作。"
+mob repo list
+mob repo import https://github.com/your-org/your-repo
+mob repo use <conversation-id> <repository-id>
+mob chat send <conversation-id> "请开始修改；过程中我会继续补充。"
 mob run watch <run-id>
 mob capability list
 ```
@@ -76,11 +85,14 @@ For direct/group chats, live steering, Agent definition, GitHub access,
 self-iteration, file browsing, and the exact HTTP contracts, give
 [the Mob control protocol](docs/llm-control.md) to the controlling LLM.
 
-In the browser, a direct Agent chat uses **Run @agent** as its primary action;
-that creates a run, streams the real CLI in the right-hand terminal, and posts
-the Agent reply. **Post note** only records shared context. Agent Skills,
-installed Plugins, and secret-free Environments are selected from the shared
-file catalog rather than typed as opaque strings.
+In the browser, chat is chat. A direct message wakes that Agent; a group message
+wakes only explicitly mentioned Agents, while an unmentioned message remains
+ordinary human conversation. The Agent first decides whether to reply, ask a
+question, or start longer work. Long work appears in the right-hand live panel,
+where people can observe its real CLI activity and keep sending guidance. The
+conversation can start in scratch and switch repositories at any time. Agent
+Skills, installed Plugins, and secret-free Environments are selected from the
+shared file catalog rather than typed as opaque strings.
 
 ## Built-in file knowledge
 

@@ -11,6 +11,14 @@ dsh --profile web --dump-config
 dsh web
 ```
 
-The bundle contributes model tools for tasks, chat, conversations, Agent invocation, run observation/control, knowledge, in-run collaboration/artifacts and contained file reads. It contributes the `mob-agent-crew` skill on demand and a read-only `/mob` UI command. Human review/publication, Agent registration, repository import, authentication, server/worker startup and database recovery are intentionally not model tools.
+The bundle contributes model tools for direct/group chat, semantic Agent wake-up,
+run observation/control, knowledge, in-run
+collaboration/artifacts and contained file reads. Chat creation does not require
+a Task or repository, and messages do not carry an `invoke` flag: a direct Agent
+or group `@mention` decides whether to reply, clarify, or begin longer work. It
+contributes the `mob-agent-crew` skill on demand and a read-only `/mob` UI
+command. Human review/publication, Agent registration, repository import,
+authentication, server/worker startup and database recovery are intentionally
+not model tools.
 
 See the integration README for file-API credential setup, exact commands, security boundaries and verification.

@@ -22,7 +22,8 @@ serve the same work to people, cloud agents, local agents, and arbitrary future
 CLI tools without becoming another agent framework.
 
 The important product is the environment around agents: durable work files,
-stable identities, conversations, task commands, observable events, artifacts,
+stable identities, direct/group conversations, execution commands, observable
+events, artifacts,
 permissions, and shared knowledge. Harness configuration, model routing, skills,
 and private memory belong to the connected agent or its operator. Encoding those
 concepts in Mob would make the abstraction thicker, couple collaboration to
@@ -43,9 +44,10 @@ primitives:
 2. **Files** — conversations, messages, tasks, run records, events, artifacts
    and knowledge are stored under the workspace data directory in documented,
    human-readable formats.
-3. **Commands** — clients may post messages, invoke or delegate to an actor,
-   claim work, cancel work and publish results through one small authenticated
-   API and the `mob` CLI.
+3. **Commands** — clients may post messages, select a repository, delegate to an
+   actor, steer or cancel work and publish results through one small
+   authenticated API and the `mob` CLI. A direct message or group `@mention`
+   wakes an Agent; there is no separate user-facing invoke command.
 4. **Events** — connected executors report normalized lifecycle and activity
    events so the web UI and CLI can observe the same work.
 
@@ -65,6 +67,12 @@ They do not define the domain model, and we will not expand Mob into a harness o
 model catalog. Local or remote executors will eventually connect through the same
 claim/event/result protocol without requiring inbound access to the user's
 machine.
+
+Conversation is independent of execution. Creating a direct or group chat does
+not create a repository-backed Task. Repositories are selected from a workspace
+list only when needed, and Mob creates a hidden execution record and isolated
+worktree at that point. Legacy task records remain internal coordination and
+publication state rather than the product's navigation model.
 
 ## Consequences
 
