@@ -1,5 +1,4 @@
 import { ArrowCounterClockwiseIcon as ArrowCounterClockwise } from "@phosphor-icons/react/ArrowCounterClockwise";
-import { BookOpenTextIcon as BookOpenText } from "@phosphor-icons/react/BookOpenText";
 import { CaretRightIcon as CaretRight } from "@phosphor-icons/react/CaretRight";
 import { CheckIcon as Check } from "@phosphor-icons/react/Check";
 import { CodeIcon as Code } from "@phosphor-icons/react/Code";
@@ -18,8 +17,6 @@ import type { CSSProperties, FormEvent } from "react";
 import {
   fetchFile,
   fetchFiles,
-  fetchKnowledge,
-  fetchKnowledgeFile,
   fetchRunEvents,
   sendRunCommand,
 } from "./api.js";
@@ -29,12 +26,11 @@ import type {
   FileContents,
   FileEntry,
   FileScope,
-  KnowledgeEntry,
   RunEvent,
   TaskDetail,
 } from "./model.js";
 
-type InspectorTab = "terminal" | "files" | "wiki" | "agent";
+type InspectorTab = "terminal" | "files" | "agent";
 
 const terminalStatuses = new Set(["succeeded", "failed", "cancelled", "skipped"]);
 
@@ -76,23 +72,6 @@ const demoFiles: DemoFile[] = [
     path: "knowledge/wiki/repositories/mob-agent-crew/index.md",
     language: "markdown",
     content: "# mob-agent-crew\n\nRevision: main@7c9d2a1\n\n## Operating boundary\nMob owns identities, conversations, files, commands, and events. Each external CLI owns its own harness internals.",
-  },
-];
-
-const demoKnowledge = [
-  {
-    path: "wiki/repositories/mob-agent-crew/index.md",
-    area: "wiki" as const,
-    title: "mob-agent-crew repository index",
-    revision: "main@7c9d2a1",
-    content: demoFiles.find((file) => file.path === "knowledge/wiki/repositories/mob-agent-crew/index.md")!.content,
-  },
-  {
-    path: "raw/repositories/mob-agent-crew/7c9d2a1/README.md",
-    area: "raw" as const,
-    title: "README.md",
-    revision: "main@7c9d2a1",
-    content: demoFiles.find((file) => file.path === "README.md")!.content,
   },
 ];
 
@@ -457,83 +436,7 @@ function FileBrowser({ task, demo }: { task: TaskDetail; demo: boolean }) {
   );
 }
 
-function WikiBrowser({ demo }: { demo: boolean }) {
-  const [area, setArea] = useState<"wiki" | "raw">("wiki");
-  const [entries, setEntries] = useState<KnowledgeEntry[]>([]);
-  const [selected, setSelected] = useState<FileContents | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    let stopped = false;
-    setLoading(true);
-    setError(null);
-    setEntries([]);
-    setSelected(null);
-    if (demo) {
-      setEntries(demoKnowledge.filter((entry) => entry.area === area).map((entry) => ({
-        path: entry.path,
-        area: entry.area,
-        title: entry.title,
-        bytes: entry.content.length,
-        revision: entry.revision,
-        updatedAt: new Date().toISOString(),
-      })));
-      setLoading(false);
-      return () => { stopped = true; };
-    }
-    void fetchKnowledge(area).then((value) => { if (!stopped) setEntries(value); }).catch((loadError: unknown) => {
-      if (!stopped) setError(loadError instanceof Error ? loadError.message : "Wiki is unavailable.");
-    }).finally(() => { if (!stopped) setLoading(false); });
-    return () => { stopped = true; };
-  }, [area, demo]);
-
-  async function open(entry: KnowledgeEntry) {
-    setLoading(true);
-    setError(null);
-    try {
-      if (demo) {
-        const file = demoKnowledge.find((candidate) => candidate.path === entry.path);
-        if (!file) throw new Error("Demo Wiki file is unavailable.");
-        setSelected({ scope: "workspace", path: file.path, name: file.path.split("/").at(-1) ?? file.path, bytes: file.content.length, language: "markdown", content: file.content, truncated: false });
-      } else {
-        setSelected(await fetchKnowledgeFile(entry.path));
-      }
-    } catch (openError) {
-      setError(openError instanceof Error ? openError.message : "Wiki file could not be opened.");
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  return (
-    <section className="wiki-panel">
-      <div className="file-scope-switch" role="tablist" aria-label="Knowledge area">
-        <button className={area === "wiki" ? "is-active" : ""} onClick={() => setArea("wiki")}><BookOpenText /> Wiki</button>
-        <button className={area === "raw" ? "is-active" : ""} onClick={() => setArea("raw")}><File /> Sources</button>
-      </div>
-      {error ? <div className="panel-error" role="alert"><WarningCircle /> {error}</div> : null}
-      {selected ? (
-        <div className="wiki-reading">
-          <button className="back-link" onClick={() => setSelected(null)}>← All {area === "wiki" ? "Wiki" : "sources"}</button>
-          <FilePreview file={selected} />
-        </div>
-      ) : (
-        <div className="wiki-list" aria-busy={loading}>
-          {loading ? <p className="panel-placeholder"><SpinnerGap className="spin" /> Reading knowledge…</p> : null}
-          {!loading && entries.map((entry) => (
-            <button key={entry.path} onClick={() => void open(entry)}>
-              <BookOpenText /><span><strong>{entry.title || entry.path}</strong><small>{entry.path}</small></span><small>{shortBytes(entry.bytes)}</small><CaretRight />
-            </button>
-          ))}
-          {!loading && !entries.length && !error ? <p className="panel-placeholder">No {area} files yet. Import a repository or add Markdown to create the first one.</p> : null}
-        </div>
-      )}
-    </section>
-  );
-}
-
-function AgentEnvironment({ task, agents, onDelegate }: { task: TaskDetail; agents: AgentProfile[]; onDelegate: (agentId: string) => void }) {
+function AgentEnvironment({ task, agents, onDelegate, onConfigure }: { task: TaskDetail; agents: AgentProfile[]; onDelegate: (agentId: string) => void; onConfigure: (agentId: string) => void }) {
   const latest = task.runs.at(-1);
   const [agentId, setAgentId] = useState(latest?.agentId ?? task.participantIds[0] ?? agents[0]?.id ?? "");
   const agent = agents.find((entry) => entry.id === agentId) ?? agents[0];
@@ -546,18 +449,20 @@ function AgentEnvironment({ task, agents, onDelegate }: { task: TaskDetail; agen
   return (
     <section className="agent-environment">
       <select value={agent.id} onChange={(event) => setAgentId(event.target.value)} aria-label="Choose an Agent">
-        {agents.map((entry) => <option value={entry.id} key={entry.id}>@{entry.name} · {entry.driver}</option>)}
+        {agents.map((entry) => <option value={entry.id} key={entry.id}>@{entry.handle} · {entry.driver}</option>)}
       </select>
-      <div className="agent-hero"><span style={{ "--agent-color": agent.color } as CSSProperties}><Robot weight="duotone" /></span><div><p className="eyebrow">Agent identity</p><h3>{agent.name}</h3><p>{agent.role}</p></div></div>
+      <div className="agent-hero"><span style={{ "--agent-color": agent.color } as CSSProperties}><Robot weight="duotone" /></span><div><p className="eyebrow">@{agent.handle}</p><h3>{agent.name}</h3><p>{agent.role}</p></div></div>
       <dl className="environment-grid">
-        <div><dt>Connector</dt><dd><Code /> {agent.driver}</dd></div>
+        <div><dt>Harness</dt><dd><Code /> {agent.driver}</dd></div>
+        <div><dt>Model</dt><dd>{agent.effectiveModelId}</dd></div>
         <div><dt>Status</dt><dd>{agent.status}</dd></div>
         <div><dt>Environment</dt><dd>{task.repository} · {task.branch}</dd></div>
+        <div><dt>Environment ref</dt><dd>{agent.environment.reference ?? "Workspace default"}</dd></div>
         <div><dt>Knowledge</dt><dd>Automatic manifest per run</dd></div>
-        <div className="wide"><dt>Skills & plugins</dt><dd>Managed by the {agent.driver} CLI. Mob passes files, commands, events, and a task worktree without copying the harness internals.</dd></div>
+        <div className="wide"><dt>Skills</dt><dd>{agent.skillRefs.length ? agent.skillRefs.join(" · ") : `${agent.driver} defaults`}</dd></div>
       </dl>
       <div className="capability-list">{agent.capabilities.map((capability) => <span key={capability}>{capability}</span>)}</div>
-      <button className="agent-command-button" onClick={() => onDelegate(agent.id)}><TerminalWindow /> Give @{agent.name} a bounded task</button>
+      <div className="agent-workbench-actions"><button className="secondary-button" onClick={() => onConfigure(agent.id)}><Code /> Configure</button><button className="agent-command-button" onClick={() => onDelegate(agent.id)}><TerminalWindow /> Give @{agent.handle} a bounded task</button></div>
     </section>
   );
 }
@@ -566,11 +471,13 @@ export function WorkspaceInspector({
   task,
   agents,
   onDelegate,
+  onConfigure,
   source,
 }: {
   task: TaskDetail | null;
   agents: AgentProfile[];
   onDelegate: (agentId: string) => void;
+  onConfigure: (agentId: string) => void;
   source: "api" | "demo";
 }) {
   const [tab, setTab] = useState<InspectorTab>("terminal");
@@ -578,20 +485,18 @@ export function WorkspaceInspector({
   return (
     <aside className="inspector-pane pane work-inspector" aria-label="Agent work, files, and knowledge">
       <header className="work-inspector-header">
-        <div><p className="eyebrow">{source === "demo" ? "Demo workspace" : "Live workspace"}</p><h2>{tab === "terminal" ? "Agent terminal" : tab === "files" ? "Files" : tab === "wiki" ? "Wiki" : "Agent"}</h2></div>
+        <div><p className="eyebrow">{source === "demo" ? "Demo workspace" : "Live workspace"}</p><h2>{tab === "terminal" ? "Agent terminal" : tab === "files" ? "Files" : "Agent"}</h2></div>
         <span className={classes("work-state", source === "demo" && "is-demo")}><i /> {source === "demo" ? "demo preview" : "connected"}</span>
       </header>
       <nav className="inspector-tabs" aria-label="Workspace inspector" role="tablist">
         <button role="tab" aria-controls="workspace-inspector-panel" aria-label="Terminal" aria-selected={tab === "terminal"} className={tab === "terminal" ? "is-active" : ""} onClick={() => setTab("terminal")}><TerminalWindow /><span>Terminal</span></button>
         <button role="tab" aria-controls="workspace-inspector-panel" aria-label="Files" aria-selected={tab === "files"} className={tab === "files" ? "is-active" : ""} onClick={() => setTab("files")}><FolderOpen /><span>Files</span></button>
-        <button role="tab" aria-controls="workspace-inspector-panel" aria-label="Wiki" aria-selected={tab === "wiki"} className={tab === "wiki" ? "is-active" : ""} onClick={() => setTab("wiki")}><BookOpenText /><span>Wiki</span></button>
         <button role="tab" aria-controls="workspace-inspector-panel" aria-label="Agent" aria-selected={tab === "agent"} className={tab === "agent" ? "is-active" : ""} onClick={() => setTab("agent")}><Robot /><span>Agent</span></button>
       </nav>
       <div className="work-inspector-body" id="workspace-inspector-panel" role="tabpanel">
         {tab === "terminal" ? <AgentTerminal task={task} agents={agents} demo={source === "demo"} /> : null}
         {tab === "files" ? <FileBrowser task={task} demo={source === "demo"} /> : null}
-        {tab === "wiki" ? <WikiBrowser demo={source === "demo"} /> : null}
-        {tab === "agent" ? <AgentEnvironment task={task} agents={agents} onDelegate={onDelegate} /> : null}
+        {tab === "agent" ? <AgentEnvironment task={task} agents={agents} onDelegate={onDelegate} onConfigure={onConfigure} /> : null}
       </div>
     </aside>
   );

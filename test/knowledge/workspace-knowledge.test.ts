@@ -10,10 +10,16 @@ afterEach(async () => {
   await Promise.all(directories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
 });
 
-async function fixture(): Promise<{ root: string; knowledge: WorkspaceKnowledge }> {
+async function fixture(cacheValidationMs?: number): Promise<{ root: string; knowledge: WorkspaceKnowledge }> {
   const root = await mkdtemp(join(tmpdir(), "mob-knowledge-"));
   directories.push(root);
-  return { root, knowledge: new WorkspaceKnowledge({ rootDirectory: join(root, "knowledge") }) };
+  return {
+    root,
+    knowledge: new WorkspaceKnowledge({
+      rootDirectory: join(root, "knowledge"),
+      ...(cacheValidationMs === undefined ? {} : { cacheValidationMs }),
+    }),
+  };
 }
 
 describe("WorkspaceKnowledge", () => {
@@ -142,8 +148,43 @@ describe("WorkspaceKnowledge", () => {
     expect(stored.id).toBe(retrieval.manifest.id);
   });
 
+  it("returns model-neutral answer context and revision-bound citations for a natural-language question", async () => {
+    const { knowledge } = await fixture();
+    await knowledge.writeWiki({
+      path: "agents/collaboration.md",
+      content: "# Agent 协作\n\nAgent 使用任务消息、显式委托和不可变产物进行协作。",
+    });
+
+    const result = await knowledge.query(" Agent 如何协作？ ", { topK: 3, charBudget: 500 });
+
+    expect(result.question).toBe("Agent 如何协作？");
+    expect(result.answerContext).toContain("wiki/agents/collaboration.md");
+    expect(result.citations[0]).toMatchObject({
+      path: "wiki/agents/collaboration.md",
+      title: "Agent 协作",
+    });
+    expect(result.citations[0]?.revision).toMatch(/^[a-f0-9]{64}$/u);
+    expect(result.indexRevision).toMatch(/^[a-f0-9]{64}$/u);
+    expect(result.manifestPath).toMatch(/^manifests\/contexts\/[a-f0-9]{24}\.json$/u);
+  });
+
+  it("shares the warm index across instances and invalidates it immediately for managed writes", async () => {
+    const { root, knowledge } = await fixture(60_000);
+    const second = new WorkspaceKnowledge({
+      rootDirectory: join(root, "knowledge"),
+      cacheValidationMs: 60_000,
+    });
+    await knowledge.writeWiki({ path: "status.md", content: "# Status\n\nFirst revision phrase" });
+    expect((await knowledge.search("first"))[0]?.path).toBe("wiki/status.md");
+
+    await second.writeWiki({ path: "status.md", content: "# Status\n\nSecond revision phrase" });
+
+    expect(await knowledge.search("first")).toEqual([]);
+    expect((await knowledge.search("second"))[0]?.path).toBe("wiki/status.md");
+  });
+
   it("detects direct file changes, rebuilds disposable cache, and lints bad source files", async () => {
-    const { root, knowledge } = await fixture();
+    const { root, knowledge } = await fixture(0);
     await knowledge.initialize();
     const wiki = join(root, "knowledge/wiki");
     await writeFile(join(wiki, "direct.md"), "# Direct\n\nFirst unique phrase");

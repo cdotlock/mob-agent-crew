@@ -37,6 +37,12 @@ type RuntimeProfile = {
   driver: AgentDriverId;
   home: string;
   role: string;
+  modelId: string | null;
+  skillRefs: string[];
+  environment: {
+    reference: string | null;
+    values: Record<string, string>;
+  };
 };
 
 type TaskRepository = {
@@ -125,7 +131,10 @@ export class MobWorker {
 
   async #loadProfile(claim: LeaseClaim): Promise<RuntimeProfile> {
     const rows = await this.#options.store.sql<RuntimeProfile[]>`
-      SELECT driver, home, role
+      SELECT driver, home, role,
+             model_id AS "modelId",
+             skill_refs AS "skillRefs",
+             environment
       FROM agent_profiles
       WHERE actor_id = ${claim.agentActorId} AND workspace_id = ${claim.workspaceId}
     `;
@@ -135,10 +144,20 @@ export class MobWorker {
     if (profile.home !== expectedHome) {
       throw new Error(`Agent profile ${claim.agentActorId} has an invalid home directory`);
     }
-    return profile;
+    return {
+      ...profile,
+      modelId: profile.modelId ?? null,
+      skillRefs: Array.isArray(profile.skillRefs) ? profile.skillRefs : [],
+      environment: profile.environment && typeof profile.environment === "object"
+        ? {
+            reference: profile.environment.reference ?? null,
+            values: profile.environment.values ?? {},
+          }
+        : { reference: null, values: {} },
+    };
   }
 
-  async #buildPrompt(claim: LeaseClaim, role: string): Promise<string> {
+  async #buildPrompt(claim: LeaseClaim, profile: RuntimeProfile): Promise<string> {
     const [thread, actors] = await Promise.all([
       this.#options.store.getTaskThread(claim.taskId),
       this.#options.store.listActors(claim.workspaceId),
@@ -165,7 +184,13 @@ export class MobWorker {
       .map((actor) => `@${actor.handle}`)
       .join(", ");
     return [
-      `You are participating as ${role || "a coding agent"} in a shared Mob Agent Crew task.`,
+      `You are participating as ${profile.role || "a coding agent"} in a shared Mob Agent Crew task.`,
+      profile.skillRefs.length
+        ? `Configured skill references (resolve only through your own harness): ${profile.skillRefs.join(", ")}`
+        : "",
+      profile.environment.reference
+        ? `Configured environment reference: ${profile.environment.reference}`
+        : "",
       `Task: ${thread.task.title}`,
       thread.task.description && currentInstruction !== thread.task.description
         ? `Task background (context only, not the current instruction): ${thread.task.description}`
@@ -285,29 +310,50 @@ export class MobWorker {
       runtimeSecrets.push(token);
 
       if (profile.driver !== "mock") {
+        const effectiveModel = profile.modelId ?? defaultModelForDriver(this.#options.config, profile.driver);
         await writeMobAiProviderConfig({
           directory: profile.home,
           baseUrl: `http://127.0.0.1:${this.#options.config.port}/api/provider`,
-          model: this.#options.config.mobAiModel,
-          claudeModel: this.#options.config.mobAiClaudeModel,
-          codexModel: this.#options.config.mobAiCodexModel,
+          model: profile.driver === "claude" || profile.driver === "codex"
+            ? this.#options.config.mobAiModel
+            : effectiveModel,
+          claudeModel: profile.driver === "claude"
+            ? effectiveModel
+            : this.#options.config.mobAiClaudeModel,
+          codexModel: profile.driver === "codex"
+            ? effectiveModel
+            : this.#options.config.mobAiCodexModel,
         });
       }
+
+      const effectiveModel = profile.modelId ?? defaultModelForDriver(this.#options.config, profile.driver);
 
       nativeRun = await driver.run({
         jobId: claim.runId,
         attemptId: claim.attemptId,
-        prompt: await this.#buildPrompt(claim, profile.role),
+        prompt: await this.#buildPrompt(claim, profile),
         cwd: taskDir,
         timeoutMs: 30 * 60_000,
         ...(profile.driver !== "mock" ? { profileDirectory: profile.home } : {}),
         env: {
+          ...profile.environment.values,
           ...agentRuntimeProviderEnvironment(this.#options.config, token),
-          MOB_AI_MODEL: this.#options.config.mobAiModel,
-          MOB_AI_CLAUDE_MODEL: this.#options.config.mobAiClaudeModel ?? "claude-opus-4-6:free",
-          MOB_AI_CODEX_MODEL: this.#options.config.mobAiCodexModel ?? "gpt-5.6-sol",
+          MOB_AI_MODEL: profile.driver === "claude" || profile.driver === "codex"
+            ? this.#options.config.mobAiModel
+            : effectiveModel,
+          MOB_AI_CLAUDE_MODEL: profile.driver === "claude"
+            ? effectiveModel
+            : this.#options.config.mobAiClaudeModel ?? "claude-opus-4-6:free",
+          MOB_AI_CODEX_MODEL: profile.driver === "codex"
+            ? effectiveModel
+            : this.#options.config.mobAiCodexModel ?? "gpt-5.6-sol",
           MOB_API_URL: this.#options.config.publicUrl ?? `http://127.0.0.1:${this.#options.config.port}`,
           MOB_RUN_TOKEN: token,
+        },
+        metadata: {
+          modelId: effectiveModel,
+          skillRefs: profile.skillRefs,
+          environmentReference: profile.environment.reference,
         },
       });
       this.#active.set(claim.runId, nativeRun);
@@ -438,6 +484,12 @@ export function agentRuntimeProviderEnvironment(
     ...(config.mobAiKey ? { MOB_AI_KEY: runToken } : {}),
     MOB_AI_BASE_URL: `http://127.0.0.1:${config.port}/api/provider`,
   };
+}
+
+function defaultModelForDriver(config: AppConfig, driver: AgentDriverId): string {
+  if (driver === "claude") return config.mobAiClaudeModel ?? config.mobAiModel;
+  if (driver === "codex") return config.mobAiCodexModel ?? config.mobAiModel;
+  return config.mobAiModel;
 }
 
 function delay(milliseconds: number): Promise<void> {

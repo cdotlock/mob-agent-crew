@@ -1,7 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
+import { constants as fsConstants } from "node:fs";
 import {
   lstat,
   mkdir,
+  open,
   readFile,
   readdir,
   realpath,
@@ -18,6 +20,11 @@ export interface WorkspaceKnowledgeOptions {
   /** One platform-owned directory for one workspace. */
   readonly rootDirectory: string;
   readonly maxDocumentBytes?: number;
+  /**
+   * How long an in-memory index may be reused before checking for direct
+   * filesystem edits. Writes through this class invalidate it immediately.
+   */
+  readonly cacheValidationMs?: number;
 }
 
 export interface WriteKnowledgeInput {
@@ -85,6 +92,16 @@ export interface KnowledgeRetrieval {
   readonly manifestPath: string;
 }
 
+/** Model-neutral result for agents or external callers answering a question. */
+export interface KnowledgeQueryResult {
+  readonly question: string;
+  /** Citation-labelled Markdown ready to add to an Agent prompt. */
+  readonly answerContext: string;
+  readonly citations: readonly KnowledgeSearchResult[];
+  readonly indexRevision: string;
+  readonly manifestPath: string;
+}
+
 export interface KnowledgeIndexSummary {
   readonly revision: string;
   readonly documents: number;
@@ -117,6 +134,12 @@ interface StoredIndex {
   readonly documents: readonly IndexedDocument[];
 }
 
+interface SharedKnowledgeCache {
+  cachedIndex: { readonly index: StoredIndex; readonly validatedAt: number } | undefined;
+  indexLoad: Promise<StoredIndex> | undefined;
+  sourceGeneration: number;
+}
+
 interface WalkedFile {
   readonly area: KnowledgeArea;
   readonly relativePath: string;
@@ -129,8 +152,10 @@ const INDEX_VERSION = 1 as const;
 const DEFAULT_MAX_DOCUMENT_BYTES = 2 * 1024 * 1024;
 const DEFAULT_TOP_K = 6;
 const DEFAULT_CHAR_BUDGET = 12_000;
+const DEFAULT_CACHE_VALIDATION_MS = 750;
 const INDEX_PATH = "cache/knowledge-index.json";
 const CATALOG_PATH = "manifests/catalog.json";
+const sharedKnowledgeCaches = new Map<string, SharedKnowledgeCache>();
 
 /**
  * Filesystem knowledge for a single workspace.
@@ -141,12 +166,24 @@ const CATALOG_PATH = "manifests/catalog.json";
 export class WorkspaceKnowledge {
   readonly rootDirectory: string;
   readonly #maxDocumentBytes: number;
+  readonly #cacheValidationMs: number;
+  readonly #sharedCache: SharedKnowledgeCache;
 
   constructor(options: WorkspaceKnowledgeOptions) {
     this.rootDirectory = resolve(options.rootDirectory);
     this.#maxDocumentBytes = options.maxDocumentBytes ?? DEFAULT_MAX_DOCUMENT_BYTES;
+    this.#cacheValidationMs = options.cacheValidationMs ?? DEFAULT_CACHE_VALIDATION_MS;
+    this.#sharedCache = sharedKnowledgeCaches.get(this.rootDirectory) ?? {
+      cachedIndex: undefined,
+      indexLoad: undefined,
+      sourceGeneration: 0,
+    };
+    sharedKnowledgeCaches.set(this.rootDirectory, this.#sharedCache);
     if (!Number.isSafeInteger(this.#maxDocumentBytes) || this.#maxDocumentBytes <= 0) {
       throw new Error("maxDocumentBytes must be a positive integer");
+    }
+    if (!Number.isSafeInteger(this.#cacheValidationMs) || this.#cacheValidationMs < 0) {
+      throw new Error("cacheValidationMs must be a non-negative integer");
     }
   }
 
@@ -181,24 +218,45 @@ export class WorkspaceKnowledge {
     return this.#writeDocument("wiki", input, false);
   }
 
+  /** Forces the next list/search/query to validate direct filesystem edits. */
+  invalidate(): void {
+    this.#sharedCache.sourceGeneration += 1;
+    this.#sharedCache.cachedIndex = undefined;
+  }
+
   async list(area?: KnowledgeArea): Promise<readonly KnowledgeEntry[]> {
-    await this.initialize();
-    const files = await this.#walkSources(area);
-    const entries = await Promise.all(files.map((file) => this.#readEntry(file)));
-    return entries.sort((left, right) => left.path.localeCompare(right.path));
+    const index = await this.#loadCurrentIndex();
+    return index.documents
+      .filter((document) => area === undefined || document.area === area)
+      .map(({ body: _body, normalizedBody: _normalizedBody, normalizedTitle: _normalizedTitle, ...entry }) => entry);
   }
 
   /** Reads `raw/...` or `wiki/...`; absolute paths and traversal are rejected. */
   async read(path: string): Promise<KnowledgeDocument> {
-    await this.initialize();
     const { area, relativePath } = splitKnowledgePath(path);
+    const normalizedPath = `${area}/${relativePath}`;
+    const cached = this.#sharedCache.cachedIndex;
+    if (cached && Date.now() - cached.validatedAt < this.#cacheValidationMs) {
+      const document = cached.index.documents.find((candidate) => candidate.path === normalizedPath);
+      if (document) {
+        return {
+          path: document.path,
+          area: document.area,
+          content: document.body,
+          bytes: document.bytes,
+          revision: document.revision,
+          updatedAt: document.updatedAt,
+        };
+      }
+    }
+    await this.initialize();
     const absolutePath = await this.#safeExistingPath(area, relativePath);
     const info = await stat(absolutePath);
     if (!info.isFile()) throw new Error(`Knowledge path is not a file: ${path}`);
     if (info.size > this.#maxDocumentBytes) throw new Error(`Knowledge document exceeds ${this.#maxDocumentBytes} bytes`);
     const content = await readUtf8(absolutePath);
     return {
-      path: `${area}/${relativePath}`,
+      path: normalizedPath,
       area,
       content,
       bytes: info.size,
@@ -211,23 +269,15 @@ export class WorkspaceKnowledge {
     const cleanQuery = normalizeQuery(query);
     const topK = positiveInteger(options.topK ?? DEFAULT_TOP_K, "topK");
     const index = await this.#loadCurrentIndex();
-    const queryTerms = unique(tokenize(cleanQuery));
-    if (queryTerms.length === 0) return [];
-
-    return index.documents
-      .map((document) => scoreDocument(document, cleanQuery, queryTerms))
-      .filter((result): result is KnowledgeSearchResult => result !== null)
-      .sort((left, right) => right.score - left.score || left.path.localeCompare(right.path))
-      .slice(0, topK);
+    return searchIndex(index, cleanQuery, topK);
   }
 
   async retrieve(query: string, options: KnowledgeRetrieveOptions = {}): Promise<KnowledgeRetrieval> {
+    const cleanQuery = normalizeQuery(query);
     const topK = positiveInteger(options.topK ?? DEFAULT_TOP_K, "topK");
     const charBudget = positiveInteger(options.charBudget ?? DEFAULT_CHAR_BUDGET, "charBudget");
-    const [results, index] = await Promise.all([
-      this.search(query, { topK }),
-      this.#loadCurrentIndex(),
-    ]);
+    const index = await this.#loadCurrentIndex();
+    const results = searchIndex(index, cleanQuery, topK);
 
     const included: KnowledgeSearchResult[] = [];
     let context = "";
@@ -242,7 +292,7 @@ export class WorkspaceKnowledge {
     }
 
     const manifestSeed = JSON.stringify({
-      query: normalizeQuery(query),
+      query: cleanQuery,
       indexRevision: index.revision,
       topK,
       charBudget,
@@ -252,7 +302,7 @@ export class WorkspaceKnowledge {
     const manifest: KnowledgeContextManifest = {
       version: 1,
       id,
-      query: normalizeQuery(query),
+      query: cleanQuery,
       indexRevision: index.revision,
       topK,
       charBudget,
@@ -269,9 +319,31 @@ export class WorkspaceKnowledge {
     return { context, items: included, manifest, manifestPath };
   }
 
+  /**
+   * Retrieves citation-bound answer context without choosing or calling a
+   * model. The caller remains free to pass it to any harness/model pair.
+   */
+  async query(question: string, options: KnowledgeRetrieveOptions = {}): Promise<KnowledgeQueryResult> {
+    const cleanQuestion = question.trim();
+    const retrieval = await this.retrieve(cleanQuestion, options);
+    return {
+      question: cleanQuestion,
+      answerContext: retrieval.context,
+      citations: retrieval.items,
+      indexRevision: retrieval.manifest.indexRevision,
+      manifestPath: retrieval.manifestPath,
+    };
+  }
+
   async rebuildIndex(): Promise<KnowledgeIndexSummary> {
     await this.initialize();
     const files = await this.#walkSources();
+    const index = await this.#persistIndex(files);
+    this.#sharedCache.cachedIndex = { index, validatedAt: Date.now() };
+    return { revision: index.revision, documents: index.documents.length, path: INDEX_PATH };
+  }
+
+  async #persistIndex(files: readonly WalkedFile[]): Promise<StoredIndex> {
     const documents = await Promise.all(files.map((file) => this.#indexFile(file)));
     documents.sort((left, right) => left.path.localeCompare(right.path));
     const sourceSignature = signatureForFiles(files);
@@ -292,7 +364,7 @@ export class WorkspaceKnowledge {
         updatedAt,
       })),
     });
-    return { revision, documents: documents.length, path: INDEX_PATH };
+    return index;
   }
 
   async lint(): Promise<KnowledgeLintReport> {
@@ -354,6 +426,8 @@ export class WorkspaceKnowledge {
       await this.#writeTextAtomic(absolutePath, content);
     }
 
+    this.#sharedCache.sourceGeneration += 1;
+    this.#sharedCache.cachedIndex = undefined;
     const document = await this.read(`${area}/${relativePath}`);
     const documentManifestPath = resolve(
       this.rootDirectory,
@@ -373,7 +447,21 @@ export class WorkspaceKnowledge {
   }
 
   async #loadCurrentIndex(): Promise<StoredIndex> {
+    const cached = this.#sharedCache.cachedIndex;
+    if (cached && Date.now() - cached.validatedAt < this.#cacheValidationMs) return cached.index;
+    if (this.#sharedCache.indexLoad) return this.#sharedCache.indexLoad;
+    const loading = this.#loadCurrentIndexUncached();
+    this.#sharedCache.indexLoad = loading;
+    try {
+      return await loading;
+    } finally {
+      if (this.#sharedCache.indexLoad === loading) this.#sharedCache.indexLoad = undefined;
+    }
+  }
+
+  async #loadCurrentIndexUncached(): Promise<StoredIndex> {
     await this.initialize();
+    const generation = this.#sharedCache.sourceGeneration;
     const files = await this.#walkSources();
     const sourceSignature = signatureForFiles(files);
     try {
@@ -384,13 +472,20 @@ export class WorkspaceKnowledge {
         typeof parsed.revision === "string" &&
         Array.isArray(parsed.documents)
       ) {
-        return parsed as StoredIndex;
+        const index = parsed as StoredIndex;
+        if (generation === this.#sharedCache.sourceGeneration) {
+          this.#sharedCache.cachedIndex = { index, validatedAt: Date.now() };
+        }
+        return index;
       }
     } catch (error) {
       if (!isNodeError(error, "ENOENT") && !(error instanceof SyntaxError)) throw error;
     }
-    await this.rebuildIndex();
-    return JSON.parse(await readFile(resolve(this.rootDirectory, INDEX_PATH), "utf8")) as StoredIndex;
+    const index = await this.#persistIndex(files);
+    if (generation === this.#sharedCache.sourceGeneration) {
+      this.#sharedCache.cachedIndex = { index, validatedAt: Date.now() };
+    }
+    return index;
   }
 
   async #walkSources(area?: KnowledgeArea): Promise<WalkedFile[]> {
@@ -400,7 +495,8 @@ export class WorkspaceKnowledge {
       await walkTree(areaRoot, async (absolutePath, relativePath, type) => {
         if (type === "symlink") throw new Error(`Symlinks are not allowed in knowledge sources: ${currentArea}/${relativePath}`);
         if (type !== "file" || !isMarkdown(relativePath)) return;
-        const info = await stat(absolutePath);
+        const info = await lstat(absolutePath);
+        if (info.isSymbolicLink()) throw new Error(`Symlinks are not allowed in knowledge sources: ${currentArea}/${relativePath}`);
         if (info.size > this.#maxDocumentBytes) throw new Error(`Knowledge document exceeds ${this.#maxDocumentBytes} bytes: ${currentArea}/${relativePath}`);
         files.push({ area: currentArea, relativePath, absolutePath, bytes: info.size, mtimeMs: info.mtimeMs });
       });
@@ -408,13 +504,27 @@ export class WorkspaceKnowledge {
     return files.sort((left, right) => `${left.area}/${left.relativePath}`.localeCompare(`${right.area}/${right.relativePath}`));
   }
 
-  async #readEntry(file: WalkedFile): Promise<KnowledgeEntry> {
-    const document = await this.read(`${file.area}/${file.relativePath}`);
-    return { ...withoutContent(document), title: markdownTitle(document.content, file.relativePath) };
-  }
-
   async #indexFile(file: WalkedFile): Promise<IndexedDocument> {
-    const document = await this.read(`${file.area}/${file.relativePath}`);
+    const handle = await open(file.absolutePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    let document: KnowledgeDocument;
+    try {
+      const info = await handle.stat();
+      if (!info.isFile()) throw new Error(`Knowledge path is not a file: ${file.area}/${file.relativePath}`);
+      if (info.size > this.#maxDocumentBytes) {
+        throw new Error(`Knowledge document exceeds ${this.#maxDocumentBytes} bytes: ${file.area}/${file.relativePath}`);
+      }
+      const content = new TextDecoder("utf-8", { fatal: true }).decode(await handle.readFile());
+      document = {
+        path: `${file.area}/${file.relativePath}`,
+        area: file.area,
+        content,
+        bytes: info.size,
+        revision: sha256(content),
+        updatedAt: info.mtime.toISOString(),
+      };
+    } finally {
+      await handle.close();
+    }
     const title = markdownTitle(document.content, file.relativePath);
     return {
       ...withoutContent(document),
@@ -459,7 +569,15 @@ export class WorkspaceKnowledge {
         }
       } catch (error) {
         if (!isNodeError(error, "ENOENT")) throw error;
-        await mkdir(current, { mode: 0o700 });
+        try {
+          await mkdir(current, { mode: 0o700 });
+        } catch (mkdirError) {
+          if (!isNodeError(mkdirError, "EEXIST")) throw mkdirError;
+          const info = await lstat(current);
+          if (info.isSymbolicLink() || !info.isDirectory()) {
+            throw new Error(`Unsafe knowledge directory: ${area}/${relativeParent}`);
+          }
+        }
       }
     }
   }
@@ -597,6 +715,16 @@ function sha256(value: string): string {
 
 function unique(values: readonly string[]): string[] {
   return [...new Set(values)];
+}
+
+function searchIndex(index: StoredIndex, cleanQuery: string, topK: number): readonly KnowledgeSearchResult[] {
+  const queryTerms = unique(tokenize(cleanQuery));
+  if (queryTerms.length === 0) return [];
+  return index.documents
+    .map((document) => scoreDocument(document, cleanQuery, queryTerms))
+    .filter((result): result is KnowledgeSearchResult => result !== null)
+    .sort((left, right) => right.score - left.score || left.path.localeCompare(right.path))
+    .slice(0, topK);
 }
 
 function positiveInteger(value: number, name: string): number {

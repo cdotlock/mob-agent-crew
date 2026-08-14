@@ -14,7 +14,12 @@ import type {
   FileContents,
   FileListing,
   FileScope,
+  GitHubConnectionStatus,
   KnowledgeEntry,
+  KnowledgeQueryResult,
+  ModelCatalog,
+  ModelCatalogEntry,
+  ModelProtocol,
   NewAgentInput,
   NewConversationInput,
   NewTaskInput,
@@ -170,18 +175,44 @@ function normalizeAgent(value: unknown, index = 0): AgentProfile {
   const driver = isRecord(driverValue)
     ? text(driverValue, ["name", "id"], "Unknown driver")
     : text(source, ["driver", "driverId", "driver_id", "runtime"], "Unknown driver");
+  const fallbackHandle = name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || `agent-${index + 1}`;
+  const environment = object(source.environment);
+  const environmentValues = object(environment.values);
+  const compatibility = object(source.compatibility);
+  const modelId = text(source, ["modelId", "model_id"]) || null;
   return {
     id: text(source, ["id", "agentId", "agent_id"], `agent-${index + 1}`),
+    handle: text(source, ["handle"], fallbackHandle),
     name,
     initials: text(source, ["initials"], initials(name)),
     role: text(source, ["role", "description"], "Crew member"),
     owner: text(source, ["owner", "ownerName", "owner_name"], "Shared crew"),
+    modelId,
+    effectiveModelId: text(source, ["effectiveModelId", "effective_model_id"], modelId ?? "Default model"),
+    skillRefs: stringArray(source.skillRefs ?? source.skill_refs),
+    environment: {
+      reference: text(environment, ["reference"]) || null,
+      values: Object.fromEntries(
+        Object.entries(environmentValues).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
+      ),
+    },
+    compatibility: {
+      compatible: typeof compatibility.compatible === "boolean" ? compatibility.compatible : null,
+      status: text(compatibility, ["status"], modelId ? "unknown-model-protocol" : "uses-default"),
+      driverProtocols: normalizeProtocols(compatibility.driverProtocols ?? compatibility.driver_protocols),
+      modelProtocols: normalizeProtocols(compatibility.modelProtocols ?? compatibility.model_protocols),
+    },
     driver,
     status: enumValue<AgentStatus>(source.status, agentStatuses, "available"),
     capabilities: normalizeCapabilities(source.capabilities),
     currentTaskId: text(source, ["currentTaskId", "current_task_id"]) || null,
     color: text(source, ["color", "accent"], palette[index % palette.length] ?? "#9d8cff"),
   };
+}
+
+function normalizeProtocols(value: unknown): ModelProtocol[] {
+  const supported = new Set<ModelProtocol>(["openai-chat", "openai-responses", "anthropic-messages"]);
+  return array(value).filter((entry): entry is ModelProtocol => typeof entry === "string" && supported.has(entry as ModelProtocol));
 }
 
 function normalizeConversationMember(value: unknown, index = 0): ConversationMember {
@@ -388,11 +419,18 @@ export async function postConversationMessage(
   };
 }
 
-export async function createAgent(input: NewAgentInput): Promise<void> {
-  await request("/api/agents", {
+export async function createAgent(input: NewAgentInput): Promise<AgentProfile> {
+  return normalizeAgent(await request("/api/agents", {
     method: "POST",
     body: JSON.stringify(input),
-  });
+  }));
+}
+
+export async function updateAgent(agentId: string, input: Omit<NewAgentInput, "handle">): Promise<AgentProfile> {
+  return normalizeAgent(await request(`/api/agents/${encodeURIComponent(agentId)}`, {
+    method: "PATCH",
+    body: JSON.stringify(input),
+  }));
 }
 
 export async function createSession(email: string, password: string): Promise<void> {
@@ -488,6 +526,104 @@ export async function fetchKnowledgeFile(path: string): Promise<FileContents> {
     language: "markdown",
     content,
     truncated: false,
+  };
+}
+
+export async function queryKnowledge(question: string): Promise<KnowledgeQueryResult> {
+  const query = new URLSearchParams({ q: question });
+  const value = object(await request(`/api/knowledge/query?${query.toString()}`));
+  return {
+    question: text(value, ["question"], question),
+    answerContext: text(value, ["answerContext", "answer_context"]),
+    citations: array(value.citations).map((item) => {
+      const citation = object(item);
+      return {
+        path: text(citation, ["path"]),
+        area: text(citation, ["area"]) === "raw" ? "raw" as const : "wiki" as const,
+        title: text(citation, ["title", "path"]),
+        revision: text(citation, ["revision"]),
+        excerpt: text(citation, ["excerpt"]),
+        reason: text(citation, ["reason"]),
+        score: number(citation, ["score"]),
+      };
+    }),
+    indexRevision: text(value, ["indexRevision", "index_revision"]),
+    manifestPath: text(value, ["manifestPath", "manifest_path"]),
+  };
+}
+
+export async function writeKnowledge(
+  area: "raw" | "wiki",
+  path: string,
+  content: string,
+): Promise<FileContents> {
+  const value = object(await request(`/api/knowledge/${area}`, {
+    method: "POST",
+    body: JSON.stringify({ path, content, source: "web:wiki-workspace" }),
+  }));
+  const normalizedContent = text(value, ["content"], content);
+  const normalizedPath = text(value, ["path"], `${area}/${path}`);
+  return {
+    scope: "workspace",
+    path: normalizedPath,
+    name: normalizedPath.split("/").at(-1) ?? normalizedPath,
+    bytes: number(value, ["bytes"], new TextEncoder().encode(normalizedContent).length),
+    language: "markdown",
+    content: normalizedContent,
+    truncated: false,
+  };
+}
+
+export async function rebuildKnowledge(): Promise<{ revision: string; documents: number; path: string }> {
+  const value = object(await request("/api/knowledge/rebuild", { method: "POST" }));
+  return {
+    revision: text(value, ["revision"]),
+    documents: number(value, ["documents"]),
+    path: text(value, ["path"]),
+  };
+}
+
+function normalizeModel(value: unknown): ModelCatalogEntry {
+  const item = object(value);
+  const capabilities = object(item.capabilities);
+  return {
+    id: text(item, ["id", "model"]),
+    name: text(item, ["name", "displayName", "display_name", "id"]),
+    provider: text(item, ["provider", "owned_by", "ownedBy"]) || null,
+    protocols: normalizeProtocols(item.protocols),
+    contextWindow: number(item, ["contextWindow", "context_window"]) || null,
+    capabilities: {
+      ...(typeof capabilities.tools === "boolean" ? { tools: capabilities.tools } : {}),
+      ...(typeof capabilities.vision === "boolean" ? { vision: capabilities.vision } : {}),
+      ...(typeof capabilities.reasoning === "boolean" ? { reasoning: capabilities.reasoning } : {}),
+    },
+  };
+}
+
+export async function fetchModelCatalog(refresh = false): Promise<ModelCatalog> {
+  const value = object(await request(`/api/models${refresh ? "?refresh=true" : ""}`));
+  return {
+    version: 1,
+    source: enumValue<ModelCatalog["source"]>(value.source, ["configured", "remote", "merged", "fallback"], "fallback"),
+    fetchedAt: text(value, ["fetchedAt", "fetched_at"], new Date().toISOString()),
+    expiresAt: text(value, ["expiresAt", "expires_at"], new Date().toISOString()),
+    stale: value.stale === true,
+    models: array(value.models).map(normalizeModel).filter((model) => model.id),
+    warnings: stringArray(value.warnings),
+  };
+}
+
+export async function fetchGitHubConnectionStatus(): Promise<GitHubConnectionStatus> {
+  const value = object(await request("/api/integrations/github/status"));
+  const setup = object(value.setup);
+  return {
+    configured: value.configured === true,
+    variable: "GH_TOKEN",
+    setup: {
+      railway: text(setup, ["railway"], "railway variable set GH_TOKEN --stdin --skip-deploys"),
+      verify: text(setup, ["verify"], "gh auth status --hostname github.com"),
+      note: text(setup, ["note"], "Configure a repository-scoped token outside chat."),
+    },
   };
 }
 

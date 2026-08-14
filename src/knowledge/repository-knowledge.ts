@@ -7,6 +7,7 @@ import type { WorkspaceKnowledge } from "./workspace-knowledge.js";
 const MAX_FILES = 200;
 const MAX_FILE_BYTES = 256 * 1024;
 const MAX_TOTAL_BYTES = 2 * 1024 * 1024;
+const WRITE_CONCURRENCY = 8;
 const ROOT_DOCUMENT = /^(?:README(?:\.[^.]+)?|AGENTS|CONTRIBUTING|CHANGELOG|SECURITY)\.md$/iu;
 const DOCUMENT_DIRECTORIES = new Set(["docs", "doc", "wiki"]);
 
@@ -49,9 +50,7 @@ export async function syncRepositoryKnowledge(
   const documents = await readRepositoryDocuments(input.checkoutDirectory);
   const revision = requireRevision(input.revision);
   const snapshot = snapshotId(revision, documents);
-  const rawPaths: string[] = [];
-
-  for (const document of documents) {
+  const rawPaths = await mapConcurrent(documents, WRITE_CONCURRENCY, async (document) => {
     const rawPath = `repositories/${repository}/${snapshot}/${document.path}`;
     const written = await input.knowledge.writeRaw({
       path: rawPath,
@@ -65,8 +64,8 @@ export async function syncRepositoryKnowledge(
         digest: document.digest,
       },
     });
-    rawPaths.push(written.path);
-  }
+    return written.path;
+  });
 
   const wikiPath = `repositories/${repository}/index.md`;
   await input.knowledge.writeWiki({
@@ -217,4 +216,23 @@ function portablePath(path: string): string {
 
 function sha256(value: string): string {
   return createHash("sha256").update(value).digest("hex");
+}
+
+async function mapConcurrent<Input, Output>(
+  input: readonly Input[],
+  concurrency: number,
+  map: (value: Input) => Promise<Output>,
+): Promise<Output[]> {
+  const output = new Array<Output>(input.length);
+  let cursor = 0;
+  const workers = Array.from({ length: Math.min(concurrency, input.length) }, async () => {
+    for (;;) {
+      const index = cursor;
+      cursor += 1;
+      if (index >= input.length) return;
+      output[index] = await map(input[index] as Input);
+    }
+  });
+  await Promise.all(workers);
+  return output;
 }

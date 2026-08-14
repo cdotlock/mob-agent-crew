@@ -4,10 +4,15 @@ This is the operational entrypoint for an LLM, local coding Agent, or person
 controlling a Mob environment from another computer. Read this document before
 issuing commands.
 
+Every deployed Mob web app also publishes a short, unauthenticated discovery
+file at `/llms.txt`. Give `https://your-mob.example/llms.txt` to an external LLM
+first; it points here for the complete authenticated control contract.
+
 ## Mental model and hard boundaries
 
 Mob is a thin shared environment: **Actors + Files + Commands + Events**. It
-does not implement a harness, model, skill system, plugin system, or private
+stores only the selected harness ID, model ID, skill references and environment
+reference for each Agent; it does not implement those systems or copy private
 memory. Pi, Oh My Pi, Claude Code, Codex and Hermes are peer CLI connectors
 behind the same `AgentDriver` contract. Hermes is not a planner and receives no
 orchestration privilege.
@@ -92,8 +97,13 @@ Discover stable IDs first; do not guess them:
 mob task list
 mob task show <task-id>
 mob agent list
+mob model list
 mob conversation list
 ```
+
+`mob model list` reads the server-side model catalog. It returns public model
+metadata and protocol compatibility only; Router credentials remain inside the
+control plane.
 
 The task chat is the backward-compatible primary group conversation:
 
@@ -102,8 +112,11 @@ mob chat send <task-id> "Here is context only; do not start work yet."
 mob agent invoke <task-id> @builder "Inspect the failure and implement the smallest safe fix."
 ```
 
-`agent invoke` posts an explicit `@mention` to the primary task chat and returns
-the queued run. Save the returned run ID and observe normalized events:
+`agent invoke` selects the Agent explicitly, posts the instruction to the
+primary task chat, and returns the queued run. If that task was completed or
+cancelled, the command first records a human `request_changes` decision and
+retries the invocation once. Save the returned run ID and observe normalized
+events:
 
 ```bash
 mob run status <run-id>
@@ -158,17 +171,52 @@ place the token in a URL. Ordinary messages should omit `invoke` or set it to
 ## Add and define an Agent
 
 An Agent identity is a stable Actor plus a small connector profile. The
-harness, model, skills, plugins and private memory remain owned by the selected
-CLI; Mob does not copy or reinterpret them.
+harness, model, skills, plugins and private memory remain implemented by the
+selected CLI or runtime; Mob only stores and passes their identifiers.
 
 ```bash
 mob agent add \
   --handle reviewer-two \
   --name "Reviewer Two" \
   --driver hermes \
-  --role "Independent implementation reviewer"
+  --role "Independent implementation reviewer" \
+  --model deepseek-v4-pro \
+  --skill review:typescript \
+  --skill workflow:focused-tests \
+  --environment railway:engineering
 mob agent list
 ```
+
+`mob agent list` reads the canonical `GET /api/agents` composition view. Change
+an existing identity by UUID or stable handle:
+
+```bash
+mob agent configure @reviewer-two \
+  --driver codex \
+  --model gpt-5.6-sol \
+  --skill review:typescript \
+  --skill workflow:focused-tests \
+  --environment railway:engineering
+```
+
+`configure` first reads the current Agent and preserves every field not named
+on the command. Repeated `--skill` flags replace the complete skill list. Use
+the explicit reset flags when that is the intended change:
+
+```bash
+mob agent configure <agent-uuid> --default-model
+mob agent configure @reviewer-two --clear-skills --clear-environment
+```
+
+`--model` conflicts with `--default-model`; `--skill` conflicts with
+`--clear-skills`; and `--environment` conflicts with `--clear-environment`.
+The environment option accepts only a secret-free reference such as
+`railway:engineering`; selecting a new reference also removes any old inline
+safe values. The reference is a label passed into the run context, not a secret
+resolver. There is deliberately no CLI flag for environment values, provider
+keys, GitHub tokens, passwords, or other secrets. Non-secret values can be set
+from the browser's Advanced section; control-plane credentials remain outside
+the Agent environment.
 
 Valid driver IDs are `pi`, `omp`, `claude`, `codex`, `hermes`, and `deepseek`.
 The standard
@@ -237,10 +285,27 @@ mob knowledge list --area raw
 mob knowledge list --area wiki
 mob knowledge search "authentication boundary"
 mob knowledge retrieve "current repository architecture"
+mob wiki ask "What controls the writable workspace lease?"
 mob knowledge read wiki/repositories/<repo>/index.md
 mob knowledge add-raw imports/design-brief.md ./design-brief.md
 mob knowledge curate decisions/agent-boundary.md ./agent-boundary.md
+mob wiki import-dir ./docs --area raw
+mob wiki import-dir ./curated-wiki --area wiki
 mob knowledge lint
+```
+
+`wiki ask` returns a bounded, citation-labelled context assembled from the
+workspace files; it does not hide a second model call. `wiki import-dir`
+recursively uploads visible `.md` and `.markdown` files in deterministic order,
+preserves their relative paths, and never follows hidden entries or symbolic
+links. `raw` is immutable source material; `wiki` is curated and replaceable.
+If an upload fails, the CLI stops and names the exact file and completed prefix.
+
+Equivalent knowledge discovery operations are:
+
+```text
+GET /api/knowledge/query?q=<natural-language-question>&top=6&budget=12000
+GET /api/knowledge/file?path=wiki/<cited-path>
 ```
 
 The web file browser is backed by a read-only, path-contained API. All listings
@@ -279,8 +344,22 @@ and verify without printing the credential:
 gh auth status --hostname github.com
 ```
 
-At container start the token is copied into a root-only runtime file and removed
-from the service environment. Server-side materialization and human-approved
+A signed-in human can check setup without exposing the credential:
+
+```text
+GET /api/integrations/github/status
+```
+
+The response contains only `configured`, the variable name, and safe setup and
+verification commands. It never reads or returns the token file. For a CLI
+setup, pass the token on standard input:
+
+```bash
+railway variable set GH_TOKEN --stdin --skip-deploys
+```
+
+At standard container start the token is copied into a root-only runtime file
+and removed from the service environment. Server-side materialization and human-approved
 publication use it only with a root-owned control repository. Agent-owned Git
 metadata is never reused by the control plane. The token is not embedded in the
 remote URL or arguments, and CLI Agent processes run under a different OS UID.

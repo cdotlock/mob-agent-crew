@@ -1,4 +1,5 @@
-import { lstat, open, readdir, realpath, stat } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
+import { lstat, open, readdir, realpath } from "node:fs/promises";
 import { basename, extname, relative, resolve, sep } from "node:path";
 
 export type WorkspaceFileScope = "workspace" | "repository";
@@ -31,7 +32,18 @@ export interface WorkspaceFileBrowserOptions {
   readonly dataDir: string;
   readonly maxReadBytes?: number;
   readonly maxEntries?: number;
+  /** Directory listings are cached briefly; reads always revalidate the path. */
+  readonly listingCacheMs?: number;
 }
+
+interface CachedListing {
+  readonly cachedAt: number;
+  readonly value: WorkspaceFileListing;
+}
+
+const DEFAULT_LISTING_CACHE_MS = 750;
+const sharedListingCache = new Map<string, CachedListing>();
+const sharedListingLoads = new Map<string, Promise<WorkspaceFileListing>>();
 
 const privateRepositoryNames = new Set([
   ".aws",
@@ -61,11 +73,24 @@ export class WorkspaceFileBrowser {
   readonly #dataDir: string;
   readonly #maxReadBytes: number;
   readonly #maxEntries: number;
+  readonly #listingCacheMs: number;
 
   constructor(options: WorkspaceFileBrowserOptions) {
     this.#dataDir = resolve(options.dataDir);
     this.#maxReadBytes = options.maxReadBytes ?? 512 * 1024;
     this.#maxEntries = options.maxEntries ?? 500;
+    this.#listingCacheMs = options.listingCacheMs ?? DEFAULT_LISTING_CACHE_MS;
+    if (!Number.isSafeInteger(this.#listingCacheMs) || this.#listingCacheMs < 0) {
+      throw new Error("listingCacheMs must be a non-negative integer");
+    }
+  }
+
+  /** Forces the next listing to observe direct filesystem changes. */
+  invalidate(): void {
+    const marker = `\0${this.#dataDir}${sep}`;
+    for (const key of sharedListingCache.keys()) {
+      if (key.includes(marker)) sharedListingCache.delete(key);
+    }
   }
 
   async list(input: {
@@ -76,31 +101,60 @@ export class WorkspaceFileBrowser {
   }): Promise<WorkspaceFileListing> {
     const root = this.#root(input.scope, input.workspaceId, input.taskId);
     const relativePath = safeRelativePath(input.path ?? "");
+    const cacheKey = `${input.scope}\0${root}\0${relativePath}\0${this.#maxEntries}`;
+    const cached = sharedListingCache.get(cacheKey);
+    if (this.#listingCacheMs > 0 && cached && Date.now() - cached.cachedAt < this.#listingCacheMs) {
+      return cached.value;
+    }
+    const pending = sharedListingLoads.get(cacheKey);
+    if (pending) return pending;
+    const loading = this.#listUncached(input.scope, root, relativePath);
+    sharedListingLoads.set(cacheKey, loading);
+    try {
+      const listing = await loading;
+      if (this.#listingCacheMs > 0) {
+        sharedListingCache.set(cacheKey, { cachedAt: Date.now(), value: listing });
+      }
+      return listing;
+    } finally {
+      if (sharedListingLoads.get(cacheKey) === loading) sharedListingLoads.delete(cacheKey);
+    }
+  }
+
+  async #listUncached(
+    scope: WorkspaceFileScope,
+    root: string,
+    relativePath: string,
+  ): Promise<WorkspaceFileListing> {
+    await rejectSymlinkPath(root, relativePath);
     const directory = await safeExistingPath(root, relativePath);
     const info = await lstat(directory);
     if (!info.isDirectory() || info.isSymbolicLink()) throw new Error("File browser path is not a directory");
 
-    const names = await readdir(directory);
-    const entries: WorkspaceFileEntry[] = [];
-    for (const name of names.sort((left, right) => left.localeCompare(right))) {
-      if (input.scope === "repository" && isPrivateRepositoryEntry(relativePath, name)) continue;
-      const absolutePath = resolve(directory, name);
-      const entryInfo = await lstat(absolutePath);
-      if (entryInfo.isSymbolicLink() || (!entryInfo.isDirectory() && !entryInfo.isFile())) continue;
-      entries.push({
-        name,
-        path: joinRelative(relativePath, name),
+    const candidates = (await readdir(directory, { withFileTypes: true }))
+      .sort((left, right) => left.name.localeCompare(right.name))
+      .filter((entry) =>
+        !entry.isSymbolicLink() &&
+        (entry.isDirectory() || entry.isFile()) &&
+        (scope !== "repository" || !isPrivateRepositoryEntry(relativePath, entry.name)),
+      )
+      .slice(0, this.#maxEntries);
+    const entries = (await Promise.all(candidates.map(async (entry): Promise<WorkspaceFileEntry | null> => {
+      const entryInfo = await lstat(resolve(directory, entry.name));
+      if (entryInfo.isSymbolicLink() || (!entryInfo.isDirectory() && !entryInfo.isFile())) return null;
+      return {
+        name: entry.name,
+        path: joinRelative(relativePath, entry.name),
         kind: entryInfo.isDirectory() ? "directory" : "file",
         bytes: entryInfo.isFile() ? entryInfo.size : null,
         updatedAt: entryInfo.mtime.toISOString(),
-      });
-      if (entries.length >= this.#maxEntries) break;
-    }
+      };
+    }))).filter((entry): entry is WorkspaceFileEntry => entry !== null);
     entries.sort((left, right) => {
       if (left.kind !== right.kind) return left.kind === "directory" ? -1 : 1;
       return left.name.localeCompare(right.name);
     });
-    return { scope: input.scope, path: relativePath, entries };
+    return { scope, path: relativePath, entries };
   }
 
   async read(input: {
@@ -117,28 +171,28 @@ export class WorkspaceFileBrowser {
     }
     await rejectSymlinkPath(root, relativePath);
     const absolutePath = await safeExistingPath(root, relativePath);
-    const info = await stat(absolutePath);
-    if (!info.isFile()) throw new Error("File browser path is not a file");
-    const bytesToRead = Math.min(info.size, this.#maxReadBytes);
-    const handle = await open(absolutePath, "r");
-    const slice = Buffer.alloc(bytesToRead);
+    const handle = await open(absolutePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
     try {
+      const info = await handle.stat();
+      if (!info.isFile()) throw new Error("File browser path is not a file");
+      const bytesToRead = Math.min(info.size, this.#maxReadBytes);
+      const slice = Buffer.alloc(bytesToRead);
       await handle.read(slice, 0, bytesToRead, 0);
+      if (slice.includes(0) || !isUtf8(slice)) {
+        throw new Error("Binary or non-UTF-8 files are not rendered in the browser");
+      }
+      return {
+        scope: input.scope,
+        path: relativePath,
+        name: basename(relativePath),
+        bytes: info.size,
+        language: languageFor(relativePath),
+        content: slice.toString("utf8"),
+        truncated: info.size > bytesToRead,
+      };
     } finally {
       await handle.close();
     }
-    if (slice.includes(0) || !isUtf8(slice)) {
-      throw new Error("Binary or non-UTF-8 files are not rendered in the browser");
-    }
-    return {
-      scope: input.scope,
-      path: relativePath,
-      name: basename(relativePath),
-      bytes: info.size,
-      language: languageFor(relativePath),
-      content: slice.toString("utf8"),
-      truncated: info.size > bytesToRead,
-    };
   }
 
   #root(scope: WorkspaceFileScope, workspaceId: string, taskId?: string): string {
@@ -198,12 +252,14 @@ function isPrivateRepositoryPath(path: string): boolean {
 }
 
 async function rejectSymlinkPath(root: string, relativePath: string): Promise<void> {
-  let cursor = resolve(root);
-  if ((await lstat(cursor)).isSymbolicLink()) throw new Error("Symbolic links are not rendered");
-  for (const segment of relativePath.split("/")) {
+  const paths = [resolve(root)];
+  let cursor = paths[0] ?? resolve(root);
+  for (const segment of relativePath ? relativePath.split("/") : []) {
     cursor = resolve(cursor, segment);
-    if ((await lstat(cursor)).isSymbolicLink()) throw new Error("Symbolic links are not rendered");
+    paths.push(cursor);
   }
+  const information = await Promise.all(paths.map((path) => lstat(path)));
+  if (information.some((info) => info.isSymbolicLink())) throw new Error("Symbolic links are not rendered");
 }
 
 function isUtf8(value: Buffer): boolean {

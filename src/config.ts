@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { loadEnvFile } from "node:process";
 import { z } from "zod";
+import { isGitHubCliConfigured } from "./integrations/index.js";
 
 const envFile = resolve(process.cwd(), ".env");
 if (existsSync(envFile)) {
@@ -37,6 +38,9 @@ const environmentSchema = z.object({
   MOB_AI_MODEL: z.string().min(1).default("deepseek-v4-pro"),
   MOB_AI_CLAUDE_MODEL: z.string().min(1).default("claude-opus-4-6:free"),
   MOB_AI_CODEX_MODEL: z.string().min(1).default("gpt-5.6-sol"),
+  MOB_AI_MODEL_CATALOG_JSON: z.string().min(2).optional(),
+  MOB_AI_MODEL_CATALOG_URL: z.string().url().optional(),
+  MOB_AI_MODEL_CATALOG_TTL_SECONDS: z.coerce.number().int().min(5).max(86_400).default(300),
   MOB_RELEASE_REVISION: z.string().min(1).max(128).optional(),
   RAILWAY_GIT_COMMIT_SHA: z.string().min(1).max(128).optional(),
   RAILWAY_DEPLOYMENT_ID: z.string().min(1).max(128).optional(),
@@ -62,6 +66,10 @@ export type AppConfig = {
   mobAiModel: string;
   mobAiClaudeModel?: string;
   mobAiCodexModel?: string;
+  mobAiModelCatalogJson?: string;
+  mobAiModelCatalogUrl?: string;
+  mobAiModelCatalogTtlMs?: number;
+  githubCliConfigured?: boolean;
   releaseRevision?: string;
   deploymentId?: string;
 };
@@ -98,6 +106,13 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
     mobAiModel: parsed.MOB_AI_MODEL,
     mobAiClaudeModel: parsed.MOB_AI_CLAUDE_MODEL,
     mobAiCodexModel: parsed.MOB_AI_CODEX_MODEL,
+    ...(parsed.MOB_AI_MODEL_CATALOG_JSON
+      ? { mobAiModelCatalogJson: parsed.MOB_AI_MODEL_CATALOG_JSON }
+      : {}),
+    mobAiModelCatalogUrl: parsed.MOB_AI_MODEL_CATALOG_URL
+      ?? `${parsed.MOB_AI_BASE_URL.replace(/\/+$/u, "")}/v1/models`,
+    mobAiModelCatalogTtlMs: parsed.MOB_AI_MODEL_CATALOG_TTL_SECONDS * 1_000,
+    githubCliConfigured: isGitHubCliConfigured(environment),
     ...(releaseRevision ? { releaseRevision } : {}),
     ...(parsed.RAILWAY_DEPLOYMENT_ID ? { deploymentId: parsed.RAILWAY_DEPLOYMENT_ID } : {}),
   };

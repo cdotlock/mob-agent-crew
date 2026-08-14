@@ -519,6 +519,26 @@ CREATE TRIGGER run_join_primary_conversation
   AFTER INSERT ON runs FOR EACH ROW EXECUTE FUNCTION mob_join_primary_run_actors();
 `,
   },
+  {
+    version: 3,
+    name: "agent_composition_metadata",
+    sql: String.raw`
+ALTER TABLE agent_profiles
+  ADD COLUMN model_id text,
+  ADD COLUMN skill_refs jsonb NOT NULL DEFAULT '[]'::jsonb,
+  ADD COLUMN environment jsonb NOT NULL DEFAULT '{"reference":null,"values":{}}'::jsonb;
+
+ALTER TABLE agent_profiles
+  ADD CONSTRAINT agent_profiles_model_id_shape CHECK (
+    model_id IS NULL OR (
+      length(model_id) BETWEEN 1 AND 128
+      AND model_id ~ '^[A-Za-z0-9][A-Za-z0-9._:/+-]*$'
+    )
+  ),
+  ADD CONSTRAINT agent_profiles_skill_refs_array CHECK (jsonb_typeof(skill_refs) = 'array'),
+  ADD CONSTRAINT agent_profiles_environment_object CHECK (jsonb_typeof(environment) = 'object');
+`,
+  },
 ] as const;
 
 export type MigrationClient = Pick<postgres.Sql, "unsafe" | "begin">;

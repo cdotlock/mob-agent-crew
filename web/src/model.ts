@@ -25,6 +25,8 @@ export type ActorKind = "human" | "agent" | "system";
 
 export type ConversationKind = "direct" | "group";
 
+export type ModelProtocol = "openai-chat" | "openai-responses" | "anthropic-messages";
+
 export type ArtifactKind = "patch" | "diff" | "report" | "plan" | "log" | "file";
 
 export interface CurrentUser {
@@ -41,10 +43,24 @@ export interface WorkspaceInfo {
 
 export interface AgentProfile {
   id: string;
+  handle: string;
   name: string;
   initials: string;
   role: string;
   owner: string;
+  modelId: string | null;
+  effectiveModelId: string;
+  skillRefs: string[];
+  environment: {
+    reference: string | null;
+    values: Record<string, string>;
+  };
+  compatibility: {
+    compatible: boolean | null;
+    status: string;
+    driverProtocols: ModelProtocol[];
+    modelProtocols: ModelProtocol[];
+  };
   driver: string;
   status: AgentStatus;
   capabilities: string[];
@@ -156,6 +172,47 @@ export interface KnowledgeEntry {
   updatedAt: string;
 }
 
+export interface KnowledgeCitation {
+  path: string;
+  area: "raw" | "wiki";
+  title: string;
+  revision: string;
+  excerpt: string;
+  reason: string;
+  score: number;
+}
+
+export interface KnowledgeQueryResult {
+  question: string;
+  answerContext: string;
+  citations: KnowledgeCitation[];
+  indexRevision: string;
+  manifestPath: string;
+}
+
+export interface ModelCatalogEntry {
+  id: string;
+  name: string;
+  provider: string | null;
+  protocols: ModelProtocol[];
+  contextWindow: number | null;
+  capabilities: {
+    tools?: boolean;
+    vision?: boolean;
+    reasoning?: boolean;
+  };
+}
+
+export interface ModelCatalog {
+  version: 1;
+  source: "configured" | "remote" | "merged" | "fallback";
+  fetchedAt: string;
+  expiresAt: string;
+  stale: boolean;
+  models: ModelCatalogEntry[];
+  warnings: string[];
+}
+
 export interface Artifact {
   id: string;
   name: string;
@@ -213,6 +270,22 @@ export interface NewAgentInput {
   name: string;
   driver: "pi" | "omp" | "claude" | "codex" | "hermes" | "deepseek";
   role: string;
+  modelId?: string | null;
+  skillRefs?: string[];
+  environment?: {
+    reference?: string | null;
+    values?: Record<string, string>;
+  } | null;
+}
+
+export interface GitHubConnectionStatus {
+  configured: boolean;
+  variable: "GH_TOKEN";
+  setup: {
+    railway: string;
+    verify: string;
+    note: string;
+  };
 }
 
 export interface ImportedContext {

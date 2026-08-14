@@ -18,6 +18,7 @@ import type {
   Workspace,
   WorkspaceDocument,
 } from "../domain/model.js";
+import { normalizeAgentComposition } from "../domain/agent-composition.js";
 
 export type DbRow = Record<string, unknown>;
 
@@ -110,6 +111,11 @@ export function mapUserAuthRecord(row: DbRow): UserAuthRecord {
 }
 
 export function mapAgentProfile(row: DbRow): AgentProfile {
+  const composition = normalizeAgentComposition({
+    modelId: nullableString(row, "model_id"),
+    skillRefs: arrayValue(row, "skill_refs"),
+    environment: objectValue(row, "environment"),
+  });
   return {
     actorId: stringValue(row, "actor_id"),
     workspaceId: stringValue(row, "workspace_id"),
@@ -117,11 +123,19 @@ export function mapAgentProfile(row: DbRow): AgentProfile {
     driver: stringValue(row, "driver"),
     home: stringValue(row, "home"),
     role: stringValue(row, "role"),
+    ...composition,
     capabilities: objectValue(row, "capabilities") as unknown as DriverCapabilities,
     maxConcurrentRuns: numberValue(row, "max_concurrent_runs"),
     createdAt: dateValue(row, "created_at"),
     updatedAt: dateValue(row, "updated_at"),
   };
+}
+
+function arrayValue(row: DbRow, key: string): string[] {
+  const current = value(row, key);
+  if (current === null || current === undefined) return [];
+  const parsed = typeof current === "string" ? JSON.parse(current) as unknown : current;
+  return Array.isArray(parsed) ? parsed.map(String) : [];
 }
 
 export function mapWorkspaceDocument(row: DbRow): WorkspaceDocument {

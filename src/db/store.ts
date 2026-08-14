@@ -12,6 +12,7 @@ import {
   normalizeGitHubRepositoryUrl,
   normalizeHandle,
 } from "../domain/rules.js";
+import { normalizeAgentComposition } from "../domain/agent-composition.js";
 import type {
   Actor,
   ActorId,
@@ -198,6 +199,21 @@ export interface CreateAgentProfileInput {
   role?: string;
   capabilities?: DriverCapabilities;
   maxConcurrentRuns?: number;
+  modelId?: string | null;
+  skillRefs?: readonly string[];
+  environment?: AgentProfile["environment"] | null;
+}
+
+export interface UpdateAgentDefinitionInput {
+  workspaceId: string;
+  actorId: string;
+  displayName: string;
+  driver: string;
+  role: string;
+  capabilities: DriverCapabilities;
+  modelId?: string | null;
+  skillRefs?: readonly string[];
+  environment?: AgentProfile["environment"] | null;
 }
 
 export interface CreateWorkspaceDocumentInput {
@@ -422,13 +438,17 @@ export class CollaborationStore {
 
   async createAgentProfile(input: CreateAgentProfileInput): Promise<AgentProfile> {
     const capabilities = input.capabilities ?? DEFAULT_DRIVER_CAPABILITIES;
+    const composition = normalizeAgentComposition(input);
     const rows = await this.sql<DbRow[]>`
       INSERT INTO agent_profiles (
         actor_id, workspace_id, owner_actor_id, driver, home, role,
-        capabilities, max_concurrent_runs
+        model_id, skill_refs, environment, capabilities, max_concurrent_runs
       ) VALUES (
         ${input.actorId}, ${input.workspaceId}, ${input.ownerActorId}, ${input.driver.trim()},
-        ${input.home.trim()}, ${input.role?.trim() ?? ''}, ${JSON.stringify(capabilities)}::jsonb,
+        ${input.home.trim()}, ${input.role?.trim() ?? ''}, ${composition.modelId},
+        ${JSON.stringify(composition.skillRefs)}::jsonb,
+        ${JSON.stringify(composition.environment)}::jsonb,
+        ${JSON.stringify(capabilities)}::jsonb,
         ${input.maxConcurrentRuns ?? 1}
       )
       RETURNING *
@@ -441,6 +461,39 @@ export class CollaborationStore {
       SELECT * FROM agent_profiles WHERE workspace_id = ${workspaceId} ORDER BY actor_id
     `;
     return rows.map(mapAgentProfile);
+  }
+
+  async updateAgentDefinition(input: UpdateAgentDefinitionInput): Promise<{ actor: Actor; profile: AgentProfile }> {
+    const composition = normalizeAgentComposition(input);
+    const displayName = input.displayName.trim();
+    const role = input.role.trim();
+    const driver = input.driver.trim();
+    if (!displayName || !driver) throw new StoreError("invalid_agent_definition", "Agent name and harness are required.");
+    return this.sql.begin(async (tx) => {
+      const actorRows = await tx<DbRow[]>`
+        UPDATE actors
+        SET display_name = ${displayName}, updated_at = now()
+        WHERE id = ${input.actorId}
+          AND workspace_id = ${input.workspaceId}
+          AND kind = 'agent'
+        RETURNING *
+      `;
+      const actor = actorRows[0];
+      if (!actor) throw new StoreError("agent_not_found", "Agent was not found.");
+      const profileRows = await tx<DbRow[]>`
+        UPDATE agent_profiles
+        SET driver = ${driver}, role = ${role}, model_id = ${composition.modelId},
+            skill_refs = ${JSON.stringify(composition.skillRefs)}::jsonb,
+            environment = ${JSON.stringify(composition.environment)}::jsonb,
+            capabilities = ${JSON.stringify(input.capabilities)}::jsonb,
+            updated_at = now()
+        WHERE actor_id = ${input.actorId} AND workspace_id = ${input.workspaceId}
+        RETURNING *
+      `;
+      const profile = profileRows[0];
+      if (!profile) throw new StoreError("agent_profile_not_found", "Agent profile was not found.");
+      return { actor: mapActor(actor), profile: mapAgentProfile(profile) };
+    });
   }
 
   async createWorkspaceDocument(input: CreateWorkspaceDocumentInput): Promise<WorkspaceDocument> {
@@ -1036,7 +1089,14 @@ export class CollaborationStore {
           WHERE conversation_id = ${conversation.id} AND actor_id = ${invokedAgent.id}
         `;
         if (invokedMembershipRows.length === 0) {
-          throw new StoreError("conversation_member_required", "Invoked Agent is not a member of this conversation.");
+          if (!conversation.isPrimary) {
+            throw new StoreError("conversation_member_required", "Invoked Agent is not a member of this conversation.");
+          }
+          await tx`
+            INSERT INTO conversation_memberships (workspace_id, conversation_id, actor_id)
+            VALUES (${task.workspaceId}, ${conversation.id}, ${invokedAgent.id})
+            ON CONFLICT DO NOTHING
+          `;
         }
       }
       const agentActors = invokedAgent
@@ -1547,7 +1607,7 @@ export class CollaborationStore {
         throw new StoreError("task_busy", "Finish or cancel active Agent runs before reviewing this task.");
       }
       const allowed = input.decision === "request_changes"
-        ? ["review_ready", "completed"]
+        ? ["review_ready", "completed", "cancelled"]
         : ["review_ready"];
       if (!allowed.includes(task.status)) {
         throw new StoreError("review_not_ready", "This task is not ready for a human review decision.");

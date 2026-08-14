@@ -1,0 +1,68 @@
+# Mob Agent Crew — LLM control entrypoint
+
+Mob Agent Crew is a file-native collaboration environment for humans and CLI
+Agents. The browser, the external `mob` CLI, and an Agent running on another
+computer all operate on the same conversations, runs, files, and Wiki.
+
+Canonical control guide:
+https://github.com/cdotlock/mob-agent-crew/blob/main/docs/llm-control.md
+
+Install the external CLI (Node.js 22+, Git, and Corepack are required):
+
+    git clone https://github.com/cdotlock/mob-agent-crew.git
+    cd mob-agent-crew
+    sh scripts/install-cli.sh
+
+Connect without putting a password in shell history:
+
+    printf '%s' "$MOB_PASSWORD" | mob login \
+      --server https://web-production-9e8cff.up.railway.app \
+      --email you@example.com \
+      --password-stdin
+
+Discover the environment before acting:
+
+    mob task list
+    mob conversation list
+    mob agent list
+    mob model list
+    mob wiki list --area wiki
+
+Import a local Markdown tree without following hidden paths or symlinks:
+
+    mob wiki import-dir ./docs --area raw
+    mob wiki import-dir ./curated-wiki --area wiki
+
+Run and observe an Agent:
+
+    mob agent invoke <task-id> @builder "inspect the failure and fix it"
+    mob run watch <run-id>
+    mob run steer <run-id> "also run the focused regression test"
+
+Chat and Agent execution are intentionally separate. A normal message does not
+start compute. Use `agent invoke`, `conversation send --invoke`, or the browser's
+explicit Run action when work should begin.
+
+Agent identity is a thin composition:
+
+    identity + harness + model + skill references + environment references
+
+Mob owns collaboration state and access rules. Each installed harness still
+owns its private implementation and memory. Never send provider or GitHub keys
+through chat, Wiki, task files, command arguments, or Agent environment fields.
+
+Wiki is available through the browser's Wiki button and through `mob wiki`.
+Use `mob wiki ask "question"` for a natural-language retrieval with file
+citations; use `mob wiki read <path>` to inspect the cited Markdown source.
+
+GitHub setup status is human-only and secret-free:
+
+    GET /api/integrations/github/status
+
+It returns only whether the server is configured plus safe setup commands; it
+never returns a token. Model discovery is available through `mob model list`
+or `GET /api/models`.
+
+Human-only operations include Agent registration, GitHub setup, review,
+publication, database replay, and server configuration. Agents may propose
+changes and publish artifacts, but may not approve SCM writes.

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { normalizeTaskDetail } from "../../web/src/api.js";
+import { normalizeBootstrap, normalizeTaskDetail } from "../../web/src/api.js";
 import type { TaskSummary } from "../../web/src/model.js";
 
 const fallback: TaskSummary = {
@@ -16,6 +16,25 @@ const fallback: TaskSummary = {
 };
 
 describe("task API normalization", () => {
+  it("preserves the stable Agent handle used by @mentions", () => {
+    const bootstrap = normalizeBootstrap({
+      workspace: { id: "workspace-1", name: "Mob" },
+      currentUser: { id: "human-1", name: "Clock" },
+      agents: [{
+        id: "agent-1",
+        handle: "claude-smoke",
+        name: "Claude Code",
+        driver: "claude",
+      }],
+      tasks: [],
+    });
+
+    expect(bootstrap.agents[0]).toMatchObject({
+      handle: "claude-smoke",
+      name: "Claude Code",
+    });
+  });
+
   it("surfaces active tasks and live run and artifact metadata", () => {
     const detail = normalizeTaskDetail({
       id: "task-1",

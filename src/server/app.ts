@@ -14,8 +14,14 @@ import { StoreError } from "../db/store.js";
 import { hashPassword, verifyPassword } from "../auth/passwords.js";
 import { issueSessionToken, verifyAnyToken, verifyToken, type TokenClaims } from "../auth/tokens.js";
 import { DomainRuleError, extractMentionHandles, normalizeGitHubRepositoryUrl } from "../domain/rules.js";
-import type { Actor, ConversationThread } from "../domain/model.js";
+import {
+  assertAgentModelCompatible,
+  evaluateAgentModelCompatibility,
+  normalizeAgentComposition,
+} from "../domain/agent-composition.js";
+import type { Actor, AgentProfile, ConversationThread, ModelCatalogEntry, ModelProtocol } from "../domain/model.js";
 import { parseMarkdownImport } from "../imports/context-imports.js";
+import { githubConnectionStatus } from "../integrations/index.js";
 import type { MobWorker } from "../worker/worker.js";
 import { writeMobAiProviderConfig } from "../agents/mob-ai-config.js";
 import { redactText, redactValue } from "../security/redaction.js";
@@ -28,6 +34,7 @@ import {
 } from "../storage/index.js";
 import { assertGitHubPublishRemote, publishTaskBranch } from "../workspace/publish.js";
 import { controlRepositoryDirectory } from "../workspace/materialize.js";
+import { ModelCatalogService } from "./model-catalog.js";
 
 const sessionCookie = "mob_session";
 
@@ -155,6 +162,13 @@ export async function ensureBootstrap(
 export async function buildApp(dependencies: AppDependencies): Promise<FastifyInstance> {
   const { config, store, files } = dependencies;
   const app = Fastify({ logger: true, trustProxy: true });
+  const modelCatalog = new ModelCatalogService({
+    ...(config.mobAiModelCatalogJson ? { configuredJson: config.mobAiModelCatalogJson } : {}),
+    ...(config.mobAiModelCatalogUrl ? { endpoint: config.mobAiModelCatalogUrl } : {}),
+    ...(config.mobAiKey ? { authorizationToken: config.mobAiKey } : {}),
+    ...(config.mobAiModelCatalogTtlMs ? { ttlMs: config.mobAiModelCatalogTtlMs } : {}),
+    fallbackModels: configuredModelFallbacks(config),
+  });
   await app.register(cookie);
   await app.register(multipart, { limits: { files: 1, fileSize: 1_000_000 } });
   app.addHook("preSerialization", async (_request, _reply, payload) => jsonSafe(payload));
@@ -247,13 +261,11 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
       store.sql<Array<{ id: string; name: string }>>`SELECT id, name FROM workspaces WHERE id = ${actor.workspaceId}`,
       store.sql<Array<{ id: string; display_name: string }>>`SELECT id, display_name FROM actors WHERE id = ${actor.actorId}`,
       store.listActors(actor.workspaceId),
-      store.sql<Array<{ actor_id: string; driver: string; role: string; capabilities: Record<string, boolean> }>>`
-        SELECT actor_id, driver, role, capabilities FROM agent_profiles WHERE workspace_id = ${actor.workspaceId}
-      `,
+      store.listAgentProfiles(actor.workspaceId),
       store.listTasks(actor.workspaceId),
       store.listRepositories(actor.workspaceId),
     ]);
-    const profileByActor = new Map(profiles.map((profile) => [profile.actor_id, profile]));
+    const profileByActor = new Map(profiles.map((profile) => [profile.actorId, profile]));
     const repositoryById = new Map(repositories.map((repository) => [repository.id, repository]));
     const currentUser = userRows[0];
     return {
@@ -272,7 +284,53 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
         name: item.displayName,
         status: item.status === "active" ? "available" : "offline",
         ...profileByActor.get(item.id),
+        effectiveModelId: effectiveAgentModel(config, profileByActor.get(item.id)),
       })),
+    };
+  });
+
+  app.get<{ Querystring: { refresh?: string } }>("/api/models", async (request) => {
+    requireActor(request);
+    const refresh = z.enum(["true", "false"]).optional().transform((value) => value === "true")
+      .parse(request.query.refresh);
+    return modelCatalog.get({ refresh });
+  });
+
+  app.get("/api/integrations/github/status", async (request) => {
+    requireHuman(request);
+    return githubConnectionStatus(config.githubCliConfigured ?? false);
+  });
+
+  app.get("/api/agents", async (request) => {
+    const current = requireActor(request);
+    const [actors, profiles, catalog] = await Promise.all([
+      store.listActors(current.workspaceId),
+      store.listAgentProfiles(current.workspaceId),
+      modelCatalog.get(),
+    ]);
+    const profileByActor = new Map(profiles.map((profile) => [profile.actorId, profile]));
+    const modelById = new Map(catalog.models.map((model) => [model.id, model]));
+    return {
+      agents: actors.filter((actor) => actor.kind === "agent").map((actor) => {
+        const profile = profileByActor.get(actor.id);
+        if (!profile) return null;
+        const effectiveModelId = effectiveAgentModel(config, profile);
+        return agentApiView(
+          actor,
+          profile,
+          effectiveModelId,
+          evaluateAgentModelCompatibility(
+            profile.driver,
+            modelById.get(effectiveModelId) ?? null,
+            profile.modelId !== null,
+          ),
+        );
+      }).filter((agent): agent is NonNullable<typeof agent> => agent !== null),
+      defaults: {
+        modelId: config.mobAiModel,
+        skills: [],
+        environment: { reference: null, values: {} },
+      },
     };
   });
 
@@ -283,7 +341,21 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
       name: z.string().min(1).max(120),
       role: z.string().max(500).default("Coding collaborator"),
       driver: z.enum(["pi", "omp", "claude", "codex", "hermes", "deepseek"]),
+      modelId: z.string().max(128).nullable().optional(),
+      skillRefs: z.array(z.string().max(128)).max(32).optional(),
+      environment: z.object({
+        reference: z.string().max(128).nullable().optional(),
+        values: z.record(z.string(), z.string()).optional(),
+      }).strict().nullable().optional(),
     }).parse(request.body);
+    const composition = normalizeAgentComposition(body);
+    const catalog = composition.modelId ? await modelCatalog.get() : null;
+    const selectedModel = catalog?.models.find((model) => model.id === composition.modelId) ?? null;
+    const compatibility = assertAgentModelCompatible(
+      body.driver,
+      selectedModel,
+      composition.modelId !== null,
+    );
     const actors = await store.listActors(actor.workspaceId);
     if (actors.some((candidate) => candidate.handle.toLowerCase() === body.handle.toLowerCase())) {
       throw new StoreError("agent_handle_exists", `@${body.handle.toLowerCase()} already exists.`);
@@ -295,12 +367,15 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
       displayName: body.name,
     });
     const home = resolve(config.dataDir, "agents", created.id);
+    const effectiveModelId = composition.modelId ?? defaultModelForDriver(config, body.driver);
     await writeMobAiProviderConfig({
       directory: home,
       baseUrl: providerProxyBaseUrl(config),
-      model: config.mobAiModel,
-      claudeModel: config.mobAiClaudeModel,
-      codexModel: config.mobAiCodexModel,
+      model: body.driver === "claude" || body.driver === "codex"
+        ? config.mobAiModel
+        : effectiveModelId,
+      claudeModel: body.driver === "claude" ? effectiveModelId : config.mobAiClaudeModel,
+      codexModel: body.driver === "codex" ? effectiveModelId : config.mobAiCodexModel,
     });
     const capabilities = connectorCapabilities(body.driver);
     const profile = await store.createAgentProfile({
@@ -310,19 +385,57 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
       driver: body.driver,
       home,
       role: body.role,
+      ...composition,
       capabilities,
       maxConcurrentRuns: 1,
     });
     await Promise.all([files.writeActor(created), files.writeAgentProfile(profile)]);
-    return {
-      id: created.id,
-      handle: created.handle,
-      name: created.displayName,
-      status: "available",
-      driver: profile.driver,
-      role: profile.role,
-      capabilities: profile.capabilities,
-    };
+    return agentApiView(created, profile, effectiveModelId, compatibility);
+  });
+
+  app.patch<{ Params: { id: string } }>("/api/agents/:id", async (request) => {
+    const human = requireHuman(request);
+    const body = z.object({
+      name: z.string().min(1).max(120),
+      role: z.string().max(500).default("Coding collaborator"),
+      driver: z.enum(["pi", "omp", "claude", "codex", "hermes", "deepseek"]),
+      modelId: z.string().max(128).nullable().optional(),
+      skillRefs: z.array(z.string().max(128)).max(32).optional(),
+      environment: z.object({
+        reference: z.string().max(128).nullable().optional(),
+        values: z.record(z.string(), z.string()).optional(),
+      }).strict().nullable().optional(),
+    }).parse(request.body);
+    const composition = normalizeAgentComposition(body);
+    const catalog = composition.modelId ? await modelCatalog.get() : null;
+    const selectedModel = catalog?.models.find((model) => model.id === composition.modelId) ?? null;
+    const compatibility = assertAgentModelCompatible(
+      body.driver,
+      selectedModel,
+      composition.modelId !== null,
+    );
+    const capabilities = connectorCapabilities(body.driver);
+    const updated = await store.updateAgentDefinition({
+      workspaceId: human.workspaceId,
+      actorId: request.params.id,
+      displayName: body.name,
+      driver: body.driver,
+      role: body.role,
+      ...composition,
+      capabilities,
+    });
+    const effectiveModelId = composition.modelId ?? defaultModelForDriver(config, body.driver);
+    await writeMobAiProviderConfig({
+      directory: updated.profile.home,
+      baseUrl: providerProxyBaseUrl(config),
+      model: body.driver === "claude" || body.driver === "codex"
+        ? config.mobAiModel
+        : effectiveModelId,
+      claudeModel: body.driver === "claude" ? effectiveModelId : config.mobAiClaudeModel,
+      codexModel: body.driver === "codex" ? effectiveModelId : config.mobAiCodexModel,
+    });
+    await Promise.all([files.writeActor(updated.actor), files.writeAgentProfile(updated.profile)]);
+    return agentApiView(updated.actor, updated.profile, effectiveModelId, compatibility);
   });
 
   app.get<{ Params: { id: string } }>("/api/tasks/:id", async (request) => {
@@ -658,23 +771,26 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     }
     const workspaceActors = await store.listActors(actor.workspaceId);
     const memberIds = new Set(thread.members.map((membership) => membership.actorId));
-    const agentMembers = workspaceActors.filter((candidate) =>
+    const conversationAgentMembers = workspaceActors.filter((candidate) =>
       candidate.kind === "agent" && memberIds.has(candidate.id) && candidate.id !== actor.actorId,
     );
+    const invokableAgents = thread.conversation.isPrimary
+      ? workspaceActors.filter((candidate) => candidate.kind === "agent" && candidate.id !== actor.actorId)
+      : conversationAgentMembers;
     let invokedAgentId: string | undefined;
     if (body.invoke) {
       if (body.agent) {
         const needle = body.agent.replace(/^@/u, "").toLowerCase();
-        invokedAgentId = agentMembers.find((candidate) =>
+        invokedAgentId = invokableAgents.find((candidate) =>
           candidate.id === body.agent || candidate.handle.toLowerCase() === needle,
         )?.id;
       } else {
         const mentions = new Set(extractMentionHandles(body.content));
-        const mentionedAgents = agentMembers.filter((candidate) => mentions.has(candidate.handle));
+        const mentionedAgents = invokableAgents.filter((candidate) => mentions.has(candidate.handle));
         const candidates = mentionedAgents.length > 0
           ? mentionedAgents
           : thread.conversation.kind === "direct"
-            ? agentMembers
+            ? conversationAgentMembers
             : [];
         if (candidates.length === 1) invokedAgentId = candidates[0]?.id;
       }
@@ -1135,6 +1251,14 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     return knowledgeFor(files, actor.workspaceId).retrieve(query, { topK, charBudget });
   });
 
+  app.get<{ Querystring: { q?: string; top?: string; budget?: string } }>("/api/knowledge/query", async (request) => {
+    const actor = requireActor(request);
+    const question = z.string().min(1).parse(request.query.q);
+    const topK = z.coerce.number().int().min(1).max(20).default(6).parse(request.query.top);
+    const charBudget = z.coerce.number().int().min(100).max(50_000).default(12_000).parse(request.query.budget);
+    return knowledgeFor(files, actor.workspaceId).query(question, { topK, charBudget });
+  });
+
   app.post<{ Params: { area: string } }>("/api/knowledge/:area", async (request) => {
     const actor = requireActor(request);
     const area = z.enum(["raw", "wiki"]).parse(request.params.area);
@@ -1212,6 +1336,58 @@ function connectorCapabilities(driver: "pi" | "omp" | "claude" | "codex" | "herm
     followUp: driver === "pi" || driver === "omp",
     resume: false,
     nativeCancel: duplex,
+  };
+}
+
+function configuredModelFallbacks(config: AppConfig): ModelCatalogEntry[] {
+  return [
+    configuredModel(config.mobAiModel, ["openai-chat"]),
+    configuredModel(config.mobAiClaudeModel ?? config.mobAiModel, ["anthropic-messages", "openai-chat"]),
+    configuredModel(config.mobAiCodexModel ?? config.mobAiModel, ["openai-responses", "openai-chat"]),
+  ];
+}
+
+function configuredModel(id: string, protocols: ModelProtocol[]): ModelCatalogEntry {
+  return {
+    id,
+    name: id,
+    provider: "MobAI",
+    protocols,
+    contextWindow: null,
+    capabilities: {},
+  };
+}
+
+function defaultModelForDriver(config: AppConfig, driver: string): string {
+  if (driver === "claude") return config.mobAiClaudeModel ?? config.mobAiModel;
+  if (driver === "codex") return config.mobAiCodexModel ?? config.mobAiModel;
+  return config.mobAiModel;
+}
+
+function effectiveAgentModel(config: AppConfig, profile: AgentProfile | undefined): string {
+  return profile?.modelId ?? defaultModelForDriver(config, profile?.driver ?? "pi");
+}
+
+function agentApiView(
+  actor: Actor,
+  profile: AgentProfile,
+  effectiveModelId: string,
+  compatibility: ReturnType<typeof evaluateAgentModelCompatibility>,
+): Record<string, unknown> {
+  return {
+    id: actor.id,
+    handle: actor.handle,
+    name: actor.displayName,
+    status: actor.status === "active" ? "available" : "offline",
+    harness: profile.driver,
+    driver: profile.driver,
+    role: profile.role,
+    modelId: profile.modelId,
+    effectiveModelId,
+    skillRefs: profile.skillRefs,
+    environment: profile.environment,
+    capabilities: profile.capabilities,
+    compatibility,
   };
 }
 

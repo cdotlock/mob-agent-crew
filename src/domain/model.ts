@@ -90,6 +90,45 @@ export interface DriverCapabilities {
   nativeCancel: boolean;
 }
 
+/**
+ * Secret-free environment selection owned by Mob. Secret material remains in
+ * the selected runtime environment and is never copied into an Agent profile.
+ */
+export interface AgentEnvironment {
+  reference: string | null;
+  values: Readonly<Record<string, string>>;
+}
+
+export type ModelProtocol =
+  | "openai-chat"
+  | "openai-responses"
+  | "anthropic-messages";
+
+export interface ModelCapabilities {
+  tools?: boolean;
+  vision?: boolean;
+  reasoning?: boolean;
+}
+
+export interface ModelCatalogEntry {
+  id: string;
+  name: string;
+  provider: string | null;
+  protocols: readonly ModelProtocol[];
+  contextWindow: number | null;
+  capabilities: ModelCapabilities;
+}
+
+export interface ModelCatalog {
+  version: 1;
+  source: "configured" | "remote" | "merged" | "fallback";
+  fetchedAt: Date;
+  expiresAt: Date;
+  stale: boolean;
+  models: readonly ModelCatalogEntry[];
+  warnings: readonly string[];
+}
+
 export interface AgentProfile {
   actorId: ActorId;
   workspaceId: WorkspaceId;
@@ -97,6 +136,9 @@ export interface AgentProfile {
   driver: string;
   home: string;
   role: string;
+  modelId: string | null;
+  skillRefs: string[];
+  environment: AgentEnvironment;
   capabilities: DriverCapabilities;
   maxConcurrentRuns: number;
   createdAt: Date;

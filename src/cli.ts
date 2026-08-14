@@ -11,11 +11,54 @@ import { MobWorker } from "./worker/index.js";
 import { FileWorkspaceStore, replayWorkspaceProjection } from "./storage/index.js";
 import {
   MobApiClient,
+  MobApiError,
   clearClientConfig,
+  importWikiDirectory,
   loadClientConfig,
   normalizeServerUrl,
   saveClientConfig,
 } from "./client/index.js";
+
+interface ListedAgent {
+  id: string;
+  handle: string;
+  name: string;
+  role: string;
+  driver?: string;
+  harness?: string;
+  modelId?: string | null;
+  skillRefs?: string[];
+  environment?: {
+    reference?: string | null;
+    values?: Record<string, string>;
+  } | null;
+}
+
+interface AgentListResponse {
+  agents?: ListedAgent[];
+}
+
+interface AgentAddOptions {
+  handle: string;
+  name: string;
+  driver: string;
+  role: string;
+  model?: string;
+  skill?: string[];
+  environment?: string;
+}
+
+interface AgentConfigureOptions {
+  name?: string;
+  role?: string;
+  driver?: string;
+  model?: string;
+  defaultModel?: boolean;
+  skill?: string[];
+  clearSkills?: boolean;
+  environment?: string;
+  clearEnvironment?: boolean;
+}
 
 const program = new Command()
   .name("mob")
@@ -121,27 +164,91 @@ chatCommands.command("send")
   .action(async (taskId: string, words: string[]) => {
     const content = words.join(" ").trim();
     if (!content) throw new Error("Message is required");
-    const result = await (await connectedClient()).request(`/api/tasks/${encodeURIComponent(taskId)}/messages`, {
+    const result = await (await connectedClient()).request(`/api/conversations/${encodeURIComponent(taskId)}/messages`, {
       method: "POST",
-      body: { content },
+      body: { content, invoke: false },
     });
     console.log(JSON.stringify(result, null, 2));
   });
 
 const agentCommands = program.command("agent").description("invoke a named actor in the environment");
 agentCommands.command("list").action(async () => {
-  const bootstrap = await (await connectedClient()).request<{ agents?: unknown[] }>("/api/bootstrap");
-  console.log(JSON.stringify(bootstrap.agents ?? [], null, 2));
+  const response = await (await connectedClient()).request<AgentListResponse>("/api/agents");
+  console.log(JSON.stringify(response.agents ?? [], null, 2));
 });
 agentCommands.command("add")
   .requiredOption("--handle <handle>", "stable @handle")
   .requiredOption("--name <name>", "display name")
   .requiredOption("--driver <driver>", "pi, omp, claude, codex, hermes, or deepseek")
   .option("--role <role>", "short collaboration role", "Coding collaborator")
-  .action(async (options: { handle: string; name: string; driver: string; role: string }) => {
+  .option("--model <model>", "MobAI model ID; omit to use the harness default")
+  .option("--skill <skill>", "skill reference (repeatable)", collectOption)
+  .option("--environment <reference>", "secret-free environment reference, for example railway:default")
+  .action(async (options: AgentAddOptions) => {
+    const modelId = optionalNonEmpty(options.model, "--model");
+    const skillRefs = options.skill?.map((value) => requiredNonEmpty(value, "--skill"));
+    const environmentReference = optionalNonEmpty(options.environment, "--environment");
     console.log(JSON.stringify(await (await connectedClient()).request("/api/agents", {
       method: "POST",
-      body: options,
+      body: {
+        handle: requiredNonEmpty(options.handle, "--handle"),
+        name: requiredNonEmpty(options.name, "--name"),
+        driver: requiredNonEmpty(options.driver, "--driver"),
+        role: options.role,
+        ...(modelId === undefined ? {} : { modelId }),
+        ...(skillRefs === undefined ? {} : { skillRefs }),
+        ...(environmentReference === undefined
+          ? {}
+          : { environment: { reference: environmentReference, values: {} } }),
+      },
+    }), null, 2));
+  });
+agentCommands.command("configure")
+  .description("update an Agent while preserving fields not named on this command")
+  .argument("<agent>", "agent ID or @handle")
+  .option("--name <name>", "display name")
+  .option("--role <role>", "short collaboration role")
+  .option("--driver <driver>", "pi, omp, claude, codex, hermes, or deepseek")
+  .option("--model <model>", "MobAI model ID")
+  .option("--default-model", "use the selected harness default model")
+  .option("--skill <skill>", "replace skills with this reference (repeatable)", collectOption)
+  .option("--clear-skills", "remove every configured skill reference")
+  .option("--environment <reference>", "replace the secret-free environment reference")
+  .option("--clear-environment", "remove the environment reference and safe values")
+  .action(async (agent: string, options: AgentConfigureOptions) => {
+    assertAgentConfigureOptions(options);
+    const client = await connectedClient();
+    const response = await client.request<AgentListResponse>("/api/agents");
+    const current = findAgent(response.agents ?? [], agent);
+    const driver = optionalNonEmpty(options.driver, "--driver") ?? current.driver ?? current.harness;
+    if (!driver) throw new Error(`Agent '@${current.handle}' has no harness configuration`);
+
+    const currentEnvironment = normalizeListedEnvironment(current.environment);
+    const modelId = options.defaultModel
+      ? null
+      : optionalNonEmpty(options.model, "--model") ?? current.modelId ?? null;
+    const skillRefs = options.clearSkills
+      ? []
+      : options.skill?.map((value) => requiredNonEmpty(value, "--skill")) ?? current.skillRefs ?? [];
+    const environment = options.clearEnvironment
+      ? { reference: null, values: {} }
+      : options.environment === undefined
+        ? currentEnvironment
+        : {
+            reference: requiredNonEmpty(options.environment, "--environment"),
+            values: {},
+          };
+
+    console.log(JSON.stringify(await client.request(`/api/agents/${encodeURIComponent(current.id)}`, {
+      method: "PATCH",
+      body: {
+        name: optionalNonEmpty(options.name, "--name") ?? current.name,
+        role: options.role === undefined ? current.role : options.role,
+        driver,
+        modelId,
+        skillRefs,
+        environment,
+      },
     }), null, 2));
   });
 agentCommands.command("invoke")
@@ -150,19 +257,39 @@ agentCommands.command("invoke")
   .argument("<request...>")
   .action(async (taskId: string, agent: string, words: string[]) => {
     const client = await connectedClient();
-    const bootstrap = await client.request<{ agents?: Array<{ id?: string; handle?: string; name?: string }> }>("/api/bootstrap");
+    const response = await client.request<AgentListResponse>("/api/agents");
     const needle = agent.replace(/^@/u, "").toLowerCase();
-    const matched = (bootstrap.agents ?? []).find((item) =>
+    const matched = (response.agents ?? []).find((item) =>
       item.id === agent || item.handle?.toLowerCase() === needle || item.name?.toLowerCase() === needle,
     );
     if (!matched?.handle) throw new Error(`Agent '${agent}' was not found`);
-    const content = `@${matched.handle} ${words.join(" ").trim()}`.trim();
-    const result = await client.request(`/api/tasks/${encodeURIComponent(taskId)}/messages`, {
+    const content = words.join(" ").trim();
+    if (!content) throw new Error("Agent instruction is required");
+    const invoke = () => client.request(`/api/conversations/${encodeURIComponent(taskId)}/messages`, {
       method: "POST",
-      body: { content },
+      body: { content, invoke: true, agent: matched.id },
     });
+    let result: unknown;
+    try {
+      result = await invoke();
+    } catch (error) {
+      if (!(error instanceof MobApiError) || error.status !== 409 || error.code !== "task_closed") throw error;
+      await client.request(`/api/tasks/${encodeURIComponent(taskId)}/reviews`, {
+        method: "POST",
+        body: {
+          decision: "request_changes",
+          note: "Reopened by mob agent invoke for an explicit follow-up instruction.",
+        },
+      });
+      result = await invoke();
+    }
     console.log(JSON.stringify(result, null, 2));
   });
+
+const modelCommands = program.command("model").description("discover models exposed by the connected Mob environment");
+modelCommands.command("list").action(async () => {
+  console.log(JSON.stringify(await (await connectedClient()).request("/api/models"), null, 2));
+});
 
 const conversationCommands = program.command("conversation").alias("conversations").description("work with direct and group chats");
 conversationCommands.command("list").action(async () => {
@@ -245,6 +372,13 @@ knowledgeCommands.command("search").argument("<query...>").action(async (words: 
 knowledgeCommands.command("retrieve").argument("<query...>").action(async (words: string[]) => {
   console.log(JSON.stringify(await (await connectedClient()).request("/api/knowledge/retrieve", { query: { q: words.join(" ") } }), null, 2));
 });
+knowledgeCommands.command("ask").argument("<question...>").action(async (words: string[]) => {
+  const question = words.join(" ").trim();
+  if (!question) throw new Error("Question is required");
+  console.log(JSON.stringify(await (await connectedClient()).request("/api/knowledge/query", {
+    query: { q: question },
+  }), null, 2));
+});
 knowledgeCommands.command("read").argument("<path>").action(async (path: string) => {
   console.log(JSON.stringify(await (await connectedClient()).request("/api/knowledge/file", { query: { path } }), null, 2));
 });
@@ -256,6 +390,19 @@ knowledgeCommands.command("curate").argument("<knowledge-path>").argument("<file
   const content = await readFile(file, "utf8");
   console.log(JSON.stringify(await (await connectedClient()).request("/api/knowledge/wiki", { method: "POST", body: { path, content, source: `cli:${basename(file)}` } }), null, 2));
 });
+knowledgeCommands.command("import-dir")
+  .argument("<directory>")
+  .requiredOption("--area <area>", "raw or wiki")
+  .action(async (directory: string, options: { area: string }) => {
+    if (options.area !== "raw" && options.area !== "wiki") {
+      throw new Error("--area must be 'raw' or 'wiki'");
+    }
+    console.log(JSON.stringify(await importWikiDirectory(
+      await connectedClient(),
+      directory,
+      options.area,
+    ), null, 2));
+  });
 knowledgeCommands.command("lint").action(async () => {
   console.log(JSON.stringify(await (await connectedClient()).request("/api/knowledge/lint"), null, 2));
 });
@@ -422,6 +569,64 @@ async function readStandardInput(): Promise<string> {
   const chunks: Buffer[] = [];
   for await (const chunk of process.stdin) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
   return Buffer.concat(chunks).toString("utf8").replace(/\r?\n$/u, "");
+}
+
+function collectOption(value: string, previous: string[] | undefined): string[] {
+  return [...(previous ?? []), value];
+}
+
+function requiredNonEmpty(value: string, option: string): string {
+  const normalized = value.trim();
+  if (!normalized) throw new Error(`${option} cannot be empty`);
+  return normalized;
+}
+
+function optionalNonEmpty(value: string | undefined, option: string): string | undefined {
+  return value === undefined ? undefined : requiredNonEmpty(value, option);
+}
+
+function assertAgentConfigureOptions(options: AgentConfigureOptions): void {
+  if (options.model !== undefined && options.defaultModel) {
+    throw new Error("Choose --model or --default-model, not both");
+  }
+  if (options.skill !== undefined && options.clearSkills) {
+    throw new Error("Choose --skill or --clear-skills, not both");
+  }
+  if (options.environment !== undefined && options.clearEnvironment) {
+    throw new Error("Choose --environment or --clear-environment, not both");
+  }
+  if (
+    options.name === undefined &&
+    options.role === undefined &&
+    options.driver === undefined &&
+    options.model === undefined &&
+    !options.defaultModel &&
+    options.skill === undefined &&
+    !options.clearSkills &&
+    options.environment === undefined &&
+    !options.clearEnvironment
+  ) {
+    throw new Error("Specify at least one Agent field to configure");
+  }
+}
+
+function findAgent(agents: readonly ListedAgent[], requested: string): ListedAgent {
+  const needle = requested.replace(/^@/u, "").toLowerCase();
+  const matched = agents.find((agent) =>
+    agent.id === requested || agent.handle.toLowerCase() === needle,
+  );
+  if (!matched) throw new Error(`Agent '${requested}' was not found`);
+  return matched;
+}
+
+function normalizeListedEnvironment(environment: ListedAgent["environment"]): {
+  reference: string | null;
+  values: Record<string, string>;
+} {
+  return {
+    reference: environment?.reference ?? null,
+    values: environment?.values ?? {},
+  };
 }
 
 function delay(milliseconds: number): Promise<void> {

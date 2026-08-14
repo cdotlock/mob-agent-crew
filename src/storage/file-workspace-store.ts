@@ -27,6 +27,7 @@ import type {
   Workspace,
   WorkspaceDocument,
 } from "../domain/model.js";
+import { normalizeAgentComposition } from "../domain/agent-composition.js";
 
 const SCHEMA_VERSION = 1;
 const MESSAGE_HEADER_PREFIX = "<!-- mob-message-meta ";
@@ -125,9 +126,10 @@ export class FileWorkspaceStore {
   }
 
   async writeAgentProfile(value: AgentProfile): Promise<string> {
+    const safeValue = { ...value, ...normalizeAgentComposition(value) };
     return this.#writeJson(
       "agent_profile",
-      value,
+      safeValue,
       safeJoin(
         this.workspaceRoot(value.workspaceId),
         "agents",
@@ -334,7 +336,7 @@ export class FileWorkspaceStore {
   }
 
   async readAgentProfile(workspaceId: string, actorId: string): Promise<AgentProfile | null> {
-    return this.#readJson(
+    const profile = await this.#readJson<AgentProfile>(
       "agent_profile",
       safeJoin(
         this.workspaceRoot(workspaceId),
@@ -343,6 +345,7 @@ export class FileWorkspaceStore {
         "profile.json",
       ),
     );
+    return profile ? { ...profile, ...normalizeAgentComposition(profile) } : null;
   }
 
   async readTask(workspaceId: string, taskId: string): Promise<Task | null> {

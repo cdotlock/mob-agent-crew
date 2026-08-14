@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { issueRunToken, issueSessionToken } from "../src/auth/tokens.js";
 import type { AppConfig } from "../src/config.js";
-import type { CollaborationStore } from "../src/db/store.js";
+import { StoreError, type CollaborationStore } from "../src/db/store.js";
 import type { Actor, ConversationThread, TaskThread } from "../src/domain/model.js";
 import { buildApp } from "../src/server/app.js";
 import type { FileWorkspaceStore } from "../src/storage/index.js";
@@ -12,6 +12,7 @@ import type { FileWorkspaceStore } from "../src/storage/index.js";
 const WORKSPACE_ID = "11111111-1111-4111-8111-111111111111";
 const HUMAN_ID = "22222222-2222-4222-8222-222222222222";
 const AGENT_ID = "33333333-3333-4333-8333-333333333333";
+const REVIEWER_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 const TASK_ID = "44444444-4444-4444-8444-444444444444";
 const CONVERSATION_ID = "55555555-5555-4555-8555-555555555555";
 const RUN_ID = "66666666-6666-4666-8666-666666666666";
@@ -35,6 +36,12 @@ const agent: Actor = {
   kind: "agent",
   handle: "builder",
   displayName: "Builder",
+};
+const reviewer: Actor = {
+  ...agent,
+  id: REVIEWER_ID,
+  handle: "reviewer",
+  displayName: "Reviewer",
 };
 const secondHuman: Actor = {
   ...human,
@@ -133,13 +140,64 @@ describe("conversation API", () => {
       method: "POST",
       url: `/api/conversations/${CONVERSATION_ID}/messages`,
       headers: { authorization: `Bearer ${sessionToken()}` },
-      payload: { content: "谢谢，先不用继续" },
+      payload: { content: "@builder 谢谢，先不用继续" },
     });
 
     expect(response.statusCode).toBe(200);
     expect(fixture.createConversationMessage).toHaveBeenCalledWith(
       expect.not.objectContaining({ invokeAgentActorId: expect.anything() }),
     );
+  });
+
+  it("invokes one mentioned Agent exactly once in the primary group", async () => {
+    const fixture = await createFixture({
+      ...directThread,
+      conversation: {
+        ...directThread.conversation,
+        kind: "group",
+        isPrimary: true,
+      },
+    });
+    const response = await fixture.app.inject({
+      method: "POST",
+      url: `/api/conversations/${CONVERSATION_ID}/messages`,
+      headers: { authorization: `Bearer ${sessionToken()}` },
+      payload: { content: "@builder inspect this", invoke: true },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(fixture.createConversationMessage).toHaveBeenCalledOnce();
+    expect(fixture.createConversationMessage).toHaveBeenCalledWith(expect.objectContaining({
+      conversationId: CONVERSATION_ID,
+      actorId: HUMAN_ID,
+      body: "@builder inspect this",
+      invokeAgentActorId: AGENT_ID,
+    }));
+  });
+
+  it("can explicitly invoke a workspace Agent that has not joined the primary group yet", async () => {
+    const fixture = await createFixture({
+      ...directThread,
+      conversation: {
+        ...directThread.conversation,
+        kind: "group",
+        isPrimary: true,
+      },
+    });
+    const response = await fixture.app.inject({
+      method: "POST",
+      url: `/api/conversations/${CONVERSATION_ID}/messages`,
+      headers: { authorization: `Bearer ${sessionToken()}` },
+      payload: { content: "review this", invoke: true, agent: "@reviewer" },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(fixture.createConversationMessage).toHaveBeenCalledWith(expect.objectContaining({
+      conversationId: CONVERSATION_ID,
+      actorId: HUMAN_ID,
+      body: "review this",
+      invokeAgentActorId: REVIEWER_ID,
+    }));
   });
 
   it("requires running Agents to delegate instead of bypassing guardrails", async () => {
@@ -310,6 +368,22 @@ describe("conversation API", () => {
 });
 
 describe("Agent identity API", () => {
+  it("serves a stable model catalog without returning the Router credential", async () => {
+    const fixture = await createFixture();
+    const response = await fixture.app.inject({
+      method: "GET",
+      url: "/api/models",
+      headers: { authorization: `Bearer ${sessionToken()}` },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      version: 1,
+      models: [expect.objectContaining({ id: "test-model" })],
+    });
+    expect(response.body).not.toContain("test-key");
+  });
+
   it.each([
     {
       driver: "hermes" as const,
@@ -342,6 +416,12 @@ describe("Agent identity API", () => {
         name: `${driver} Reviewer`,
         driver,
         role: "Independent reviewer",
+        modelId: "test-model",
+        skillRefs: ["repo:review", "workspace:typescript"],
+        environment: {
+          reference: "workspace:railway-small",
+          values: { LOG_LEVEL: "info" },
+        },
       },
     });
 
@@ -349,10 +429,210 @@ describe("Agent identity API", () => {
     expect(createAgentProfile).toHaveBeenCalledWith(expect.objectContaining({
       driver,
       role: "Independent reviewer",
+      modelId: "test-model",
+      skillRefs: ["repo:review", "workspace:typescript"],
+      environment: {
+        reference: "workspace:railway-small",
+        values: { LOG_LEVEL: "info" },
+      },
       capabilities: expect.objectContaining(capabilities),
     }));
     expect(fixture.writeActor).toHaveBeenCalledOnce();
     expect(fixture.writeAgentProfile).toHaveBeenCalledOnce();
+  });
+
+  it("lists the identity plus four thin composition selections without exposing Agent home", async () => {
+    const fixture = await createFixture();
+    Object.assign(fixture.store, {
+      listAgentProfiles: vi.fn(async () => [{
+        actorId: AGENT_ID,
+        workspaceId: WORKSPACE_ID,
+        ownerActorId: HUMAN_ID,
+        driver: "pi",
+        home: "/private/runtime/home",
+        role: "Builder",
+        modelId: "test-model",
+        skillRefs: ["repo:review"],
+        environment: { reference: "workspace:railway-small", values: { LOG_LEVEL: "info" } },
+        capabilities: { streaming: true, steer: true, followUp: true, resume: false, nativeCancel: true },
+        maxConcurrentRuns: 1,
+        createdAt: now,
+        updatedAt: now,
+      }]),
+    });
+
+    const response = await fixture.app.inject({
+      method: "GET",
+      url: "/api/agents",
+      headers: { authorization: `Bearer ${sessionToken()}` },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().agents).toContainEqual(expect.objectContaining({
+      id: AGENT_ID,
+      handle: "builder",
+      harness: "pi",
+      modelId: "test-model",
+      skillRefs: ["repo:review"],
+      environment: { reference: "workspace:railway-small", values: { LOG_LEVEL: "info" } },
+    }));
+    expect(response.body).not.toContain("/private/runtime/home");
+  });
+
+  it("lets a human update the Agent composition and refreshes both file projections", async () => {
+    const fixture = await createFixture();
+    const updatedActor = { ...agent, displayName: "Hermes Builder", updatedAt: new Date(now.getTime() + 1) };
+    const updatedProfile = {
+      actorId: AGENT_ID,
+      workspaceId: WORKSPACE_ID,
+      ownerActorId: HUMAN_ID,
+      driver: "hermes",
+      home: join(temporaryDirectories.at(-1)!, "agents", AGENT_ID),
+      role: "Research and implementation",
+      modelId: "test-model",
+      skillRefs: ["repo:review", "workspace:typescript"],
+      environment: {
+        reference: "workspace:railway-small",
+        values: { LOG_LEVEL: "debug" },
+      },
+      capabilities: {
+        streaming: true,
+        steer: true,
+        followUp: false,
+        resume: false,
+        nativeCancel: true,
+      },
+      maxConcurrentRuns: 1,
+      createdAt: now,
+      updatedAt: new Date(now.getTime() + 1),
+    };
+    const updateAgentDefinition = vi.fn(async () => ({
+      actor: updatedActor,
+      profile: updatedProfile,
+    }));
+    Object.assign(fixture.store, { updateAgentDefinition });
+
+    const response = await fixture.app.inject({
+      method: "PATCH",
+      url: `/api/agents/${AGENT_ID}`,
+      headers: { authorization: `Bearer ${sessionToken()}` },
+      payload: {
+        name: "Hermes Builder",
+        role: "Research and implementation",
+        driver: "hermes",
+        modelId: "test-model",
+        skillRefs: ["repo:review", "workspace:typescript"],
+        environment: {
+          reference: "workspace:railway-small",
+          values: { LOG_LEVEL: "debug" },
+        },
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(updateAgentDefinition).toHaveBeenCalledWith({
+      workspaceId: WORKSPACE_ID,
+      actorId: AGENT_ID,
+      displayName: "Hermes Builder",
+      driver: "hermes",
+      role: "Research and implementation",
+      modelId: "test-model",
+      skillRefs: ["repo:review", "workspace:typescript"],
+      environment: {
+        reference: "workspace:railway-small",
+        values: { LOG_LEVEL: "debug" },
+      },
+      capabilities: {
+        streaming: true,
+        steer: true,
+        followUp: false,
+        resume: false,
+        nativeCancel: true,
+      },
+    });
+    expect(fixture.writeActor).toHaveBeenCalledWith(updatedActor);
+    expect(fixture.writeAgentProfile).toHaveBeenCalledWith(updatedProfile);
+    expect(response.json()).toMatchObject({
+      id: AGENT_ID,
+      name: "Hermes Builder",
+      harness: "hermes",
+      modelId: "test-model",
+      effectiveModelId: "test-model",
+      skillRefs: ["repo:review", "workspace:typescript"],
+      environment: {
+        reference: "workspace:railway-small",
+        values: { LOG_LEVEL: "debug" },
+      },
+      compatibility: { compatible: true, status: "compatible" },
+    });
+  });
+
+  it("rejects an active Agent run that attempts to change another Agent definition", async () => {
+    const fixture = await createFixture();
+    const updateAgentDefinition = vi.fn();
+    Object.assign(fixture.store, { updateAgentDefinition });
+    const runToken = issueRunToken({
+      actorId: AGENT_ID,
+      workspaceId: WORKSPACE_ID,
+      taskId: TASK_ID,
+      runId: RUN_ID,
+      attemptId: ATTEMPT_ID,
+    }, SECRET);
+
+    const response = await fixture.app.inject({
+      method: "PATCH",
+      url: `/api/agents/${AGENT_ID}`,
+      headers: { authorization: `Bearer ${runToken}` },
+      payload: { name: "Escalated", driver: "pi" },
+    });
+
+    expect(response.statusCode).toBe(403);
+    expect(response.json()).toMatchObject({ error: "human_required" });
+    expect(updateAgentDefinition).not.toHaveBeenCalled();
+    expect(fixture.writeActor).not.toHaveBeenCalled();
+    expect(fixture.writeAgentProfile).not.toHaveBeenCalled();
+  });
+
+  it("rejects an unknown Agent without writing either file projection", async () => {
+    const fixture = await createFixture();
+    const updateAgentDefinition = vi.fn(async () => {
+      throw new StoreError("agent_not_found", "Agent was not found.");
+    });
+    Object.assign(fixture.store, { updateAgentDefinition });
+
+    const response = await fixture.app.inject({
+      method: "PATCH",
+      url: "/api/agents/99999999-9999-4999-8999-999999999999",
+      headers: { authorization: `Bearer ${sessionToken()}` },
+      payload: { name: "Missing Agent", driver: "pi" },
+    });
+
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toMatchObject({ error: "agent_not_found" });
+    expect(fixture.writeActor).not.toHaveBeenCalled();
+    expect(fixture.writeAgentProfile).not.toHaveBeenCalled();
+  });
+
+  it("rejects secret-bearing inline environment values before creating an Agent", async () => {
+    const fixture = await createFixture();
+    const createActor = vi.fn();
+    Object.assign(fixture.store, { createActor });
+
+    const response = await fixture.app.inject({
+      method: "POST",
+      url: "/api/agents",
+      headers: { authorization: `Bearer ${sessionToken()}` },
+      payload: {
+        handle: "unsafe-agent",
+        name: "Unsafe Agent",
+        driver: "pi",
+        environment: { values: { API_KEY: "must-not-be-stored" } },
+      },
+    });
+
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toMatchObject({ error: "secret_environment_key_forbidden" });
+    expect(createActor).not.toHaveBeenCalled();
   });
 });
 
@@ -408,7 +688,7 @@ async function createFixture(thread: ConversationThread = directThread) {
   const store = {
     getTask: vi.fn(async () => task),
     listRepositories: vi.fn(async () => []),
-    listActors: vi.fn(async () => [human, secondHuman, agent]),
+    listActors: vi.fn(async () => [human, secondHuman, agent, reviewer]),
     createConversation,
     getConversationThread: vi.fn(async () => thread),
     canActorAccessConversation: vi.fn(async (conversationId: string, actorId: string) =>

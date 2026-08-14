@@ -3,7 +3,7 @@ import { MIGRATIONS } from "../../src/db/migrations.js";
 
 describe("database migrations", () => {
   it("are ordered and cover the collaboration aggregate", () => {
-    expect(MIGRATIONS.map(({ version }) => version)).toEqual([1, 2]);
+    expect(MIGRATIONS.map(({ version }) => version)).toEqual([1, 2, 3]);
     const sql = MIGRATIONS[0]?.sql ?? "";
     for (const table of [
       "workspaces",
@@ -44,5 +44,14 @@ describe("database migrations", () => {
     const sql = MIGRATIONS[0]?.sql ?? "";
     expect(sql).toMatch(/task_id uuid PRIMARY KEY/);
     expect(sql).toContain("writer_fence");
+  });
+
+  it("adds secret-free Agent composition metadata without replacing the harness driver", () => {
+    const sql = MIGRATIONS[2]?.sql ?? "";
+    expect(sql).toContain("ADD COLUMN model_id text");
+    expect(sql).toContain("ADD COLUMN skill_refs jsonb NOT NULL DEFAULT '[]'::jsonb");
+    expect(sql).toContain("ADD COLUMN environment jsonb NOT NULL");
+    expect(sql).toContain("jsonb_typeof(skill_refs) = 'array'");
+    expect(sql).not.toContain("DROP COLUMN driver");
   });
 });

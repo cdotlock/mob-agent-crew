@@ -68,6 +68,19 @@ describe("WorkspaceFileBrowser", () => {
       truncated: true,
     });
   });
+
+  it("shares short-lived listings across request instances and supports explicit invalidation", async () => {
+    const root = await fixture();
+    const first = new WorkspaceFileBrowser({ dataDir: root, listingCacheMs: 60_000 });
+    const second = new WorkspaceFileBrowser({ dataDir: root, listingCacheMs: 60_000 });
+    const input = { scope: "workspace" as const, workspaceId: "workspace-1" };
+    await first.list(input);
+    await writeFile(join(root, "state/workspaces/workspace-1/new.md"), "# New\n");
+
+    expect((await second.list(input)).entries.some((entry) => entry.name === "new.md")).toBe(false);
+    second.invalidate();
+    expect((await second.list(input)).entries.some((entry) => entry.name === "new.md")).toBe(true);
+  });
 });
 
 async function fixture(): Promise<string> {

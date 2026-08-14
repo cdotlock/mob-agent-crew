@@ -21,6 +21,7 @@ import type {
   WorkspaceDocument,
 } from "../domain/model.js";
 import type { FileWorkspaceStore } from "./file-workspace-store.js";
+import { normalizeAgentComposition } from "../domain/agent-composition.js";
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 
@@ -285,6 +286,16 @@ export function validateFileWorkspaceSnapshot(
     checkWorkspace(issues, profile.workspaceId, workspaceId, `agentProfiles/${profile.actorId}`);
     reference(issues, actors, profile.actorId, `agentProfiles/${profile.actorId}.actorId`);
     reference(issues, actors, profile.ownerActorId, `agentProfiles/${profile.actorId}.ownerActorId`);
+    try {
+      normalizeAgentComposition(profile);
+    } catch (error) {
+      issue(
+        issues,
+        "invalid_agent_composition",
+        `agentProfiles/${profile.actorId}`,
+        error instanceof Error ? error.message : "Invalid Agent composition",
+      );
+    }
   }
   const repositories = indexed(snapshot.repositories, "repositories", issues);
   const documents = indexed(snapshot.documents, "documents", issues);
@@ -605,6 +616,9 @@ function replayRows(snapshot: FileWorkspaceSnapshot): ReplayRows {
       driver: profile.driver,
       home: profile.home,
       role: profile.role,
+      model_id: profile.modelId ?? null,
+      skill_refs: profile.skillRefs ?? [],
+      environment: profile.environment ?? { reference: null, values: {} },
       capabilities: profile.capabilities,
       max_concurrent_runs: profile.maxConcurrentRuns,
       created_at: iso(profile.createdAt),
@@ -814,7 +828,7 @@ const columns = (source: string): ColumnSpec[] => source.split(/\s*,\s*/u).map((
 
 const WORKSPACES = spec("workspaces", "id uuid, slug text, name text, created_at timestamptz, updated_at timestamptz", ["id"]);
 const ACTORS = spec("actors", "id uuid, workspace_id uuid, kind text, handle text, display_name text, status text, created_at timestamptz, updated_at timestamptz", ["id"], ["workspace_id", "kind"]);
-const AGENT_PROFILES = spec("agent_profiles", "actor_id uuid, workspace_id uuid, owner_actor_id uuid, driver text, home text, role text, capabilities jsonb, max_concurrent_runs integer, created_at timestamptz, updated_at timestamptz", ["actor_id"], ["workspace_id"]);
+const AGENT_PROFILES = spec("agent_profiles", "actor_id uuid, workspace_id uuid, owner_actor_id uuid, driver text, home text, role text, model_id text, skill_refs jsonb, environment jsonb, capabilities jsonb, max_concurrent_runs integer, created_at timestamptz, updated_at timestamptz", ["actor_id"], ["workspace_id"]);
 const REPOSITORIES = spec("repositories", "id uuid, workspace_id uuid, name text, kind text, remote_url text, local_path text, default_branch text, allowlisted boolean, enabled boolean, created_by_actor_id uuid, created_at timestamptz, updated_at timestamptz", ["id"], ["workspace_id"]);
 const DOCUMENTS = spec("workspace_documents", "id uuid, workspace_id uuid, name text, content text, local_path text, source text, uploaded_by_actor_id uuid, created_at timestamptz, updated_at timestamptz", ["id"], ["workspace_id"]);
 const TASKS = spec("tasks", "id uuid, workspace_id uuid, repository_id uuid, created_by_actor_id uuid, assigned_actor_id uuid, title text, description text, base_revision text, branch_name text, status text, max_delegation_depth integer, run_budget integer, writer_fence bigint, created_at timestamptz, updated_at timestamptz", ["id"], ["workspace_id"], { writer_fence: "GREATEST(tasks.writer_fence, EXCLUDED.writer_fence)" });

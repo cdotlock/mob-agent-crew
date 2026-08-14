@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -98,6 +98,9 @@ function fixture(): {
     driver: "pi",
     home: `/data/agents/${ids.agent}`,
     role: "Builder",
+    modelId: null,
+    skillRefs: [],
+    environment: { reference: null, values: {} },
     capabilities: { streaming: true, steer: true, followUp: true, resume: false, nativeCancel: true },
     maxConcurrentRuns: 1,
     createdAt,
@@ -245,6 +248,30 @@ describe("file projection replay", () => {
     });
   });
 
+  it("normalizes legacy profile files that predate composition metadata", async () => {
+    const { files } = await persistedFixture();
+    const path = join(
+      files.workspaceRoot(ids.workspace),
+      "agents",
+      ids.agent,
+      "profile.json",
+    );
+    const envelope = JSON.parse(await readFile(path, "utf8")) as { data: Record<string, unknown> };
+    delete envelope.data.modelId;
+    delete envelope.data.skillRefs;
+    delete envelope.data.environment;
+    await writeFile(path, `${JSON.stringify(envelope)}\n`, "utf8");
+
+    const snapshot = await loadFileWorkspaceSnapshot(files, ids.workspace);
+
+    expect(snapshot.agentProfiles[0]).toMatchObject({
+      modelId: null,
+      skillRefs: [],
+      environment: { reference: null, values: {} },
+    });
+    expect(validateFileWorkspaceSnapshot(snapshot)).toEqual([]);
+  });
+
   it("reports broken references before touching PostgreSQL", async () => {
     const { snapshot } = await persistedFixture();
     snapshot.threads[0]!.messages[0]!.actorId = "00000000-0000-4000-8000-999999999999";
@@ -290,6 +317,7 @@ describe("file projection replay", () => {
     expect(statements).toContain("SELECT pg_advisory_xact_lock(514509012320260814)");
     expect(statements.some((statement) => statement.startsWith("INSERT INTO messages"))).toBe(true);
     expect(statements.some((statement) => statement.startsWith("INSERT INTO agent_profiles"))).toBe(true);
+    expect(statements.some((statement) => statement.includes("model_id"))).toBe(true);
     for (const operational of ["user_auth_records", "repository_imports", "task_writer_leases"]) {
       expect(statements.some((statement) => new RegExp(`(?:INSERT INTO|DELETE FROM|UPDATE) ${operational}`).test(statement))).toBe(false);
     }
