@@ -3,7 +3,7 @@ import { MIGRATIONS } from "../../src/db/migrations.js";
 
 describe("database migrations", () => {
   it("are ordered and cover the collaboration aggregate", () => {
-    expect(MIGRATIONS.map(({ version }) => version)).toEqual([1, 2, 3, 4]);
+    expect(MIGRATIONS.map(({ version }) => version)).toEqual([1, 2, 3, 4, 5]);
     const sql = MIGRATIONS[0]?.sql ?? "";
     for (const table of [
       "workspaces",
@@ -60,5 +60,16 @@ describe("database migrations", () => {
     expect(sql).toContain("ADD COLUMN plugin_refs jsonb NOT NULL DEFAULT '[]'::jsonb");
     expect(sql).toContain("jsonb_typeof(plugin_refs) = 'array'");
     expect(sql).not.toContain("DROP COLUMN driver");
+  });
+
+  it("makes chat workspace-first and keeps Tasks as hidden execution contexts", () => {
+    const sql = MIGRATIONS[4]?.sql ?? "";
+    expect(sql).toContain("ALTER COLUMN task_id DROP NOT NULL");
+    expect(sql).toContain("ALTER COLUMN repository_id DROP NOT NULL");
+    expect(sql).toContain("ADD COLUMN active_repository_id uuid");
+    expect(sql).toContain("ADD COLUMN execution_conversation_id uuid");
+    expect(sql).toContain("ADD COLUMN is_execution boolean");
+    expect(sql).toContain("ADD COLUMN wait_for_run_id uuid");
+    expect(sql).toContain("IF NEW.is_execution THEN RETURN NEW");
   });
 });

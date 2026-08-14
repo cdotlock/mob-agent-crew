@@ -176,7 +176,12 @@ export interface RepositoryImport {
 export interface Task {
   id: TaskId;
   workspaceId: WorkspaceId;
-  repositoryId: RepositoryId;
+  /** Null for a workspace-only execution that does not need a Git checkout. */
+  repositoryId: RepositoryId | null;
+  /** Conversation that caused this hidden execution context to be created. */
+  executionConversationId: ConversationId | null;
+  /** Hidden implementation detail; user-facing chat does not require a Task. */
+  isExecution: boolean;
   createdByActorId: ActorId;
   assignedActorId: ActorId | null;
   title: string;
@@ -192,16 +197,15 @@ export interface Task {
 }
 
 /**
- * A lightweight chat surface over a task execution context.
- *
- * The task owns repository/run guardrails; the conversation only owns who can
- * read/write a transcript. Every task has one primary group conversation for
- * compatibility with the original task-thread API.
+ * A workspace chat between actors. Chat exists independently of repositories
+ * and execution Tasks. taskId/isPrimary are retained only for legacy task
+ * threads; new direct/group chats normally have taskId=null.
  */
 export interface Conversation {
   id: ConversationId;
   workspaceId: WorkspaceId;
-  taskId: TaskId;
+  taskId: TaskId | null;
+  activeRepositoryId: RepositoryId | null;
   kind: ConversationKind;
   title: string | null;
   createdByActorId: ActorId;
@@ -220,7 +224,7 @@ export interface ConversationMembership {
 export interface Message {
   id: MessageId;
   workspaceId: WorkspaceId;
-  taskId: TaskId;
+  taskId: TaskId | null;
   conversationId: ConversationId;
   actorId: ActorId;
   sourceRunId: RunId | null;
@@ -253,6 +257,8 @@ export interface Run {
   taskId: TaskId;
   conversationId: ConversationId;
   triggerMessageId: MessageId | null;
+  /** Optional predecessor used for a real queued follow-up after steer fails. */
+  waitForRunId?: RunId | null;
   agentActorId: ActorId;
   requestedByActorId: ActorId;
   delegationId: DelegationId | null;

@@ -550,6 +550,84 @@ ALTER TABLE agent_profiles
   ADD CONSTRAINT agent_profiles_plugin_refs_array CHECK (jsonb_typeof(plugin_refs) = 'array');
 `,
   },
+  {
+    version: 5,
+    name: "conversation_first_workspace",
+    sql: String.raw`
+-- Chat is a workspace resource. Tasks and repositories are attached only when
+-- an Agent execution actually needs them.
+ALTER TABLE tasks
+  ALTER COLUMN repository_id DROP NOT NULL,
+  ADD COLUMN execution_conversation_id uuid,
+  ADD COLUMN is_execution boolean NOT NULL DEFAULT false;
+
+ALTER TABLE conversations
+  ALTER COLUMN task_id DROP NOT NULL,
+  ADD COLUMN active_repository_id uuid;
+
+ALTER TABLE messages
+  ALTER COLUMN task_id DROP NOT NULL;
+
+ALTER TABLE runs
+  ADD COLUMN wait_for_run_id uuid;
+
+ALTER TABLE tasks
+  ADD CONSTRAINT tasks_execution_conversation_fk
+    FOREIGN KEY (workspace_id, execution_conversation_id)
+    REFERENCES conversations(workspace_id, id)
+    ON DELETE CASCADE
+    DEFERRABLE INITIALLY DEFERRED,
+  ADD CONSTRAINT tasks_execution_shape CHECK (
+    NOT is_execution OR execution_conversation_id IS NOT NULL
+  );
+
+ALTER TABLE conversations
+  ADD CONSTRAINT conversations_active_repository_fk
+    FOREIGN KEY (workspace_id, active_repository_id)
+    REFERENCES repositories(workspace_id, id)
+    ON DELETE SET NULL (active_repository_id);
+
+ALTER TABLE runs
+  ADD CONSTRAINT runs_wait_for_run_fk
+    FOREIGN KEY (workspace_id, wait_for_run_id)
+    REFERENCES runs(workspace_id, id)
+    ON DELETE SET NULL (wait_for_run_id)
+    DEFERRABLE INITIALLY DEFERRED;
+
+CREATE INDEX runs_wait_for_run_idx ON runs (wait_for_run_id)
+  WHERE wait_for_run_id IS NOT NULL;
+
+CREATE INDEX tasks_execution_conversation_repository_idx
+  ON tasks (execution_conversation_id, repository_id, created_at DESC)
+  WHERE is_execution;
+CREATE INDEX conversations_workspace_active_repository_idx
+  ON conversations (workspace_id, active_repository_id)
+  WHERE active_repository_id IS NOT NULL;
+
+-- Hidden execution Tasks must not manufacture another visible primary chat.
+CREATE OR REPLACE FUNCTION mob_create_primary_conversation() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF NEW.is_execution THEN RETURN NEW; END IF;
+  INSERT INTO conversations (
+    id, workspace_id, task_id, kind, title, created_by_actor_id, is_primary,
+    created_at, updated_at
+  ) VALUES (
+    NEW.id, NEW.workspace_id, NEW.id, 'group', NEW.title,
+    NEW.created_by_actor_id, true, NEW.created_at, NEW.updated_at
+  ) ON CONFLICT (id) DO NOTHING;
+  INSERT INTO conversation_memberships (workspace_id, conversation_id, actor_id, joined_at)
+  VALUES (NEW.workspace_id, NEW.id, NEW.created_by_actor_id, NEW.created_at)
+  ON CONFLICT DO NOTHING;
+  IF NEW.assigned_actor_id IS NOT NULL THEN
+    INSERT INTO conversation_memberships (workspace_id, conversation_id, actor_id, joined_at)
+    VALUES (NEW.workspace_id, NEW.id, NEW.assigned_actor_id, NEW.created_at)
+    ON CONFLICT DO NOTHING;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+`,
+  },
 ] as const;
 
 export type MigrationClient = Pick<postgres.Sql, "unsafe" | "begin">;

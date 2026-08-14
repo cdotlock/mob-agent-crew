@@ -1,5 +1,5 @@
 import { join } from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   AgentDriverRegistry,
   MockDriver,
@@ -20,6 +20,7 @@ import type { FileWorkspaceStore } from "../../src/storage/index.js";
 
 const {
   materializeGitWorkspace,
+  materializeScratchWorkspace,
   grantAgentWorkspace,
   revokeAgentWorkspace,
   syncRepositoryKnowledge,
@@ -28,6 +29,7 @@ const {
     baseCommit: "a".repeat(40),
     refreshed: true,
   })),
+  materializeScratchWorkspace: vi.fn(async () => ({ created: true })),
   grantAgentWorkspace: vi.fn(async () => undefined),
   revokeAgentWorkspace: vi.fn(async () => undefined),
   syncRepositoryKnowledge: vi.fn(async () => undefined),
@@ -37,6 +39,9 @@ vi.mock("../../src/workspace/materialize.js", () => ({
   controlRepositoryDirectory: (dataDirectory: string, taskId: string) =>
     `${dataDirectory}/control/tasks/${taskId}`,
   materializeGitWorkspace,
+  materializeScratchWorkspace,
+  taskWorkspaceDirectory: (dataDirectory: string, taskId: string) =>
+    `${dataDirectory}/tasks/${taskId}`,
 }));
 vi.mock("../../src/workspace/agent-access.js", async (importOriginal) => ({
   ...await importOriginal<typeof import("../../src/workspace/agent-access.js")>(),
@@ -65,6 +70,10 @@ const MESSAGE_ID = "88888888-8888-4888-8888-888888888888";
 const SESSION_SECRET = "worker-profile-test-secret-longer-than-32-characters";
 const PROFILE_MODEL = "profile-model";
 const now = new Date("2026-08-14T00:00:00.000Z");
+
+beforeEach(() => {
+  vi.clearAllMocks();
+});
 
 describe("Worker Agent profile composition", () => {
   it("uses the claimed Agent profile for each run and protects runtime/provider environment", async () => {
@@ -158,12 +167,76 @@ describe("Worker Agent profile composition", () => {
     expect(input.env).toMatchObject({ MOB_ENVIRONMENT_KIND: "railway" });
     expect(input.metadata).toMatchObject({ capabilityWarnings: [] });
   });
+
+  it("runs repository-free conversations in scratch and keeps the complete named transcript", async () => {
+    let receivedInput: AgentRunInput | undefined;
+    const driver = new MockDriver({
+      delegate: (input) => {
+        receivedInput = input;
+        return { finalMessage: "Direct answer" };
+      },
+    });
+    const claim = leaseClaim();
+    const thread = taskThread();
+    const olderMessages = Array.from({ length: 31 }, (_, index): Message => ({
+      ...thread.messages[0]!,
+      id: `older-${index}`,
+      body: index === 0 ? "OLDEST_CONVERSATION_CONTEXT" : `Earlier message ${index}`,
+      createdAt: new Date(now.getTime() - (31 - index) * 1_000),
+    }));
+    thread.messages = [...olderMessages, ...thread.messages];
+    const store = workerStore(claim, thread, {}, {
+      repositoryId: null,
+      name: null,
+      remoteUrl: null,
+      baseRevision: null,
+      allowlisted: null,
+      enabled: null,
+    }, [{
+      id: HUMAN_ID,
+      workspaceId: WORKSPACE_ID,
+      kind: "human",
+      handle: "clock",
+      displayName: "Clock",
+      status: "active",
+      createdAt: now,
+      updatedAt: now,
+    }]);
+    const worker = new MobWorker({
+      id: claim.workerId,
+      store,
+      files: fileStore(),
+      drivers: new AgentDriverRegistry([driver]),
+      config: workerConfig(),
+    });
+
+    await expect(worker.tick()).resolves.toBe(true);
+
+    const input = receivedInput as AgentRunInput;
+    expect(input.cwd).toBe(`/tmp/mob-worker-profile/tasks/${TASK_ID}`);
+    expect(input.prompt).toContain("No repository is selected for this run");
+    expect(input.prompt).toContain("Clock (@clock): OLDEST_CONVERSATION_CONTEXT");
+    expect(input.prompt).toContain("For multi-step or long-running work, first use mob say once");
+    expect(input.metadata).toMatchObject({ workspaceKind: "scratch", repositoryId: null });
+    expect(materializeScratchWorkspace).toHaveBeenCalledOnce();
+    expect(materializeGitWorkspace).not.toHaveBeenCalled();
+    expect(syncRepositoryKnowledge).not.toHaveBeenCalled();
+  });
 });
 
 function workerStore(
   claim: LeaseClaim,
   thread: TaskThread,
   profileOverrides: Record<string, unknown> = {},
+  repositoryRow: Record<string, unknown> = {
+    repositoryId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    name: "mob-agent-crew",
+    remoteUrl: "https://github.com/cdotlock/mob-agent-crew.git",
+    baseRevision: "main",
+    allowlisted: true,
+    enabled: true,
+  },
+  actors: unknown[] = [],
 ): CollaborationStore {
   let sequence = 0;
   const sql = vi.fn(async (strings: TemplateStringsArray) => {
@@ -193,13 +266,7 @@ function workerStore(
       }];
     }
     if (query.includes("FROM tasks")) {
-      return [{
-        name: "mob-agent-crew",
-        remoteUrl: "https://github.com/cdotlock/mob-agent-crew.git",
-        baseRevision: "main",
-        allowlisted: true,
-        enabled: true,
-      }];
+      return [repositoryRow];
     }
     throw new Error(`Unexpected Worker SQL: ${query}`);
   });
@@ -224,7 +291,13 @@ function workerStore(
     } as RunEvent)),
     completeAttempt: vi.fn(async () => ({ run: completedRun, attempt: completedAttempt })),
     getTaskThread: vi.fn(async () => thread),
-    listActors: vi.fn(async () => []),
+    getConversationThreadForRun: vi.fn(async () => ({
+      conversation: thread.conversations[0]!,
+      members: thread.conversationMemberships,
+      messages: thread.messages,
+      runs: thread.runs,
+    })),
+    listActors: vi.fn(async () => actors),
     createConversationMessage: vi.fn(async (input: { body: string; kind: Message["kind"] }) => ({
       message: {
         id: "99999999-9999-4999-8999-999999999999",
@@ -329,6 +402,8 @@ function taskThread(): TaskThread {
       id: TASK_ID,
       workspaceId: WORKSPACE_ID,
       repositoryId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      executionConversationId: CONVERSATION_ID,
+      isExecution: true,
       createdByActorId: HUMAN_ID,
       assignedActorId: AGENT_ID,
       title: "Profile regression",
@@ -346,6 +421,7 @@ function taskThread(): TaskThread {
       id: CONVERSATION_ID,
       workspaceId: WORKSPACE_ID,
       taskId: TASK_ID,
+      activeRepositoryId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
       kind: "group",
       title: "Profile regression",
       createdByActorId: HUMAN_ID,

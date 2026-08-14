@@ -188,7 +188,9 @@ export function mapTask(row: DbRow): Task {
   return {
     id: stringValue(row, "id"),
     workspaceId: stringValue(row, "workspace_id"),
-    repositoryId: stringValue(row, "repository_id"),
+    repositoryId: nullableString(row, "repository_id"),
+    executionConversationId: nullableString(row, "execution_conversation_id"),
+    isExecution: booleanValue(row, "is_execution"),
     createdByActorId: stringValue(row, "created_by_actor_id"),
     assignedActorId: nullableString(row, "assigned_actor_id"),
     title: stringValue(row, "title"),
@@ -208,7 +210,7 @@ export function mapMessage(row: DbRow, mentions: string[] = []): Message {
   return {
     id: stringValue(row, "id"),
     workspaceId: stringValue(row, "workspace_id"),
-    taskId: stringValue(row, "task_id"),
+    taskId: nullableString(row, "task_id"),
     conversationId: stringValue(row, "conversation_id"),
     actorId: stringValue(row, "actor_id"),
     sourceRunId: nullableString(row, "source_run_id"),
@@ -223,7 +225,8 @@ export function mapConversation(row: DbRow): Conversation {
   return {
     id: stringValue(row, "id"),
     workspaceId: stringValue(row, "workspace_id"),
-    taskId: stringValue(row, "task_id"),
+    taskId: nullableString(row, "task_id"),
+    activeRepositoryId: nullableString(row, "active_repository_id"),
     kind: stringValue(row, "kind") as Conversation["kind"],
     title: nullableString(row, "title"),
     createdByActorId: stringValue(row, "created_by_actor_id"),
@@ -268,6 +271,7 @@ export function mapRun(row: DbRow): Run {
     taskId: stringValue(row, "task_id"),
     conversationId: stringValue(row, "conversation_id"),
     triggerMessageId: nullableString(row, "trigger_message_id"),
+    waitForRunId: nullableString(row, "wait_for_run_id"),
     agentActorId: stringValue(row, "agent_actor_id"),
     requestedByActorId: stringValue(row, "requested_by_actor_id"),
     delegationId: nullableString(row, "delegation_id"),

@@ -75,6 +75,8 @@ const task: Task = {
   id: "task-1",
   workspaceId: workspace.id,
   repositoryId: repository.id,
+  executionConversationId: null,
+  isExecution: false,
   createdByActorId: actor.id,
   assignedActorId: actor.id,
   title: "Build a page",
@@ -125,6 +127,7 @@ const run: Run = {
   taskId: task.id,
   conversationId: task.id,
   triggerMessageId: message.id,
+  waitForRunId: null,
   agentActorId: actor.id,
   requestedByActorId: actor.id,
   delegationId: delegation.id,
@@ -216,6 +219,7 @@ const conversation: Conversation = {
   id: task.id,
   workspaceId: workspace.id,
   taskId: task.id,
+  activeRepositoryId: null,
   kind: "group",
   title: task.title,
   createdByActorId: actor.id,
@@ -245,6 +249,51 @@ const thread: TaskThread = {
 };
 
 describe("FileWorkspaceStore", () => {
+  it("persists a taskless chat under the workspace conversation ledger", async () => {
+    const { dataDir, store } = await createStore();
+    const chat: Conversation = {
+      ...conversation,
+      id: "conversation-free-1",
+      taskId: null,
+      activeRepositoryId: null,
+      isPrimary: false,
+      title: "General chat",
+    };
+    const member = { ...conversationMembership, conversationId: chat.id };
+    const chatMessage: Message = {
+      ...message,
+      id: "message-free-1",
+      taskId: null,
+      conversationId: chat.id,
+      body: "We can chat before choosing a repository.",
+    };
+
+    await store.repairConversationThread({
+      conversation: chat,
+      members: [member],
+      messages: [chatMessage],
+      runs: [],
+    });
+
+    const root = join(
+      dataDir,
+      "state",
+      "workspaces",
+      workspace.id,
+      "conversations",
+      chat.id,
+    );
+    await expect(readFile(join(root, "conversation.json"), "utf8")).resolves.toContain(
+      '"taskId": null',
+    );
+    expect(await store.readConversationThread(workspace.id, chat.id)).toEqual({
+      conversation: chat,
+      members: [member],
+      messages: [chatMessage],
+      runs: [],
+    });
+  });
+
   it("writes every state kind to a deterministic layout and reads it back", async () => {
     const { dataDir, store } = await createStore();
 

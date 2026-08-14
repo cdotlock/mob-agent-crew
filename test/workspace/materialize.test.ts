@@ -8,8 +8,10 @@ import {
   agentGitEnvironment,
   controlGitDirectory,
   materializeGitWorkspace,
+  materializeScratchWorkspace,
   materializedBaseCommitPath,
   readMaterializedBaseCommit,
+  taskWorkspaceDirectory,
 } from "../../src/workspace/materialize.js";
 
 const execFileAsync = promisify(execFile);
@@ -24,6 +26,19 @@ afterEach(async () => {
 });
 
 describe("task workspace materialization", () => {
+  it("creates and preserves a repository-free scratch workspace at the browser-compatible task path", async () => {
+    const root = await mkdtemp(join(tmpdir(), "mob-workspace-scratch-"));
+    directories.push(root);
+    const target = taskWorkspaceDirectory(root, "task-1");
+
+    await expect(materializeScratchWorkspace(target)).resolves.toEqual({ created: true });
+    await writeFile(join(target, "NOTES.md"), "conversation notes\n");
+    await expect(materializeScratchWorkspace(target)).resolves.toEqual({ created: false });
+
+    expect(target).toBe(join(root, "tasks", "task-1"));
+    await expect(readFile(join(target, "NOTES.md"), "utf8")).resolves.toBe("conversation notes\n");
+  });
+
   it("refreshes a clean Agent checkout from a distinct root-only control clone", async () => {
     const setup = await repositoryFixture("clean");
     const first = await materializeGitWorkspace(setup.input);

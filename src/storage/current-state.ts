@@ -10,17 +10,30 @@ export async function writeTaskFileState(
   await files.repairTaskThread(await store.getTaskThread(taskId));
 }
 
+export async function writeConversationFileState(
+  store: CollaborationStore,
+  files: FileWorkspaceStore,
+  conversationId: string,
+): Promise<void> {
+  await files.repairConversationThread(await store.getConversationContext(conversationId));
+}
+
 export async function writeWorkspaceFileState(
   store: CollaborationStore,
   files: FileWorkspaceStore,
   workspace: Workspace,
 ): Promise<void> {
-  const [actors, agentProfiles, repositories, documents, tasks] = await Promise.all([
+  const [actors, agentProfiles, repositories, documents, tasks, conversationRows] = await Promise.all([
     store.listActors(workspace.id),
     store.listAgentProfiles(workspace.id),
     store.listRepositories(workspace.id),
     store.listWorkspaceDocuments(workspace.id),
-    store.listTasks(workspace.id, 500),
+    store.listTasks(workspace.id, 500, true),
+    store.sql<Array<{ id: string }>>`
+      SELECT id FROM conversations
+      WHERE workspace_id = ${workspace.id}
+      ORDER BY created_at, id
+    `,
   ]);
   await files.writeWorkspace(workspace);
   await Promise.all([
@@ -31,5 +44,8 @@ export async function writeWorkspaceFileState(
   ]);
   for (const task of tasks) {
     await writeTaskFileState(store, files, task.id);
+  }
+  for (const conversation of conversationRows) {
+    await writeConversationFileState(store, files, conversation.id);
   }
 }

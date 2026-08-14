@@ -450,6 +450,12 @@ async function createFixture(options: {
     createMessage,
     createConversationMessage,
     getTaskThread: vi.fn(async () => ({})),
+    getConversationContext: vi.fn(async () => ({
+      conversation: { id: CONVERSATION_ID },
+      members: [],
+      messages: [],
+      runs: [],
+    })),
     sql: vi.fn(async () => [{
       task_id: TASK_ID,
       workspace_id: WORKSPACE_ID,
@@ -464,6 +470,7 @@ async function createFixture(options: {
   const files = {
     workspaceRoot: vi.fn(() => workspaceRoot),
     repairTaskThread: vi.fn(async () => ({ root: "", written: 0, paths: [], removed: 0 })),
+    repairConversationThread: vi.fn(async () => ({ root: "", written: 0, paths: [], removed: 0 })),
   } as unknown as FileWorkspaceStore;
   const app = await buildApp({ config: testConfig(dataDir), store, files });
   openApps.push(app);

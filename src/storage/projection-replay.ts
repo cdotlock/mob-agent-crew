@@ -9,6 +9,7 @@ import type {
   Artifact,
   Conversation,
   ConversationMembership,
+  ConversationThread,
   Delegation,
   Message,
   Repository,
@@ -53,6 +54,7 @@ export interface FileWorkspaceSnapshot {
   repositories: Repository[];
   documents: WorkspaceDocument[];
   threads: TaskThread[];
+  conversationThreads: ConversationThread[];
 }
 
 export interface ProjectionReplayIssue {
@@ -209,6 +211,7 @@ export async function loadFileWorkspaceSnapshot(
   const agentActorIds = await regularEntryIds(join(root, "agents"), "", "directory");
   const documentIds = await regularEntryIds(join(root, "documents"), ".json", "file");
   const taskIds = await regularEntryIds(join(root, "tasks"), "", "directory");
+  const conversationIds = await regularEntryIds(join(root, "conversations"), "", "directory");
 
   const actors = await readRequired(actorIds, (id) => files.readActor(workspaceId, id), "actor");
   const repositories = await readRequired(
@@ -231,6 +234,11 @@ export async function loadFileWorkspaceSnapshot(
     (id) => files.readTaskThread(workspaceId, id),
     "task thread",
   );
+  const conversationThreads = await readRequired(
+    conversationIds,
+    (id) => files.readConversationThread(workspaceId, id),
+    "conversation thread",
+  );
 
   return {
     workspace,
@@ -239,11 +247,47 @@ export async function loadFileWorkspaceSnapshot(
     repositories: repositories.sort(compareId),
     documents: documents.sort(compareId),
     threads: threads.sort((left, right) => left.task.id.localeCompare(right.task.id)),
+    conversationThreads: conversationThreads.sort((left, right) =>
+      left.conversation.id.localeCompare(right.conversation.id)),
+  };
+}
+
+function conversationRecords(snapshot: FileWorkspaceSnapshot): {
+  conversations: Conversation[];
+  memberships: ConversationMembership[];
+  messages: Message[];
+} {
+  const conversations = new Map<string, Conversation>();
+  const memberships = new Map<string, ConversationMembership>();
+  const messages = new Map<string, Message>();
+  for (const thread of snapshot.threads) {
+    for (const conversation of thread.conversations) conversations.set(conversation.id, conversation);
+    for (const membership of thread.conversationMemberships) {
+      memberships.set(`${membership.conversationId}:${membership.actorId}`, membership);
+    }
+    for (const message of thread.messages) messages.set(message.id, message);
+  }
+  // Workspace-level files are canonical when the legacy task projection also exists.
+  for (const thread of snapshot.conversationThreads) {
+    conversations.set(thread.conversation.id, thread.conversation);
+    for (const membership of thread.members) {
+      memberships.set(`${membership.conversationId}:${membership.actorId}`, membership);
+    }
+    for (const message of thread.messages) messages.set(message.id, message);
+  }
+  return {
+    conversations: [...conversations.values()].sort(compareId),
+    memberships: [...memberships.values()].sort((left, right) =>
+      left.conversationId === right.conversationId
+        ? left.actorId.localeCompare(right.actorId)
+        : left.conversationId.localeCompare(right.conversationId)),
+    messages: [...messages.values()].sort(compareId),
   };
 }
 
 export function countFileWorkspaceSnapshot(snapshot: FileWorkspaceSnapshot): ProjectionReplayCounts {
-  const messages = snapshot.threads.flatMap((thread) => thread.messages);
+  const records = conversationRecords(snapshot);
+  const messages = records.messages;
   return {
     workspaces: 1,
     actors: snapshot.actors.length,
@@ -251,11 +295,8 @@ export function countFileWorkspaceSnapshot(snapshot: FileWorkspaceSnapshot): Pro
     repositories: snapshot.repositories.length,
     workspace_documents: snapshot.documents.length,
     tasks: snapshot.threads.length,
-    conversations: snapshot.threads.reduce((total, thread) => total + thread.conversations.length, 0),
-    conversation_memberships: snapshot.threads.reduce(
-      (total, thread) => total + thread.conversationMemberships.length,
-      0,
-    ),
+    conversations: records.conversations.length,
+    conversation_memberships: records.memberships.length,
     messages: messages.length,
     message_mentions: messages.reduce((total, message) => total + message.mentions.length, 0),
     delegations: snapshot.threads.reduce((total, thread) => total + thread.delegations.length, 0),
@@ -300,15 +341,14 @@ export function validateFileWorkspaceSnapshot(
   const repositories = indexed(snapshot.repositories, "repositories", issues);
   const documents = indexed(snapshot.documents, "documents", issues);
   const tasks = indexed(snapshot.threads.map((thread) => thread.task), "tasks", issues);
+  const chatRecords = conversationRecords(snapshot);
   const conversations = indexed(
-    snapshot.threads.flatMap((thread) => thread.conversations),
+    chatRecords.conversations,
     "conversations",
     issues,
   );
-  const conversationMemberships = snapshot.threads.flatMap(
-    (thread) => thread.conversationMemberships,
-  );
-  const messages = indexed(snapshot.threads.flatMap((thread) => thread.messages), "messages", issues);
+  const conversationMemberships = chatRecords.memberships;
+  const messages = indexed(chatRecords.messages, "messages", issues);
   const delegations = indexed(
     snapshot.threads.flatMap((thread) => thread.delegations),
     "delegations",
@@ -347,13 +387,33 @@ export function validateFileWorkspaceSnapshot(
     reference(issues, actors, document.uploadedByActorId, `documents/${document.id}.uploadedByActorId`);
   }
   for (const task of tasks.values()) {
-    reference(issues, repositories, task.repositoryId, `tasks/${task.id}.repositoryId`);
+    if (task.repositoryId) {
+      reference(issues, repositories, task.repositoryId, `tasks/${task.id}.repositoryId`);
+    }
     reference(issues, actors, task.createdByActorId, `tasks/${task.id}.createdByActorId`);
     if (task.assignedActorId) reference(issues, actors, task.assignedActorId, `tasks/${task.id}.assignedActorId`);
+    if (task.executionConversationId) {
+      reference(
+        issues,
+        conversations,
+        task.executionConversationId,
+        `tasks/${task.id}.executionConversationId`,
+      );
+    }
   }
   const membershipKeys = new Set<string>();
   for (const conversation of conversations.values()) {
-    reference(issues, tasks, conversation.taskId, `conversations/${conversation.id}.taskId`);
+    if (conversation.taskId) {
+      reference(issues, tasks, conversation.taskId, `conversations/${conversation.id}.taskId`);
+    }
+    if (conversation.activeRepositoryId) {
+      reference(
+        issues,
+        repositories,
+        conversation.activeRepositoryId,
+        `conversations/${conversation.id}.activeRepositoryId`,
+      );
+    }
     reference(
       issues,
       actors,
@@ -387,14 +447,14 @@ export function validateFileWorkspaceSnapshot(
     membershipKeys.add(key);
   }
   for (const message of messages.values()) {
-    reference(issues, tasks, message.taskId, `messages/${message.id}.taskId`);
+    if (message.taskId) reference(issues, tasks, message.taskId, `messages/${message.id}.taskId`);
     const conversation = reference(
       issues,
       conversations,
       message.conversationId,
       `messages/${message.id}.conversationId`,
     );
-    if (conversation && conversation.taskId !== message.taskId) {
+    if (conversation?.taskId && conversation.taskId !== message.taskId) {
       issue(issues, "task_mismatch", `messages/${message.id}.conversationId`, message.conversationId);
     }
     reference(issues, actors, message.actorId, `messages/${message.id}.actorId`);
@@ -421,7 +481,7 @@ export function validateFileWorkspaceSnapshot(
       run.conversationId,
       `runs/${run.id}.conversationId`,
     );
-    if (conversation && conversation.taskId !== run.taskId) {
+    if (conversation?.taskId && conversation.taskId !== run.taskId) {
       issue(issues, "task_mismatch", `runs/${run.id}.conversationId`, run.conversationId);
     }
     if (run.triggerMessageId) {
@@ -434,6 +494,9 @@ export function validateFileWorkspaceSnapshot(
       if (trigger && trigger.conversationId !== run.conversationId) {
         issue(issues, "conversation_mismatch", `runs/${run.id}.triggerMessageId`, run.triggerMessageId);
       }
+    }
+    if (run.waitForRunId) {
+      reference(issues, runs, run.waitForRunId, `runs/${run.id}.waitForRunId`);
     }
     reference(issues, actors, run.agentActorId, `runs/${run.id}.agentActorId`);
     reference(issues, actors, run.requestedByActorId, `runs/${run.id}.requestedByActorId`);
@@ -545,6 +608,7 @@ async function applySnapshot(sql: ReplaySql, snapshot: FileWorkspaceSnapshot): P
     ...row,
     delegation_id: null,
     trigger_message_id: null,
+    wait_for_run_id: null,
   })));
   await updateNullableEdges(sql, "delegations", rows.delegations, [
     ["source_run_id", "uuid"],
@@ -554,6 +618,7 @@ async function applySnapshot(sql: ReplaySql, snapshot: FileWorkspaceSnapshot): P
   await updateNullableEdges(sql, "runs", rows.runs, [
     ["delegation_id", "uuid"],
     ["trigger_message_id", "uuid"],
+    ["wait_for_run_id", "uuid"],
   ]);
 
   await upsertRows(sql, ATTEMPTS, rows.run_attempts);
@@ -583,7 +648,8 @@ interface ReplayRows {
 }
 
 function replayRows(snapshot: FileWorkspaceSnapshot): ReplayRows {
-  const messages = snapshot.threads.flatMap((thread) => thread.messages);
+  const chatRecords = conversationRecords(snapshot);
+  const messages = chatRecords.messages;
   const runs = snapshot.threads.flatMap((thread) => thread.runs);
   const attempts = snapshot.threads.flatMap((thread) => thread.attempts);
   const recoverableRunIds = new Set(
@@ -654,6 +720,8 @@ function replayRows(snapshot: FileWorkspaceSnapshot): ReplayRows {
       id: task.id,
       workspace_id: task.workspaceId,
       repository_id: task.repositoryId,
+      execution_conversation_id: task.executionConversationId,
+      is_execution: task.isExecution,
       created_by_actor_id: task.createdByActorId,
       assigned_actor_id: task.assignedActorId,
       title: task.title,
@@ -667,11 +735,12 @@ function replayRows(snapshot: FileWorkspaceSnapshot): ReplayRows {
       created_at: iso(task.createdAt),
       updated_at: iso(task.updatedAt),
     })),
-    conversations: snapshot.threads.flatMap((thread) => thread.conversations).map(
+    conversations: chatRecords.conversations.map(
       (conversation: Conversation) => ({
         id: conversation.id,
         workspace_id: conversation.workspaceId,
         task_id: conversation.taskId,
+        active_repository_id: conversation.activeRepositoryId,
         kind: conversation.kind,
         title: conversation.title,
         created_by_actor_id: conversation.createdByActorId,
@@ -680,8 +749,7 @@ function replayRows(snapshot: FileWorkspaceSnapshot): ReplayRows {
         updated_at: iso(conversation.updatedAt),
       }),
     ),
-    conversation_memberships: snapshot.threads
-      .flatMap((thread) => thread.conversationMemberships)
+    conversation_memberships: chatRecords.memberships
       .map((membership: ConversationMembership) => ({
         workspace_id: membership.workspaceId,
         conversation_id: membership.conversationId,
@@ -727,6 +795,7 @@ function replayRows(snapshot: FileWorkspaceSnapshot): ReplayRows {
       task_id: run.taskId,
       conversation_id: run.conversationId,
       trigger_message_id: run.triggerMessageId,
+      wait_for_run_id: run.waitForRunId ?? null,
       agent_actor_id: run.agentActorId,
       requested_by_actor_id: run.requestedByActorId,
       delegation_id: run.delegationId,
@@ -832,13 +901,13 @@ const ACTORS = spec("actors", "id uuid, workspace_id uuid, kind text, handle tex
 const AGENT_PROFILES = spec("agent_profiles", "actor_id uuid, workspace_id uuid, owner_actor_id uuid, driver text, home text, role text, model_id text, skill_refs jsonb, plugin_refs jsonb, environment jsonb, capabilities jsonb, max_concurrent_runs integer, created_at timestamptz, updated_at timestamptz", ["actor_id"], ["workspace_id"]);
 const REPOSITORIES = spec("repositories", "id uuid, workspace_id uuid, name text, kind text, remote_url text, local_path text, default_branch text, allowlisted boolean, enabled boolean, created_by_actor_id uuid, created_at timestamptz, updated_at timestamptz", ["id"], ["workspace_id"]);
 const DOCUMENTS = spec("workspace_documents", "id uuid, workspace_id uuid, name text, content text, local_path text, source text, uploaded_by_actor_id uuid, created_at timestamptz, updated_at timestamptz", ["id"], ["workspace_id"]);
-const TASKS = spec("tasks", "id uuid, workspace_id uuid, repository_id uuid, created_by_actor_id uuid, assigned_actor_id uuid, title text, description text, base_revision text, branch_name text, status text, max_delegation_depth integer, run_budget integer, writer_fence bigint, created_at timestamptz, updated_at timestamptz", ["id"], ["workspace_id"], { writer_fence: "GREATEST(tasks.writer_fence, EXCLUDED.writer_fence)" });
-const CONVERSATIONS = spec("conversations", "id uuid, workspace_id uuid, task_id uuid, kind text, title text, created_by_actor_id uuid, is_primary boolean, created_at timestamptz, updated_at timestamptz", ["id"], ["workspace_id", "task_id"]);
+const TASKS = spec("tasks", "id uuid, workspace_id uuid, repository_id uuid, execution_conversation_id uuid, is_execution boolean, created_by_actor_id uuid, assigned_actor_id uuid, title text, description text, base_revision text, branch_name text, status text, max_delegation_depth integer, run_budget integer, writer_fence bigint, created_at timestamptz, updated_at timestamptz", ["id"], ["workspace_id"], { writer_fence: "GREATEST(tasks.writer_fence, EXCLUDED.writer_fence)" });
+const CONVERSATIONS = spec("conversations", "id uuid, workspace_id uuid, task_id uuid, active_repository_id uuid, kind text, title text, created_by_actor_id uuid, is_primary boolean, created_at timestamptz, updated_at timestamptz", ["id"], ["workspace_id"]);
 const CONVERSATION_MEMBERSHIPS = spec("conversation_memberships", "workspace_id uuid, conversation_id uuid, actor_id uuid, joined_at timestamptz", ["conversation_id", "actor_id"], [], {}, true);
 const MESSAGES = spec("messages", "id uuid, workspace_id uuid, task_id uuid, conversation_id uuid, actor_id uuid, source_run_id uuid, kind text, body text, created_at timestamptz", ["id"], ["workspace_id", "task_id", "conversation_id"]);
 const MENTIONS = spec("message_mentions", "workspace_id uuid, message_id uuid, actor_id uuid, created_at timestamptz", ["message_id", "actor_id"], [], {}, true);
 const DELEGATIONS = spec("delegations", "id uuid, workspace_id uuid, task_id uuid, from_actor_id uuid, to_agent_actor_id uuid, source_run_id uuid, parent_delegation_id uuid, intent text, deliverable text, depth integer, status text, created_at timestamptz, updated_at timestamptz, completed_at timestamptz", ["id"], ["workspace_id", "task_id"]);
-const RUNS = spec("runs", "id uuid, workspace_id uuid, task_id uuid, conversation_id uuid, trigger_message_id uuid, agent_actor_id uuid, requested_by_actor_id uuid, delegation_id uuid, status text, priority integer, writer_required boolean, latest_attempt_number integer, created_at timestamptz, updated_at timestamptz, completed_at timestamptz", ["id"], ["workspace_id", "task_id", "conversation_id", "status", "completed_at"]);
+const RUNS = spec("runs", "id uuid, workspace_id uuid, task_id uuid, conversation_id uuid, trigger_message_id uuid, wait_for_run_id uuid, agent_actor_id uuid, requested_by_actor_id uuid, delegation_id uuid, status text, priority integer, writer_required boolean, latest_attempt_number integer, created_at timestamptz, updated_at timestamptz, completed_at timestamptz", ["id"], ["workspace_id", "task_id", "conversation_id", "status", "completed_at"]);
 const ATTEMPTS = spec("run_attempts", "id uuid, workspace_id uuid, task_id uuid, run_id uuid, attempt_number integer, status text, worker_id text, lease_token uuid, fence bigint, writer_fence bigint, lease_expires_at timestamptz, started_at timestamptz, completed_at timestamptz, failure_code text, failure_message text, created_at timestamptz, updated_at timestamptz", ["id"], ["workspace_id", "task_id", "run_id", "status", "worker_id", "lease_token", "fence", "writer_fence", "lease_expires_at", "started_at", "completed_at", "failure_code", "failure_message"]);
 const EVENTS = spec("run_events", "id uuid, workspace_id uuid, task_id uuid, run_id uuid, attempt_id uuid, sequence integer, type text, payload jsonb, created_at timestamptz", ["id"], ["workspace_id", "task_id", "run_id", "attempt_id"]);
 const ARTIFACTS = spec("artifacts", "id uuid, workspace_id uuid, task_id uuid, actor_id uuid, source_run_id uuid, source_attempt_id uuid, kind text, name text, uri text, media_type text, byte_size bigint, sha256 text, metadata jsonb, created_at timestamptz", ["id"], ["workspace_id", "task_id"]);

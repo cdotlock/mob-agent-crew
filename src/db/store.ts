@@ -113,6 +113,7 @@ export interface QueueRunInput {
   taskId: string;
   conversationId?: string;
   triggerMessageId?: string | null;
+  waitForRunId?: string | null;
   agentActorId: string;
   requestedByActorId: string;
   delegationId?: string | null;
@@ -145,10 +146,11 @@ async function insertQueuedRun(
   const runRows = await sql<DbRow[]>`
     INSERT INTO runs (
       id, workspace_id, task_id, agent_actor_id, requested_by_actor_id,
-      conversation_id, trigger_message_id, delegation_id, priority, writer_required
+      conversation_id, trigger_message_id, wait_for_run_id, delegation_id, priority, writer_required
     ) VALUES (
       ${runId}, ${input.workspaceId}, ${input.taskId}, ${input.agentActorId},
       ${input.requestedByActorId}, ${conversationId}, ${input.triggerMessageId ?? null},
+      ${input.waitForRunId ?? null},
       ${delegationId}, ${priority}, ${writerRequired}
     )
     RETURNING *
@@ -162,6 +164,62 @@ async function insertQueuedRun(
     RETURNING *
   `;
   return { run: mapRun(one(runRows, "Run")), attempt: mapRunAttempt(one(attemptRows, "Run attempt")) };
+}
+
+async function executionTaskForConversation(
+  sql: QueryClient,
+  input: {
+    conversation: Conversation;
+    repositoryId: string | null;
+    requestedByActorId: string;
+    assignedActorId: string;
+  },
+): Promise<Task> {
+  const reusableRows = await sql<DbRow[]>`
+    SELECT t.*
+    FROM tasks t
+    WHERE t.workspace_id = ${input.conversation.workspaceId}
+      AND t.execution_conversation_id = ${input.conversation.id}
+      AND t.repository_id IS NOT DISTINCT FROM ${input.repositoryId}
+      AND t.status NOT IN ('completed', 'cancelled')
+      AND (SELECT count(*) FROM runs r WHERE r.task_id = t.id) < t.run_budget
+    ORDER BY t.created_at DESC, t.id DESC
+    LIMIT 1
+    FOR UPDATE OF t
+  `;
+  const reusable = optionalOne(reusableRows);
+  if (reusable) return mapTask(reusable);
+
+  let baseRevision = "workspace";
+  if (input.repositoryId) {
+    const repositoryRows = await sql<DbRow[]>`
+      SELECT * FROM repositories
+      WHERE id = ${input.repositoryId}
+        AND workspace_id = ${input.conversation.workspaceId}
+      FOR SHARE
+    `;
+    const repository = mapRepository(one(repositoryRows, "Repository"));
+    if (!repository.allowlisted || !repository.enabled) {
+      throw new StoreError("repository_not_allowlisted", "Repository is not enabled on the workspace allowlist.");
+    }
+    baseRevision = repository.defaultBranch;
+  }
+
+  const title = input.conversation.title?.trim() || `Conversation ${input.conversation.id.slice(0, 8)}`;
+  const taskRows = await sql<DbRow[]>`
+    INSERT INTO tasks (
+      id, workspace_id, repository_id, execution_conversation_id, is_execution,
+      created_by_actor_id, assigned_actor_id, title, description, base_revision,
+      max_delegation_depth, run_budget
+    ) VALUES (
+      ${randomUUID()}, ${input.conversation.workspaceId}, ${input.repositoryId},
+      ${input.conversation.id}, true, ${input.requestedByActorId}, ${input.assignedActorId},
+      ${title}, ${`Execution context for conversation ${input.conversation.id}.`},
+      ${baseRevision}, 2, 8
+    )
+    RETURNING *
+  `;
+  return mapTask(one(taskRows, "Execution task"));
 }
 
 export interface BootstrapWorkspaceInput {
@@ -271,11 +329,20 @@ export interface CreateMessageInput {
 export interface CreateMessageResult {
   message: Message;
   queuedRuns: Run[];
+  deliveries: MessageDelivery[];
+}
+
+export interface MessageDelivery {
+  agentActorId: string;
+  runId: string;
+  action: "queued_run" | "steer" | "queued_follow_up";
+  warning?: string;
 }
 
 export interface CreateConversationInput {
   workspaceId: string;
-  taskId: string;
+  taskId?: string | null;
+  activeRepositoryId?: string | null;
   createdByActorId: string;
   kind: ConversationKind;
   title?: string | null;
@@ -295,6 +362,17 @@ export interface CreateConversationMessageInput {
   kind?: MessageKind;
   sourceRunId?: string | null;
   invokeAgentActorId?: string | null;
+  invokeAgentActorIds?: readonly string[];
+  repositoryId?: string | null;
+  writerRequired?: boolean;
+}
+
+export interface QueueConversationFollowUpInput {
+  conversationId: string;
+  messageId: string;
+  predecessorRunId: string;
+  agentActorId: string;
+  requestedByActorId: string;
   writerRequired?: boolean;
 }
 
@@ -559,6 +637,15 @@ export class CollaborationStore {
     return rows.map(mapRepository);
   }
 
+  async getRepository(repositoryId: string, workspaceId: string): Promise<Repository | null> {
+    const rows = await this.sql<DbRow[]>`
+      SELECT * FROM repositories
+      WHERE id = ${repositoryId} AND workspace_id = ${workspaceId}
+    `;
+    const row = optionalOne(rows);
+    return row === undefined ? null : mapRepository(row);
+  }
+
   async createRepositoryImport(
     workspaceId: string,
     requestedByActorId: string,
@@ -688,10 +775,11 @@ export class CollaborationStore {
     return row === undefined ? null : mapTask(row);
   }
 
-  async listTasks(workspaceId: string, limit = 100): Promise<Task[]> {
+  async listTasks(workspaceId: string, limit = 100, includeExecution = false): Promise<Task[]> {
     const rows = await this.sql<DbRow[]>`
       SELECT * FROM tasks
       WHERE workspace_id = ${workspaceId}
+        AND (${includeExecution} OR NOT is_execution)
       ORDER BY updated_at DESC, id DESC
       LIMIT ${Math.max(1, Math.min(limit, 500))}
     `;
@@ -708,32 +796,34 @@ export class CollaborationStore {
     }
     const title = input.title?.trim() || null;
     return this.sql.begin(async (tx) => {
-      const taskRows = await tx<DbRow[]>`
-        SELECT * FROM tasks
-        WHERE id = ${input.taskId} AND workspace_id = ${input.workspaceId}
-        FOR SHARE
-      `;
-      one(taskRows, "Task");
-      const memberActors: Actor[] = [];
-      for (const actorId of memberActorIds) {
-        memberActors.push(await requireActor(tx, input.workspaceId, actorId));
+      if (input.taskId) {
+        const taskRows = await tx<DbRow[]>`
+          SELECT * FROM tasks
+          WHERE id = ${input.taskId} AND workspace_id = ${input.workspaceId}
+          FOR SHARE
+        `;
+        one(taskRows, "Task");
       }
-      if (
-        input.kind === "direct" &&
-        (memberActors.filter((actor) => actor.kind === "human").length !== 1 ||
-          memberActors.filter((actor) => actor.kind === "agent").length !== 1)
-      ) {
-        throw new StoreError(
-          "direct_human_agent_required",
-          "A direct conversation requires exactly one human and one Agent.",
-        );
+      if (input.activeRepositoryId) {
+        const repositoryRows = await tx<DbRow[]>`
+          SELECT * FROM repositories
+          WHERE id = ${input.activeRepositoryId} AND workspace_id = ${input.workspaceId}
+          FOR SHARE
+        `;
+        const repository = mapRepository(one(repositoryRows, "Repository"));
+        if (!repository.allowlisted || !repository.enabled) {
+          throw new StoreError("repository_not_allowlisted", "Repository is not enabled on the workspace allowlist.");
+        }
+      }
+      for (const actorId of memberActorIds) {
+        await requireActor(tx, input.workspaceId, actorId);
       }
       const conversationRows = await tx<DbRow[]>`
         INSERT INTO conversations (
-          id, workspace_id, task_id, kind, title, created_by_actor_id
+          id, workspace_id, task_id, active_repository_id, kind, title, created_by_actor_id
         ) VALUES (
-          ${randomUUID()}, ${input.workspaceId}, ${input.taskId}, ${input.kind},
-          ${title}, ${input.createdByActorId}
+          ${randomUUID()}, ${input.workspaceId}, ${input.taskId ?? null},
+          ${input.activeRepositoryId ?? null}, ${input.kind}, ${title}, ${input.createdByActorId}
         )
         RETURNING *
       `;
@@ -748,6 +838,65 @@ export class CollaborationStore {
         members.push(mapConversationMembership(one(membershipRows, "Conversation membership")));
       }
       return { conversation, members, messages: [], runs: [] };
+    });
+  }
+
+  async updateConversationActiveRepository(
+    conversationId: string,
+    workspaceId: string,
+    repositoryId: string | null,
+  ): Promise<Conversation> {
+    return this.sql.begin(async (tx) => {
+      if (repositoryId) {
+        const repositoryRows = await tx<DbRow[]>`
+          SELECT * FROM repositories
+          WHERE id = ${repositoryId} AND workspace_id = ${workspaceId}
+          FOR SHARE
+        `;
+        const repository = mapRepository(one(repositoryRows, "Repository"));
+        if (!repository.allowlisted || !repository.enabled) {
+          throw new StoreError("repository_not_allowlisted", "Repository is not enabled on the workspace allowlist.");
+        }
+      }
+      const rows = await tx<DbRow[]>`
+        UPDATE conversations
+        SET active_repository_id = ${repositoryId}, updated_at = now()
+        WHERE id = ${conversationId} AND workspace_id = ${workspaceId}
+        RETURNING *
+      `;
+      return mapConversation(one(rows, "Conversation"));
+    });
+  }
+
+  async addConversationMembers(
+    conversationId: string,
+    workspaceId: string,
+    actorIds: readonly string[],
+  ): Promise<ConversationMembership[]> {
+    return this.sql.begin(async (tx) => {
+      const conversationRows = await tx<DbRow[]>`
+        SELECT * FROM conversations
+        WHERE id = ${conversationId} AND workspace_id = ${workspaceId}
+        FOR UPDATE
+      `;
+      const conversation = mapConversation(one(conversationRows, "Conversation"));
+      const uniqueActorIds = [...new Set(actorIds)];
+      if (conversation.kind === "direct" && uniqueActorIds.length > 0) {
+        throw new StoreError("direct_members_fixed", "Direct conversation membership is fixed.");
+      }
+      const memberships: ConversationMembership[] = [];
+      for (const actorId of uniqueActorIds) {
+        await requireActor(tx, workspaceId, actorId);
+        const rows = await tx<DbRow[]>`
+          INSERT INTO conversation_memberships (workspace_id, conversation_id, actor_id)
+          VALUES (${workspaceId}, ${conversation.id}, ${actorId})
+          ON CONFLICT (conversation_id, actor_id) DO UPDATE
+          SET joined_at = conversation_memberships.joined_at
+          RETURNING *
+        `;
+        memberships.push(mapConversationMembership(one(rows, "Conversation membership")));
+      }
+      return memberships;
     });
   }
 
@@ -791,17 +940,31 @@ export class CollaborationStore {
          AND a.status = 'active'
         WHERE t.id = ${taskId}
           AND t.workspace_id = ${workspaceId}
-          AND NOT EXISTS (
-            SELECT 1
-            FROM conversations private_conversation
-            WHERE private_conversation.task_id = t.id
-              AND NOT private_conversation.is_primary
+          AND (
+            (
+              t.is_execution
+              AND t.execution_conversation_id IS NOT NULL
+              AND EXISTS (
+                SELECT 1 FROM conversation_memberships execution_member
+                WHERE execution_member.conversation_id = t.execution_conversation_id
+                  AND execution_member.actor_id = a.id
+              )
+            )
+            OR (
+              NOT t.is_execution
               AND NOT EXISTS (
                 SELECT 1
-                FROM conversation_memberships mine
-                WHERE mine.conversation_id = private_conversation.id
-                  AND mine.actor_id = a.id
+                FROM conversations private_conversation
+                WHERE private_conversation.task_id = t.id
+                  AND NOT private_conversation.is_primary
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM conversation_memberships mine
+                    WHERE mine.conversation_id = private_conversation.id
+                      AND mine.actor_id = a.id
+                  )
               )
+            )
           )
       ) AS allowed
     `;
@@ -903,6 +1066,55 @@ export class CollaborationStore {
         runs: runRows.map(mapRun),
       };
     });
+  }
+
+  /** Internal/file-ledger view after the caller has performed authorization. */
+  async getConversationContext(conversationId: string): Promise<ConversationThread> {
+    return this.sql.begin(async (tx) => {
+      const conversationRows = await tx<DbRow[]>`
+        SELECT * FROM conversations WHERE id = ${conversationId}
+      `;
+      const conversation = mapConversation(one(conversationRows, "Conversation"));
+      const [membershipRows, messageRows, runRows] = await Promise.all([
+        tx<DbRow[]>`
+          SELECT * FROM conversation_memberships
+          WHERE conversation_id = ${conversation.id}
+          ORDER BY joined_at, actor_id
+        `,
+        tx<DbRow[]>`
+          SELECT m.*, COALESCE(array_agg(mm.actor_id ORDER BY mm.actor_id)
+            FILTER (WHERE mm.actor_id IS NOT NULL), '{}') AS mention_actor_ids
+          FROM messages m
+          LEFT JOIN message_mentions mm ON mm.message_id = m.id
+          WHERE m.conversation_id = ${conversation.id}
+          GROUP BY m.id
+          ORDER BY m.created_at, m.id
+        `,
+        tx<DbRow[]>`
+          SELECT * FROM runs
+          WHERE conversation_id = ${conversation.id}
+          ORDER BY created_at, id
+        `,
+      ]);
+      return {
+        conversation,
+        members: membershipRows.map(mapConversationMembership),
+        messages: messageRows.map((row) => {
+          const raw = row.mention_actor_ids;
+          return mapMessage(row, Array.isArray(raw) ? raw.map(String) : []);
+        }),
+        runs: runRows.map(mapRun),
+      };
+    });
+  }
+
+  async getConversationThreadForRun(runId: string): Promise<ConversationThread> {
+    const rows = await this.sql<Array<{ conversation_id: string }>>`
+      SELECT conversation_id FROM runs WHERE id = ${runId}
+    `;
+    const row = rows[0];
+    if (!row) throw new StoreError("not_found", "Run was not found.");
+    return this.getConversationContext(row.conversation_id);
   }
 
   async getTaskThread(taskId: string): Promise<TaskThread> {
@@ -1146,6 +1358,11 @@ export class CollaborationStore {
       return {
         message: mapMessage(messageRow, mentionedActors.map((actor) => actor.id)),
         queuedRuns,
+        deliveries: queuedRuns.map((run) => ({
+          agentActorId: run.agentActorId,
+          runId: run.id,
+          action: "queued_run" as const,
+        })),
       };
     });
   }
@@ -1153,22 +1370,302 @@ export class CollaborationStore {
   async createConversationMessage(
     input: CreateConversationMessageInput,
   ): Promise<CreateMessageResult> {
-    const conversationRows = await this.sql<DbRow[]>`
-      SELECT * FROM conversations WHERE id = ${input.conversationId}
-    `;
-    const conversation = mapConversation(one(conversationRows, "Conversation"));
-    return this.createMessage({
-      taskId: conversation.taskId,
-      conversationId: conversation.id,
-      actorId: input.actorId,
-      body: input.body,
-      ...(input.kind ? { kind: input.kind } : {}),
-      ...(input.sourceRunId !== undefined ? { sourceRunId: input.sourceRunId } : {}),
-      enqueueMentionedAgents: false,
-      ...(input.invokeAgentActorId !== undefined
-        ? { invokeAgentActorId: input.invokeAgentActorId }
-        : {}),
-      ...(input.writerRequired !== undefined ? { writerRequired: input.writerRequired } : {}),
+    if (input.body.trim().length === 0) {
+      throw new DomainRuleError("message_body_required", "Message body is required.");
+    }
+    return this.sql.begin(async (tx) => {
+      const conversationRows = await tx<DbRow[]>`
+        SELECT * FROM conversations WHERE id = ${input.conversationId} FOR UPDATE
+      `;
+      let conversation = mapConversation(one(conversationRows, "Conversation"));
+      await requireActor(tx, conversation.workspaceId, input.actorId);
+
+      let sourceRun: Run | null = null;
+      if (input.sourceRunId) {
+        const sourceRunRows = await tx<DbRow[]>`
+          SELECT * FROM runs
+          WHERE id = ${input.sourceRunId}
+            AND conversation_id = ${conversation.id}
+            AND agent_actor_id = ${input.actorId}
+          FOR SHARE
+        `;
+        sourceRun = mapRun(one(sourceRunRows, "Source run"));
+      } else {
+        const memberRows = await tx<DbRow[]>`
+          SELECT * FROM conversation_memberships
+          WHERE conversation_id = ${conversation.id} AND actor_id = ${input.actorId}
+        `;
+        if (memberRows.length === 0 && !conversation.isPrimary) {
+          throw new StoreError("conversation_membership_required", "You are not a member of this conversation.");
+        }
+      }
+
+      if (input.repositoryId !== undefined) {
+        if (input.repositoryId !== null) {
+          const repositoryRows = await tx<DbRow[]>`
+            SELECT * FROM repositories
+            WHERE id = ${input.repositoryId} AND workspace_id = ${conversation.workspaceId}
+            FOR SHARE
+          `;
+          const repository = mapRepository(one(repositoryRows, "Repository"));
+          if (!repository.allowlisted || !repository.enabled) {
+            throw new StoreError("repository_not_allowlisted", "Repository is not enabled on the workspace allowlist.");
+          }
+        }
+        const updatedRows = await tx<DbRow[]>`
+          UPDATE conversations
+          SET active_repository_id = ${input.repositoryId}, updated_at = now()
+          WHERE id = ${conversation.id}
+          RETURNING *
+        `;
+        conversation = mapConversation(one(updatedRows, "Conversation"));
+      }
+
+      const handles = extractMentionHandles(input.body);
+      const mentionedActors: Actor[] = [];
+      if (handles.length > 0) {
+        const actorRows = await tx<DbRow[]>`
+          SELECT * FROM actors
+          WHERE workspace_id = ${conversation.workspaceId}
+            AND status = 'active'
+            AND handle = ANY(${tx.array(handles)})
+        `;
+        mentionedActors.push(...actorRows.map(mapActor));
+        const found = new Set(mentionedActors.map((actor) => actor.handle));
+        const unknown = handles.filter((handle) => !found.has(handle));
+        if (unknown.length > 0) {
+          throw new StoreError("unknown_mention", `Unknown or disabled actor mention: @${unknown.join(", @")}.`);
+        }
+        if (!conversation.isPrimary) {
+          const memberRows = await tx<Array<{ actor_id: string }>>`
+            SELECT actor_id FROM conversation_memberships
+            WHERE conversation_id = ${conversation.id}
+              AND actor_id = ANY(${tx.array(mentionedActors.map((actor) => actor.id))}::uuid[])
+          `;
+          const memberIds = new Set(memberRows.map((row) => row.actor_id));
+          const outside = mentionedActors.filter((actor) => !memberIds.has(actor.id));
+          if (outside.length > 0) {
+            throw new StoreError(
+              "conversation_member_required",
+              `Mentioned actor is not in this conversation: @${outside.map((actor) => actor.handle).join(", @")}.`,
+            );
+          }
+        }
+      }
+
+      const messageRows = await tx<DbRow[]>`
+        INSERT INTO messages (
+          id, workspace_id, task_id, conversation_id, actor_id, source_run_id, kind, body
+        ) VALUES (
+          ${randomUUID()}, ${conversation.workspaceId}, ${sourceRun?.taskId ?? conversation.taskId},
+          ${conversation.id}, ${input.actorId}, ${input.sourceRunId ?? null},
+          ${input.kind ?? 'comment'}, ${input.body}
+        )
+        RETURNING *
+      `;
+      const messageRow = one(messageRows, "Message");
+      for (const mentioned of mentionedActors) {
+        await tx`
+          INSERT INTO message_mentions (workspace_id, message_id, actor_id)
+          VALUES (${conversation.workspaceId}, ${String(messageRow.id)}, ${mentioned.id})
+        `;
+      }
+
+      const requestedAgentIds = [...new Set([
+        ...(input.invokeAgentActorIds ?? []),
+        ...(input.invokeAgentActorId ? [input.invokeAgentActorId] : []),
+      ])];
+      if (sourceRun && requestedAgentIds.length > 0) {
+        throw new StoreError(
+          "explicit_delegation_required",
+          "Agents must delegate explicitly instead of waking another Agent through chat.",
+        );
+      }
+
+      const queuedRuns: Run[] = [];
+      const deliveries: MessageDelivery[] = [];
+      for (const agentId of requestedAgentIds) {
+        const agent = await requireActor(tx, conversation.workspaceId, agentId);
+        if (agent.kind !== "agent") {
+          throw new StoreError("agent_required", "Conversation invocation requires an Agent member.");
+        }
+        const membershipRows = await tx<DbRow[]>`
+          SELECT * FROM conversation_memberships
+          WHERE conversation_id = ${conversation.id} AND actor_id = ${agent.id}
+        `;
+        if (membershipRows.length === 0) {
+          if (!conversation.isPrimary) {
+            throw new StoreError("conversation_member_required", "Invoked Agent is not a member of this conversation.");
+          }
+          await tx`
+            INSERT INTO conversation_memberships (workspace_id, conversation_id, actor_id)
+            VALUES (${conversation.workspaceId}, ${conversation.id}, ${agent.id})
+            ON CONFLICT DO NOTHING
+          `;
+        }
+
+        const activeRows = await tx<DbRow[]>`
+          SELECT * FROM runs
+          WHERE conversation_id = ${conversation.id}
+            AND agent_actor_id = ${agent.id}
+            AND status IN ('queued', 'running')
+          ORDER BY CASE status WHEN 'running' THEN 0 ELSE 1 END, created_at DESC
+          LIMIT 1
+          FOR UPDATE
+        `;
+        const activeRow = optionalOne(activeRows);
+        if (activeRow) {
+          const active = mapRun(activeRow);
+          deliveries.push({
+            agentActorId: agent.id,
+            runId: active.id,
+            action: active.status === "running" ? "steer" : "queued_follow_up",
+            ...(active.status === "queued"
+              ? { warning: "The Agent is already queued; this message remains in the conversation context." }
+              : {}),
+          });
+          continue;
+        }
+
+        const effectiveRepositoryId = conversation.activeRepositoryId ?? null;
+        let task: Task | null = null;
+        if (conversation.taskId) {
+          const legacyRows = await tx<DbRow[]>`
+            SELECT * FROM tasks WHERE id = ${conversation.taskId} FOR UPDATE
+          `;
+          const legacyRow = optionalOne(legacyRows);
+          if (legacyRow) {
+            const legacy = mapTask(legacyRow);
+            const runCountRows = await tx<Array<{ count: string }>>`
+              SELECT count(*)::text AS count FROM runs WHERE task_id = ${legacy.id}
+            `;
+            const requestedRepositoryId = effectiveRepositoryId ?? legacy.repositoryId;
+            if (
+              legacy.status !== "completed" && legacy.status !== "cancelled" &&
+              legacy.repositoryId === requestedRepositoryId &&
+              Number(runCountRows[0]?.count ?? "0") < legacy.runBudget
+            ) {
+              task = legacy;
+            }
+          }
+        }
+        task ??= await executionTaskForConversation(tx, {
+          conversation,
+          repositoryId: effectiveRepositoryId,
+          requestedByActorId: input.actorId,
+          assignedActorId: agent.id,
+        });
+
+        const queued = await insertQueuedRun(tx, {
+          workspaceId: conversation.workspaceId,
+          taskId: task.id,
+          conversationId: conversation.id,
+          triggerMessageId: String(messageRow.id),
+          agentActorId: agent.id,
+          requestedByActorId: input.actorId,
+          writerRequired: task.repositoryId !== null && (input.writerRequired ?? true),
+        });
+        queuedRuns.push(queued.run);
+        deliveries.push({ agentActorId: agent.id, runId: queued.run.id, action: "queued_run" });
+        if (task.status !== "active") {
+          await tx`UPDATE tasks SET status = 'active', updated_at = now() WHERE id = ${task.id}`;
+        }
+      }
+
+      await tx`UPDATE conversations SET updated_at = now() WHERE id = ${conversation.id}`;
+      return {
+        message: mapMessage(messageRow, mentionedActors.map((actor) => actor.id)),
+        queuedRuns,
+        deliveries,
+      };
+    });
+  }
+
+  async queueConversationFollowUp(
+    input: QueueConversationFollowUpInput,
+  ): Promise<{ run: Run; attempt: RunAttempt }> {
+    return this.sql.begin(async (tx) => {
+      const conversationRows = await tx<DbRow[]>`
+        SELECT * FROM conversations WHERE id = ${input.conversationId} FOR UPDATE
+      `;
+      const conversation = mapConversation(one(conversationRows, "Conversation"));
+      const agent = await requireActor(tx, conversation.workspaceId, input.agentActorId);
+      await requireActor(tx, conversation.workspaceId, input.requestedByActorId);
+      if (agent.kind !== "agent") throw new StoreError("agent_required", "Run recipient must be an Agent.");
+
+      const messageRows = await tx<DbRow[]>`
+        SELECT * FROM messages
+        WHERE id = ${input.messageId} AND conversation_id = ${conversation.id}
+        FOR SHARE
+      `;
+      one(messageRows, "Trigger message");
+      const predecessorRows = await tx<DbRow[]>`
+        SELECT * FROM runs
+        WHERE id = ${input.predecessorRunId}
+          AND conversation_id = ${conversation.id}
+          AND agent_actor_id = ${agent.id}
+        FOR UPDATE
+      `;
+      const predecessor = mapRun(one(predecessorRows, "Predecessor run"));
+      const existingRows = await tx<DbRow[]>`
+        SELECT * FROM runs
+        WHERE trigger_message_id = ${input.messageId}
+          AND agent_actor_id = ${agent.id}
+          AND wait_for_run_id = ${predecessor.id}
+        LIMIT 1
+      `;
+      const existing = optionalOne(existingRows);
+      if (existing) {
+        const run = mapRun(existing);
+        const attemptRows = await tx<DbRow[]>`
+          SELECT * FROM run_attempts WHERE run_id = ${run.id} ORDER BY attempt_number DESC LIMIT 1
+        `;
+        return { run, attempt: mapRunAttempt(one(attemptRows, "Run attempt")) };
+      }
+
+      let task: Task | null = null;
+      let effectiveRepositoryId = conversation.activeRepositoryId;
+      const predecessorTaskRows = await tx<DbRow[]>`
+        SELECT * FROM tasks WHERE id = ${predecessor.taskId} FOR UPDATE
+      `;
+      const predecessorTaskRow = optionalOne(predecessorTaskRows);
+      if (predecessorTaskRow) {
+        const candidate = mapTask(predecessorTaskRow);
+        effectiveRepositoryId ??= candidate.repositoryId;
+        const runCountRows = await tx<Array<{ count: string }>>`
+          SELECT count(*)::text AS count FROM runs WHERE task_id = ${candidate.id}
+        `;
+        if (
+          candidate.status !== "completed" && candidate.status !== "cancelled" &&
+          candidate.repositoryId === effectiveRepositoryId &&
+          Number(runCountRows[0]?.count ?? "0") < candidate.runBudget
+        ) {
+          task = candidate;
+        }
+      }
+      task ??= await executionTaskForConversation(tx, {
+        conversation,
+        repositoryId: effectiveRepositoryId,
+        requestedByActorId: input.requestedByActorId,
+        assignedActorId: agent.id,
+      });
+      const waitForRunId = predecessor.status === "queued" || predecessor.status === "running"
+        ? predecessor.id
+        : null;
+      const queued = await insertQueuedRun(tx, {
+        workspaceId: conversation.workspaceId,
+        taskId: task.id,
+        conversationId: conversation.id,
+        triggerMessageId: input.messageId,
+        waitForRunId,
+        agentActorId: agent.id,
+        requestedByActorId: input.requestedByActorId,
+        writerRequired: task.repositoryId !== null && (input.writerRequired ?? true),
+      });
+      if (task.status !== "active") {
+        await tx`UPDATE tasks SET status = 'active', updated_at = now() WHERE id = ${task.id}`;
+      }
+      return queued;
     });
   }
 
@@ -1355,6 +1852,14 @@ export class CollaborationStore {
         LEFT JOIN task_writer_leases wl
           ON wl.task_id = a.task_id AND wl.expires_at > ${now}
         WHERE r.status IN ('queued', 'running')
+          AND (
+            r.wait_for_run_id IS NULL
+            OR EXISTS (
+              SELECT 1 FROM runs predecessor
+              WHERE predecessor.id = r.wait_for_run_id
+                AND predecessor.status IN ('succeeded', 'failed', 'cancelled')
+            )
+          )
           AND (
             a.status = 'queued'
             OR (a.status IN ('claimed', 'running') AND a.lease_expires_at <= ${now})
@@ -1580,7 +2085,11 @@ export class CollaborationStore {
       const nextTaskStatus = input.status === "succeeded" ? "review_ready" : "open";
       await tx`
         UPDATE tasks
-        SET status = ${nextTaskStatus}, updated_at = ${now}
+        SET status = CASE
+              WHEN is_execution AND repository_id IS NULL THEN 'open'
+              ELSE ${nextTaskStatus}
+            END,
+            updated_at = ${now}
         WHERE id = ${input.claim.taskId}
           AND status = 'active'
           AND NOT EXISTS (

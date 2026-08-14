@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import type { TaskThread } from "../../src/domain/model.js";
-import { runConversationContext } from "../../src/worker/prompt-context.js";
+import type { ConversationThread, TaskThread } from "../../src/domain/model.js";
+import { runChatContext, runConversationContext } from "../../src/worker/prompt-context.js";
 
 const primaryConversation = "11111111-1111-4111-8111-111111111111";
 const directConversation = "22222222-2222-4222-8222-222222222222";
@@ -39,6 +39,46 @@ describe("run conversation prompt context", () => {
 
     expect(runConversationContext(value, runId).currentInstruction).toBe("只审查鉴权边界");
   });
+
+  it("reads the complete taskless chat while using the hidden Task only for execution metadata", () => {
+    const execution = thread();
+    execution.task = {
+      ...execution.task,
+      executionConversationId: directConversation,
+      isExecution: true,
+      description: "Internal execution context",
+    };
+    const trigger = { ...execution.messages[1]!, taskId: null };
+    const chat: ConversationThread = {
+      conversation: {
+        id: directConversation,
+        workspaceId: "workspace-1",
+        taskId: null,
+        activeRepositoryId: null,
+        kind: "direct",
+        title: null,
+        createdByActorId: "human-1",
+        isPrimary: false,
+        createdAt: now,
+        updatedAt: now,
+      },
+      members: [],
+      messages: [
+        { ...trigger, id: "older-chat-message", body: "我们先讨论需求" },
+        trigger,
+      ],
+      runs: execution.runs,
+    };
+
+    const context = runChatContext(chat, execution, runId);
+
+    expect(context.currentInstruction).toBe("给我写一个贪吃蛇");
+    expect(context.messages.map((message) => message.body)).toEqual([
+      "我们先讨论需求",
+      "给我写一个贪吃蛇",
+    ]);
+    expect(context.currentInstruction).not.toContain("Internal execution context");
+  });
 });
 
 function thread(): TaskThread {
@@ -47,6 +87,8 @@ function thread(): TaskThread {
       id: primaryConversation,
       workspaceId: "workspace-1",
       repositoryId: "repository-1",
+      executionConversationId: null,
+      isExecution: false,
       createdByActorId: "human-1",
       assignedActorId: null,
       title: "Old smoke task",

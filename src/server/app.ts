@@ -19,7 +19,7 @@ import {
   evaluateAgentModelCompatibility,
   normalizeAgentComposition,
 } from "../domain/agent-composition.js";
-import type { Actor, AgentProfile, ConversationThread, ModelCatalogEntry, ModelProtocol } from "../domain/model.js";
+import type { Actor, AgentProfile, ConversationThread, ModelCatalogEntry, ModelProtocol, Repository, Task } from "../domain/model.js";
 import { parseMarkdownImport } from "../imports/context-imports.js";
 import { githubConnectionStatus } from "../integrations/index.js";
 import type { MobWorker } from "../worker/worker.js";
@@ -29,6 +29,7 @@ import { WorkspaceKnowledge } from "../knowledge/index.js";
 import { WorkspaceFileBrowser } from "../files/index.js";
 import {
   type FileWorkspaceStore,
+  writeConversationFileState,
   writeTaskFileState,
   writeWorkspaceFileState,
 } from "../storage/index.js";
@@ -161,6 +162,52 @@ export async function ensureBootstrap(
   await writeWorkspaceFileState(store, files, workspace);
 }
 
+async function importWorkspaceRepository(
+  store: CollaborationStore,
+  files: FileWorkspaceStore,
+  workspaceId: string,
+  actorId: string,
+  sourceUrl: string,
+) {
+  const repositoryImport = await store.createRepositoryImport(workspaceId, actorId, sourceUrl);
+  const name = new URL(repositoryImport.sourceUrl).pathname
+    .split("/")
+    .filter(Boolean)
+    .at(-1)
+    ?.replace(/\.git$/u, "") ?? "repository";
+  const completed = await store.completeRepositoryImport(repositoryImport.id, { name });
+  await files.writeRepository(completed.repository);
+  return completed;
+}
+
+function githubRepositoryUrlFromMessage(message: string): string | undefined {
+  const match = message.match(
+    /https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+(?:\.git)?(?=$|[\s)\],;])/u,
+  )?.[0];
+  return match ? normalizeGitHubRepositoryUrl(match) : undefined;
+}
+
+function repositoryIdFromMessage(
+  message: string,
+  repositories: readonly Repository[],
+): string | undefined {
+  const text = message.toLowerCase();
+  const matches = repositories.filter((repository) => {
+    if (!repository.allowlisted || !repository.enabled) return false;
+    const needles = [repository.name.toLowerCase()];
+    if (repository.remoteUrl) {
+      const pathname = new URL(repository.remoteUrl).pathname.replace(/^\/+|\/+$/gu, "");
+      if (pathname) needles.push(pathname.replace(/\.git$/u, "").toLowerCase());
+    }
+    return needles.some((needle) => {
+      if (!needle) return false;
+      const escaped = needle.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+      return new RegExp(`(^|[^a-z0-9])${escaped}([^a-z0-9]|$)`, "u").test(text);
+    });
+  });
+  return matches.length === 1 ? matches[0]?.id : undefined;
+}
+
 export async function buildApp(dependencies: AppDependencies): Promise<FastifyInstance> {
   const { config, store, files } = dependencies;
   const app = Fastify({ logger: true, trustProxy: true });
@@ -279,7 +326,9 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
       tasks: tasks.map((task) => ({
         ...task,
         resolution: taskResolution(task),
-        repository: repositoryById.get(task.repositoryId)?.name ?? "Unknown repository",
+        repository: task.repositoryId
+          ? repositoryById.get(task.repositoryId)?.name ?? "Unknown repository"
+          : "No repository",
         branch: task.branchName ?? task.baseRevision,
         participantIds: task.assignedActorId ? [task.assignedActorId] : [],
       })),
@@ -292,6 +341,23 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
         effectiveModelId: effectiveAgentModel(config, profileByActor.get(item.id)),
       })),
     };
+  });
+
+  app.get("/api/actors", async (request) => {
+    const actor = requireHuman(request);
+    return { actors: await store.listActors(actor.workspaceId) };
+  });
+
+  app.get("/api/repositories", async (request) => {
+    const actor = requireHuman(request);
+    return { repositories: await store.listRepositories(actor.workspaceId) };
+  });
+
+  app.post("/api/repositories/import", async (request) => {
+    const actor = requireHuman(request);
+    const body = z.object({ url: z.string().url() }).parse(request.body);
+    const completed = await importWorkspaceRepository(store, files, actor.workspaceId, actor.actorId, body.url);
+    return { repository: completed.repository, repositoryImport: completed.repositoryImport };
   });
 
   app.get<{ Querystring: { refresh?: string } }>("/api/models", async (request) => {
@@ -482,6 +548,10 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     const actor = requireActor(request);
     const thread = await store.getTaskThread(request.params.id);
     assertTaskAccess(actor, thread.task.id, thread.task.workspaceId);
+    await assertExecutionTaskAccess(store, actor, thread.task);
+    const executionConversation = thread.task.isExecution && thread.task.executionConversationId
+      ? await store.getConversationContext(thread.task.executionConversationId)
+      : null;
     const [repositories, actors] = await Promise.all([
       store.listRepositories(actor.workspaceId),
       store.listActors(actor.workspaceId),
@@ -498,6 +568,7 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
           )
           .map((conversation) => conversation.id))
       : new Set(thread.conversations.map((conversation) => conversation.id));
+    if (executionConversation) visibleConversationIds.add(executionConversation.conversation.id);
     const runById = new Map(thread.runs.map((run) => [run.id, run]));
     const activityByRun = new Map<string, string>();
     for (const event of thread.events) {
@@ -511,14 +582,20 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
       resolution: taskResolution(thread.task),
       repository: repo?.name,
       branch: thread.task.branchName ?? thread.task.baseRevision,
-      messages: thread.messages.filter((message) => message.conversationId === thread.task.id).map((message) => ({
+      messages: (executionConversation
+        ? executionConversation.messages
+        : thread.messages.filter((message) => message.conversationId === thread.task.id)
+      ).map((message) => ({
         ...message,
         content: message.body,
         actorName: actorMap.get(message.actorId)?.displayName,
         actorKind: actorMap.get(message.actorId)?.kind,
         runId: message.sourceRunId,
       })),
-      runs: thread.runs.filter((run) => run.conversationId === thread.task.id).map((run) => {
+      runs: (executionConversation
+        ? executionConversation.runs.filter((run) => run.taskId === thread.task.id)
+        : thread.runs.filter((run) => run.conversationId === thread.task.id)
+      ).map((run) => {
         const attempt = attemptByRun.get(run.id);
         return {
           ...run,
@@ -603,6 +680,9 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
       decision: z.enum(["accept", "reject", "request_changes"]),
       note: z.string().max(2_000).default(""),
     }).parse(request.body);
+    const currentTask = await store.getTask(request.params.id);
+    if (!currentTask) throw new StoreError("not_found", "Task was not found.");
+    await assertExecutionTaskAccess(store, actor, currentTask);
     const task = await store.reviewTask({
       taskId: request.params.id,
       decidedByActorId: actor.actorId,
@@ -613,13 +693,25 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
       : body.decision === "reject"
         ? "Human review rejected this result. The task was cancelled."
         : "Human review requested changes. The task is open for a bounded follow-up.";
-    await store.createMessage({
-      taskId: task.id,
-      actorId: actor.actorId,
-      kind: "system",
-      body: body.note.trim() ? `${summary}\n\nReview note: ${body.note.trim()}` : summary,
-      enqueueMentionedAgents: false,
-    });
+    const reviewMessage = body.note.trim() ? `${summary}\n\nReview note: ${body.note.trim()}` : summary;
+    if (task.isExecution && task.executionConversationId) {
+      await store.createConversationMessage({
+        conversationId: task.executionConversationId,
+        actorId: actor.actorId,
+        kind: "system",
+        body: reviewMessage,
+        invokeAgentActorIds: [],
+      });
+      await writeConversationFileState(store, files, task.executionConversationId);
+    } else {
+      await store.createMessage({
+        taskId: task.id,
+        actorId: actor.actorId,
+        kind: "system",
+        body: reviewMessage,
+        enqueueMentionedAgents: false,
+      });
+    }
     await writeTaskFileState(store, files, task.id);
     return { ...task, resolution: taskResolution(task) };
   });
@@ -638,6 +730,7 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     const task = await store.getTask(request.params.id);
     if (!task) throw new StoreError("not_found", "Task was not found.");
     assertTaskAccess(actor, task.id, task.workspaceId);
+    await assertExecutionTaskAccess(store, actor, task);
     if (task.status !== "completed") {
       throw new StoreError("human_review_required", "Accept the task result before publishing a branch.");
     }
@@ -727,14 +820,18 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
   app.post("/api/conversations", async (request) => {
     const actor = requireHuman(request);
     const body = z.object({
-      taskId: z.string().uuid(),
+      taskId: z.string().uuid().nullable().optional(),
+      activeRepositoryId: z.string().uuid().nullable().optional(),
+      repositoryId: z.string().uuid().nullable().optional(),
       kind: z.enum(["direct", "group"]),
       title: z.string().min(1).max(120).nullable().optional(),
       members: z.array(z.string().min(1).max(80)).max(32).default([]),
     }).parse(request.body);
-    const task = await store.getTask(body.taskId);
-    if (!task) throw new StoreError("not_found", "Task was not found.");
-    assertTaskAccess(actor, task.id, task.workspaceId);
+    if (body.taskId) {
+      const task = await store.getTask(body.taskId);
+      if (!task) throw new StoreError("not_found", "Task was not found.");
+      assertTaskAccess(actor, task.id, task.workspaceId);
+    }
     const workspaceActors = await store.listActors(actor.workspaceId);
     const memberIds = body.members.map((needle) => {
       const handle = needle.replace(/^@/u, "").toLowerCase();
@@ -748,26 +845,30 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
       .filter((id, index, values) => values.indexOf(id) === index)
       .map((id) => workspaceActors.find((candidate) => candidate.id === id))
       .filter((candidate): candidate is Actor => candidate !== undefined);
-    if (
-      body.kind === "direct" &&
-      (uniqueMembers.length !== 2 ||
-        uniqueMembers.filter((candidate) => candidate.kind === "human").length !== 1 ||
-        uniqueMembers.filter((candidate) => candidate.kind === "agent").length !== 1)
-    ) {
+    if (body.kind === "direct" && uniqueMembers.length !== 2) {
       throw new StoreError(
-        "direct_human_agent_required",
-        "A direct conversation requires exactly one human and one Agent.",
+        "direct_members_required",
+        "A direct conversation requires exactly two active members.",
       );
     }
+    const activeRepositoryId = body.activeRepositoryId !== undefined
+      ? body.activeRepositoryId
+      : body.repositoryId;
     const thread = await store.createConversation({
       workspaceId: actor.workspaceId,
-      taskId: task.id,
+      ...(body.taskId !== undefined ? { taskId: body.taskId } : {}),
+      ...(activeRepositoryId !== undefined
+        ? { activeRepositoryId }
+        : {}),
       createdByActorId: actor.actorId,
       kind: body.kind,
       ...(body.title !== undefined ? { title: body.title } : {}),
       memberActorIds: memberIds,
     });
-    await writeTaskFileState(store, files, task.id);
+    await writeConversationFileState(store, files, thread.conversation.id);
+    if (thread.conversation.taskId) {
+      await writeTaskFileState(store, files, thread.conversation.taskId);
+    }
     return replyConversation(thread, workspaceActors);
   });
 
@@ -786,13 +887,29 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     return replyConversation(thread, await store.listActors(actor.workspaceId));
   });
 
+  app.patch<{ Params: { id: string } }>("/api/conversations/:id", async (request) => {
+    const actor = requireHuman(request);
+    const body = z.object({ activeRepositoryId: z.string().uuid().nullable() }).parse(request.body);
+    await assertSessionConversationAccess(store, actor, request.params.id);
+    const conversation = await store.updateConversationActiveRepository(
+      request.params.id,
+      actor.workspaceId,
+      body.activeRepositoryId,
+    );
+    await writeConversationFileState(store, files, conversation.id);
+    return { conversation };
+  });
+
   app.post<{ Params: { id: string } }>("/api/conversations/:id/messages", async (request) => {
     const actor = requireActor(request);
     const body = z.object({
       content: z.string().min(1).max(20_000),
       kind: z.enum(["comment", "progress", "result"]).optional(),
-      invoke: z.boolean().default(false),
+      invoke: z.boolean().optional(),
+      wake: z.boolean().optional(),
       agent: z.string().min(1).max(80).optional(),
+      repositoryId: z.string().uuid().nullable().optional(),
+      repositoryUrl: z.string().url().optional(),
       writerRequired: z.boolean().default(true),
     }).parse(request.body);
     await assertSessionConversationAccess(store, actor, request.params.id);
@@ -805,7 +922,10 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     if (actor.kind === "run" && !thread.runs.some((run) => run.id === actor.runId)) {
       throw new StoreError("not_found", "Conversation was not found.");
     }
-    if (actor.kind === "run" && body.invoke) {
+    if (
+      actor.kind === "run" &&
+      (body.invoke || body.wake || body.agent || body.repositoryId !== undefined || body.repositoryUrl)
+    ) {
       throw new StoreError(
         "explicit_delegation_required",
         "Agents must use mob delegate so delegation depth and budgets remain enforced.",
@@ -816,48 +936,113 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     const conversationAgentMembers = workspaceActors.filter((candidate) =>
       candidate.kind === "agent" && memberIds.has(candidate.id) && candidate.id !== actor.actorId,
     );
-    const invokableAgents = thread.conversation.isPrimary
+    const invokableAgents = thread.conversation.isPrimary || thread.conversation.kind === "group"
       ? workspaceActors.filter((candidate) => candidate.kind === "agent" && candidate.id !== actor.actorId)
       : conversationAgentMembers;
-    let invokedAgentId: string | undefined;
-    if (body.invoke) {
+    const invokedAgentIds: string[] = [];
+    if (actor.kind === "session" && body.wake !== false) {
       if (body.agent) {
         const needle = body.agent.replace(/^@/u, "").toLowerCase();
-        invokedAgentId = invokableAgents.find((candidate) =>
+        const explicit = invokableAgents.find((candidate) =>
           candidate.id === body.agent || candidate.handle.toLowerCase() === needle,
         )?.id;
+        if (!explicit) {
+          throw new StoreError("agent_required", "Choose an Agent who belongs to this conversation.");
+        }
+        invokedAgentIds.push(explicit);
       } else {
         const mentions = new Set(extractMentionHandles(body.content));
         const mentionedAgents = invokableAgents.filter((candidate) => mentions.has(candidate.handle));
-        const candidates = mentionedAgents.length > 0
-          ? mentionedAgents
-          : thread.conversation.kind === "direct"
-            ? conversationAgentMembers
-            : [];
-        if (candidates.length === 1) invokedAgentId = candidates[0]?.id;
+        if (thread.conversation.kind === "group") {
+          invokedAgentIds.push(...mentionedAgents.map((candidate) => candidate.id));
+        } else if (conversationAgentMembers.length === 1) {
+          invokedAgentIds.push(conversationAgentMembers[0]!.id);
+        }
       }
-      if (!invokedAgentId) {
+      if (body.invoke === true && invokedAgentIds.length === 0) {
         throw new StoreError(
           "agent_required",
-          "Choose one Agent member with agent, or @mention exactly one Agent and set invoke=true.",
+          "Choose an Agent member or @mention an Agent in this conversation.",
         );
       }
+    }
+    if (
+      actor.kind === "session" &&
+      thread.conversation.kind === "group" &&
+      invokedAgentIds.some((agentId) => !memberIds.has(agentId))
+    ) {
+      await store.addConversationMembers(
+        thread.conversation.id,
+        actor.workspaceId,
+        invokedAgentIds.filter((agentId) => !memberIds.has(agentId)),
+      );
     }
     const bearer = request.headers.authorization?.match(/^Bearer\s+(.+)$/iu)?.[1];
     const content = actor.kind === "run"
       ? redactText(body.content, [config.mobAiKey, bearer])
       : body.content;
+    let repositoryId = actor.kind === "session" ? body.repositoryId : undefined;
+    const repositoryUrl = actor.kind === "session"
+      ? body.repositoryUrl ?? githubRepositoryUrlFromMessage(content)
+      : undefined;
+    if (repositoryId == null && repositoryUrl) {
+      const imported = await importWorkspaceRepository(
+        store,
+        files,
+        actor.workspaceId,
+        actor.actorId,
+        repositoryUrl,
+      );
+      repositoryId = imported.repository.id;
+    }
+    if (actor.kind === "session" && repositoryId == null && !repositoryUrl) {
+      repositoryId = repositoryIdFromMessage(
+        content,
+        await store.listRepositories(actor.workspaceId),
+      );
+    }
     const result = await store.createConversationMessage({
       conversationId: thread.conversation.id,
       actorId: actor.actorId,
       body: content,
       ...(body.kind ? { kind: body.kind } : {}),
       ...(actor.kind === "run" ? { sourceRunId: actor.runId } : {}),
-      ...(invokedAgentId ? { invokeAgentActorId: invokedAgentId } : {}),
+      ...(invokedAgentIds.length > 0 ? { invokeAgentActorIds: invokedAgentIds } : {}),
+      ...(repositoryId !== undefined ? { repositoryId } : {}),
       writerRequired: body.writerRequired,
     });
-    await writeTaskFileState(store, files, thread.conversation.taskId);
-    return result;
+    const followUpRuns: typeof result.queuedRuns = [];
+    const deliveries = await Promise.all(result.deliveries.map(async (delivery) => {
+      if (delivery.action !== "steer") return delivery;
+      const acknowledgement = await dependencies.worker?.sendRunCommand(delivery.runId, {
+        type: "steer",
+        message: content,
+      });
+      if (acknowledgement?.accepted) return { ...delivery, accepted: true };
+      const followUp = await store.queueConversationFollowUp({
+        conversationId: thread.conversation.id,
+        messageId: result.message.id,
+        predecessorRunId: delivery.runId,
+        agentActorId: delivery.agentActorId,
+        requestedByActorId: actor.actorId,
+        writerRequired: body.writerRequired,
+      });
+      followUpRuns.push(followUp.run);
+      return {
+        ...delivery,
+        runId: followUp.run.id,
+        waitForRunId: delivery.runId,
+        action: "queued_follow_up" as const,
+        accepted: true,
+        ...(acknowledgement?.error ? { warning: acknowledgement.error } : {}),
+      };
+    }));
+    await writeConversationFileState(store, files, thread.conversation.id);
+    const queuedRuns = [...result.queuedRuns, ...followUpRuns];
+    for (const taskId of new Set(queuedRuns.map((run) => run.taskId))) {
+      await writeTaskFileState(store, files, taskId);
+    }
+    return { ...result, queuedRuns, deliveries };
   });
 
   app.post<{ Params: { id: string } }>("/api/tasks/:id/messages", async (request) => {
@@ -869,15 +1054,19 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     const task = await store.getTask(request.params.id);
     if (!task) throw new StoreError("not_found", "Task was not found.");
     assertTaskAccess(actor, task.id, task.workspaceId);
+    await assertExecutionTaskAccess(store, actor, task);
     const bearer = request.headers.authorization?.match(/^Bearer\s+(.+)$/iu)?.[1];
     const content = actor.kind === "run"
       ? redactText(body.content, [config.mobAiKey, bearer])
       : body.content;
+    const runConversationId = actor.kind === "run"
+      ? requireActiveRun(request).conversationId
+      : null;
     const result = actor.kind === "run"
       ? await store.createConversationMessage({
           // Never trust a client-supplied conversation for an Agent message.
           // Authentication resolves this from the exact active attempt.
-          conversationId: requireActiveRun(request).conversationId,
+          conversationId: runConversationId!,
           actorId: actor.actorId,
           sourceRunId: actor.runId,
           kind: body.kind ?? "comment",
@@ -891,6 +1080,9 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
           enqueueMentionedAgents: true,
         });
     await writeTaskFileState(store, files, task.id);
+    if (runConversationId) {
+      await writeConversationFileState(store, files, runConversationId);
+    }
     return result;
   });
 
@@ -904,6 +1096,7 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     const task = await store.getTask(request.params.id);
     if (!task) throw new StoreError("not_found", "Task was not found.");
     assertTaskAccess(actor, task.id, task.workspaceId);
+    await assertExecutionTaskAccess(store, actor, task);
     const agentNeedle = body.agentId.replace(/^@/u, "").toLowerCase();
     const recipient = (await store.listActors(task.workspaceId)).find((candidate) =>
       candidate.kind === "agent" &&
@@ -1259,10 +1452,13 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
   app.post<{ Params: { id: string } }>("/api/tasks/:id/imports/github", async (request) => {
     const actor = requireHuman(request);
     const body = z.object({ url: z.string().url() }).parse(request.body);
-    const repositoryImport = await store.createRepositoryImport(actor.workspaceId, actor.actorId, body.url);
-    const name = new URL(repositoryImport.sourceUrl).pathname.split("/").filter(Boolean).at(-1)?.replace(/\.git$/u, "") ?? "repository";
-    const completed = await store.completeRepositoryImport(repositoryImport.id, { name });
-    await files.writeRepository(completed.repository);
+    const completed = await importWorkspaceRepository(
+      store,
+      files,
+      actor.workspaceId,
+      actor.actorId,
+      body.url,
+    );
     return { context: { id: completed.repositoryImport.id, name: completed.repository.name, kind: "github", summary: "Repository imported and allowlisted", content: completed.repository.remoteUrl, sourceUrl: completed.repository.remoteUrl, createdAt: completed.repository.createdAt } };
   });
 
@@ -1618,6 +1814,24 @@ async function assertTaskRepositoryAccess(
   taskId: string,
 ): Promise<void> {
   if (!(await store.canActorAccessTaskRepository(taskId, actor.actorId, actor.workspaceId))) {
+    throw new StoreError("not_found", "Resource was not found.");
+  }
+}
+
+async function assertExecutionTaskAccess(
+  store: CollaborationStore,
+  actor: TokenClaims,
+  task: Task,
+): Promise<void> {
+  if (!task.isExecution || actor.kind !== "session") return;
+  if (
+    !task.executionConversationId ||
+    !(await store.canActorAccessConversation(
+      task.executionConversationId,
+      actor.actorId,
+      actor.workspaceId,
+    ))
+  ) {
     throw new StoreError("not_found", "Resource was not found.");
   }
 }

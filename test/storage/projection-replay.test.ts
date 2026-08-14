@@ -111,6 +111,8 @@ function fixture(): {
     id: ids.task,
     workspaceId: ids.workspace,
     repositoryId: ids.repository,
+    executionConversationId: null,
+    isExecution: false,
     createdByActorId: ids.human,
     assignedActorId: ids.agent,
     title: "Replay",
@@ -194,6 +196,7 @@ function fixture(): {
         id: ids.task,
         workspaceId: ids.workspace,
         taskId: ids.task,
+        activeRepositoryId: null,
         kind: "group",
         title: task.title,
         createdByActorId: ids.human,
@@ -277,7 +280,8 @@ describe("file projection replay", () => {
 
   it("reports broken references before touching PostgreSQL", async () => {
     const { snapshot } = await persistedFixture();
-    snapshot.threads[0]!.messages[0]!.actorId = "00000000-0000-4000-8000-999999999999";
+    snapshot.conversationThreads[0]!.messages[0]!.actorId =
+      "00000000-0000-4000-8000-999999999999";
 
     expect(validateFileWorkspaceSnapshot(snapshot)).toContainEqual(expect.objectContaining({
       code: "missing_reference",

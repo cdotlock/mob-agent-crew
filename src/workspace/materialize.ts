@@ -46,11 +46,20 @@ export interface MaterializeWorkspaceResult {
   refreshed: boolean;
 }
 
+export interface MaterializeScratchWorkspaceResult {
+  /** True only when this call created the empty task workspace. */
+  created: boolean;
+}
+
+/** Stable Agent-visible location shared by repository and scratch runs. */
+export function taskWorkspaceDirectory(dataDirectory: string, taskId: string): string {
+  assertSafeTaskId(taskId);
+  return join(resolve(dataDirectory), "tasks", taskId);
+}
+
 /** Stable control-plane location for one task's trusted repository state. */
 export function controlRepositoryDirectory(dataDirectory: string, taskId: string): string {
-  if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u.test(taskId)) {
-    throw new Error("Task id is not safe for a control repository path");
-  }
+  assertSafeTaskId(taskId);
   return join(resolve(dataDirectory), "control", "tasks", taskId);
 }
 
@@ -117,6 +126,22 @@ export async function materializeGitWorkspace(
   await rebuildAgentCheckout(input, repository, nextBase);
   await writeBaseCommit(input.controlDirectory, nextBase);
   return { baseCommit: nextBase, refreshed: true };
+}
+
+/**
+ * Prepare a persistent empty workspace for a conversation that does not need
+ * a repository. Existing files are retained so a non-coding run can still
+ * hand durable notes or artifacts to a later run.
+ */
+export async function materializeScratchWorkspace(
+  taskDirectory: string,
+): Promise<MaterializeScratchWorkspaceResult> {
+  const target = resolve(taskDirectory);
+  const existed = await ensureTaskWorkspacePath(target);
+  if (!existed) await mkdir(target, { mode: 0o700 });
+  await chmod(dirname(target), 0o711);
+  await chmod(target, 0o700);
+  return { created: !existed };
 }
 
 async function ensureControlDirectory(directory: string): Promise<void> {
@@ -470,6 +495,12 @@ async function ensureTaskWorkspacePath(taskDirectory: string): Promise<boolean> 
 
 function assertCommit(commit: string): void {
   if (!/^[0-9a-f]{40,64}$/u.test(commit)) throw new Error("Git returned an invalid commit id");
+}
+
+function assertSafeTaskId(taskId: string): void {
+  if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u.test(taskId)) {
+    throw new Error("Task id is not safe for a workspace path");
+  }
 }
 
 function isMissingFileError(error: unknown): boolean {

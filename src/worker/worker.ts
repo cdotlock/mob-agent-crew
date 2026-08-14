@@ -11,7 +11,12 @@ import type { AppConfig } from "../config.js";
 import type { CollaborationStore } from "../db/store.js";
 import type { LeaseClaim } from "../domain/model.js";
 import { issueRunToken } from "../auth/tokens.js";
-import { controlRepositoryDirectory, materializeGitWorkspace } from "../workspace/materialize.js";
+import {
+  controlRepositoryDirectory,
+  materializeGitWorkspace,
+  materializeScratchWorkspace,
+  taskWorkspaceDirectory,
+} from "../workspace/materialize.js";
 import { grantAgentWorkspace, revokeAgentWorkspace } from "../workspace/agent-access.js";
 import { syncRepositoryKnowledge, WorkspaceKnowledge } from "../knowledge/index.js";
 import { type FileWorkspaceStore, writeTaskFileState } from "../storage/index.js";
@@ -21,8 +26,13 @@ import {
   redactRuntimePayload,
   redactedRuntimeError,
 } from "./runtime-redaction.js";
-import { runConversationContext } from "./prompt-context.js";
+import { runChatContext } from "./prompt-context.js";
 import { CapabilityCatalogService, type ResolvedAgentCapabilities } from "../capabilities/index.js";
+import {
+  taskRepositoryContext,
+  type TaskRepositoryContext,
+  type TaskRepositoryRow,
+} from "./repository-context.js";
 
 export interface WorkerOptions {
   id: string;
@@ -45,14 +55,6 @@ type RuntimeProfile = {
     reference: string | null;
     values: Record<string, string>;
   };
-};
-
-type TaskRepository = {
-  name: string;
-  remoteUrl: string | null;
-  baseRevision: string;
-  allowlisted: boolean;
-  enabled: boolean;
 };
 
 export class MobWorker {
@@ -165,18 +167,26 @@ export class MobWorker {
     claim: LeaseClaim,
     profile: RuntimeProfile,
     capabilities: ResolvedAgentCapabilities,
+    repository: TaskRepositoryContext,
   ): Promise<string> {
-    const [thread, actors] = await Promise.all([
+    const [thread, conversation, actors] = await Promise.all([
       this.#options.store.getTaskThread(claim.taskId),
+      this.#options.store.getConversationThreadForRun(claim.runId),
       this.#options.store.listActors(claim.workspaceId),
     ]);
-    const { messages: conversationMessages, currentInstruction } = runConversationContext(
+    const { messages: conversationMessages, currentInstruction } = runChatContext(
+      conversation,
       thread,
       claim.runId,
     );
+    const actorLabels = new Map(actors.map((actor) => [
+      actor.id,
+      actor.displayName === actor.handle
+        ? `@${actor.handle}`
+        : `${actor.displayName} (@${actor.handle})`,
+    ]));
     const transcript = conversationMessages
-      .slice(-30)
-      .map((message) => `${message.actorId}: ${message.body}`)
+      .map((message) => `${actorLabels.get(message.actorId) ?? message.actorId}: ${message.body}`)
       .join("\n");
     const knowledgeQuery = [
       thread.task.title,
@@ -192,7 +202,10 @@ export class MobWorker {
       .map((actor) => `@${actor.handle}`)
       .join(", ");
     return [
-      `You are participating as ${profile.role || "a coding agent"} in a shared Mob Agent Crew task.`,
+      `You are participating as ${profile.role || "an Agent"} in a shared Mob Agent Crew conversation.`,
+      repository.kind === "git"
+        ? `Repository workspace: ${repository.name} at ${repository.baseRevision}. Its checkout is ready in the current directory.`
+        : "No repository is selected for this run. The current directory is a persistent scratch workspace; do not assume the user wants coding work.",
       profile.skillRefs.length
         ? `Requested shared skill references: ${profile.skillRefs.join(", ")}. Only catalog entries whose instructions appear below are active.`
         : "",
@@ -208,11 +221,16 @@ export class MobWorker {
       capabilities.warnings.length
         ? `Capability warnings:\n${capabilities.warnings.map((warning) => `- ${warning}`).join("\n")}`
         : "",
-      `Task: ${thread.task.title}`,
-      thread.task.description && currentInstruction !== thread.task.description
+      thread.task.isExecution
+        ? `Conversation: ${conversation.conversation.title?.trim() || "Untitled conversation"}`
+        : `Legacy task context: ${thread.task.title}`,
+      !thread.task.isExecution && thread.task.description && currentInstruction !== thread.task.description
         ? `Task background (context only, not the current instruction): ${thread.task.description}`
         : "",
-      "Start the requested work immediately. Do not explore the Mob platform or inspect mob --help/context unless the user explicitly asks.",
+      "A run may be a direct conversational answer, a concise clarification, or tool-backed work. Reply directly when no repository or tools are needed.",
+      "When the request is clear and needs files or tools, start that work immediately. Ask one concise clarification only when a missing choice would materially change the result.",
+      "For multi-step or long-running work, first use mob say once to briefly confirm your understanding and next step in the conversation, then continue with tools. For a pure question, return the answer directly without a progress preamble.",
+      "Do not explore the Mob platform or inspect mob --help/context unless the user explicitly asks.",
       "Use mob say only for meaningful progress, mob delegate only for a bounded handoff, mob artifact add for deliverables, and mob done once when finished.",
       collaborators ? `Available Agent collaborators: ${collaborators}. Invoke one with mob delegate @handle \"bounded deliverable\".` : "",
       "Never print environment variables, tokens, or credentials. Do not inspect runtime plumbing unless the task explicitly asks for it.",
@@ -228,18 +246,26 @@ export class MobWorker {
       .join("\n\n");
   }
 
-  async #prepareTaskDirectory(claim: LeaseClaim): Promise<string> {
-    const taskDirectory = join(this.#options.config.dataDir, "tasks", claim.taskId);
-    const rows = await this.#options.store.sql<TaskRepository[]>`
-      SELECT r.name, r.remote_url AS "remoteUrl", t.base_revision AS "baseRevision",
+  async #loadRepositoryContext(claim: LeaseClaim): Promise<TaskRepositoryContext> {
+    const rows = await this.#options.store.sql<TaskRepositoryRow[]>`
+      SELECT t.repository_id AS "repositoryId", r.name, r.remote_url AS "remoteUrl",
+             COALESCE(NULLIF(btrim(t.base_revision), ''), r.default_branch) AS "baseRevision",
              r.allowlisted, r.enabled
       FROM tasks t
-      JOIN repositories r ON r.id = t.repository_id AND r.workspace_id = t.workspace_id
+      LEFT JOIN repositories r ON r.id = t.repository_id AND r.workspace_id = t.workspace_id
       WHERE t.id = ${claim.taskId} AND t.workspace_id = ${claim.workspaceId}
     `;
-    const repository = rows[0];
-    if (!repository?.allowlisted || !repository.enabled || !repository.remoteUrl) {
-      throw new Error("Task repository is not an enabled allowlisted Git remote");
+    return taskRepositoryContext(rows[0]);
+  }
+
+  async #prepareTaskDirectory(
+    claim: LeaseClaim,
+    repository: TaskRepositoryContext,
+  ): Promise<string> {
+    const taskDirectory = taskWorkspaceDirectory(this.#options.config.dataDir, claim.taskId);
+    if (repository.kind === "scratch") {
+      await materializeScratchWorkspace(taskDirectory);
+      return taskDirectory;
     }
     const materialized = await materializeGitWorkspace({
       taskDirectory,
@@ -279,6 +305,7 @@ export class MobWorker {
         pluginRefs: profile.pluginRefs,
         environment: profile.environment,
       }, { strict: false });
+      const repository = await this.#loadRepositoryContext(claim);
       if (profile.driver !== "mock" && !this.#options.drivers.has(profile.driver)) {
         throw new Error(`Agent driver '${profile.driver}' is not registered`);
       }
@@ -296,7 +323,12 @@ export class MobWorker {
       const syncing = await this.#options.store.appendRunEvent({
         claim,
         type: "workspace.sync.started",
-        payload: { message: "Preparing the repository and workspace knowledge" },
+        payload: {
+          message: repository.kind === "git"
+            ? `Preparing ${repository.name} at ${repository.baseRevision}`
+            : "Preparing a scratch workspace (no repository selected)",
+          workspaceKind: repository.kind,
+        },
       });
       await this.#options.files.writeEvent(syncing);
 
@@ -321,12 +353,17 @@ export class MobWorker {
       }, Math.max(1_000, Math.floor(leaseMs / 3)));
       leaseHeartbeat.unref();
 
-      taskDir = await this.#prepareTaskDirectory(claim);
+      taskDir = await this.#prepareTaskDirectory(claim, repository);
       await grantAgentWorkspace(taskDir);
       const synced = await this.#options.store.appendRunEvent({
         claim,
         type: "workspace.sync.completed",
-        payload: { message: "Repository checkout and Wiki context are ready" },
+        payload: {
+          message: repository.kind === "git"
+            ? "Repository checkout and Wiki context are ready"
+            : "Scratch workspace is ready; no repository was required",
+          workspaceKind: repository.kind,
+        },
       });
       await this.#options.files.writeEvent(synced);
       if (leaseLost) throw new Error("Worker lease was lost while preparing the task workspace");
@@ -364,7 +401,7 @@ export class MobWorker {
       nativeRun = await driver.run({
         jobId: claim.runId,
         attemptId: claim.attemptId,
-        prompt: await this.#buildPrompt(claim, profile, capabilities),
+        prompt: await this.#buildPrompt(claim, profile, capabilities, repository),
         cwd: taskDir,
         timeoutMs: 30 * 60_000,
         ...(profile.driver !== "mock" ? { profileDirectory: profile.home } : {}),
@@ -389,6 +426,8 @@ export class MobWorker {
           pluginRefs: profile.pluginRefs,
           environmentReference: profile.environment.reference,
           capabilityWarnings: capabilities.warnings,
+          workspaceKind: repository.kind,
+          repositoryId: repository.kind === "git" ? repository.repositoryId : null,
         },
       });
       this.#active.set(claim.runId, nativeRun);
@@ -408,9 +447,10 @@ export class MobWorker {
         await this.#options.files.writeEvent(storedEvent);
       }
       const result = await nativeRun.result;
-      const threadAfterRun = await this.#options.store.getTaskThread(claim.taskId);
-      const runContext = runConversationContext(threadAfterRun, claim.runId);
-      const resultAlreadyPosted = threadAfterRun.messages.some(
+      const conversationAfterRun = await this.#options.store.getConversationThreadForRun(claim.runId);
+      const runContext = conversationAfterRun.runs.find((run) => run.id === claim.runId);
+      if (!runContext) throw new Error(`Run ${claim.runId} was not found in its conversation`);
+      const resultAlreadyPosted = conversationAfterRun.messages.some(
         (message) => message.sourceRunId === claim.runId && message.kind === "result",
       );
       const missingResult = result.outcome === "completed" && !result.finalMessage && !resultAlreadyPosted;
@@ -438,7 +478,7 @@ export class MobWorker {
 
       if (missingResult) {
         const posted = await this.#options.store.createConversationMessage({
-          conversationId: runContext.run.conversationId,
+          conversationId: runContext.conversationId,
           actorId: claim.agentActorId,
           sourceRunId: claim.runId,
           kind: "progress",
@@ -450,7 +490,7 @@ export class MobWorker {
       if (result.finalMessage) {
         if (!resultAlreadyPosted) {
           const posted = await this.#options.store.createConversationMessage({
-            conversationId: runContext.run.conversationId,
+            conversationId: runContext.conversationId,
             actorId: claim.agentActorId,
             sourceRunId: claim.runId,
             kind: status === "succeeded" ? "result" : "progress",

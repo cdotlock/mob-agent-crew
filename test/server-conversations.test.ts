@@ -4,10 +4,11 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { issueRunToken, issueSessionToken } from "../src/auth/tokens.js";
 import type { AppConfig } from "../src/config.js";
-import { StoreError, type CollaborationStore } from "../src/db/store.js";
+import { StoreError, type CollaborationStore, type CreateMessageResult } from "../src/db/store.js";
 import type { Actor, ConversationThread, TaskThread } from "../src/domain/model.js";
 import { buildApp } from "../src/server/app.js";
 import type { FileWorkspaceStore } from "../src/storage/index.js";
+import type { MobWorker } from "../src/worker/worker.js";
 
 const WORKSPACE_ID = "11111111-1111-4111-8111-111111111111";
 const HUMAN_ID = "22222222-2222-4222-8222-222222222222";
@@ -55,6 +56,7 @@ const directThread: ConversationThread = {
     id: CONVERSATION_ID,
     workspaceId: WORKSPACE_ID,
     taskId: TASK_ID,
+    activeRepositoryId: null,
     kind: "direct",
     title: null,
     createdByActorId: HUMAN_ID,
@@ -81,6 +83,26 @@ afterEach(async () => {
 });
 
 describe("conversation API", () => {
+  it("creates a workspace chat without requiring a Task or repository", async () => {
+    const fixture = await createFixture();
+    const response = await fixture.app.inject({
+      method: "POST",
+      url: "/api/conversations",
+      headers: { authorization: `Bearer ${sessionToken()}` },
+      payload: { kind: "direct", members: ["@builder"] },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(fixture.createConversation).toHaveBeenCalledWith(expect.objectContaining({
+      workspaceId: WORKSPACE_ID,
+      kind: "direct",
+      memberActorIds: [AGENT_ID],
+    }));
+    expect(fixture.createConversation).toHaveBeenCalledWith(
+      expect.not.objectContaining({ taskId: expect.anything() }),
+    );
+  });
+
   it("creates a task-backed direct chat with exactly the human and chosen Agent", async () => {
     const fixture = await createFixture();
     const response = await fixture.app.inject({
@@ -99,7 +121,7 @@ describe("conversation API", () => {
     }));
   });
 
-  it("rejects a direct chat between two humans", async () => {
+  it("allows a direct chat between two humans without an Agent", async () => {
     const fixture = await createFixture();
     const response = await fixture.app.inject({
       method: "POST",
@@ -108,21 +130,20 @@ describe("conversation API", () => {
       payload: { taskId: TASK_ID, kind: "direct", members: ["@alice"] },
     });
 
-    expect(response.statusCode).toBe(409);
-    expect(response.json()).toMatchObject({
-      error: "direct_human_agent_required",
-      message: "A direct conversation requires exactly one human and one Agent.",
-    });
-    expect(fixture.createConversation).not.toHaveBeenCalled();
+    expect(response.statusCode).toBe(200);
+    expect(fixture.createConversation).toHaveBeenCalledWith(expect.objectContaining({
+      kind: "direct",
+      memberActorIds: [secondHuman.id],
+    }));
   });
 
-  it("only invokes the sole Agent in a direct chat when invoke=true", async () => {
+  it("wakes the sole Agent in a direct chat without an invoke button", async () => {
     const fixture = await createFixture();
     const response = await fixture.app.inject({
       method: "POST",
       url: `/api/conversations/${CONVERSATION_ID}/messages`,
       headers: { authorization: `Bearer ${sessionToken()}` },
-      payload: { content: "写一个贪吃蛇", invoke: true },
+      payload: { content: "写一个贪吃蛇" },
     });
 
     expect(response.statusCode).toBe(200);
@@ -130,23 +151,153 @@ describe("conversation API", () => {
       conversationId: CONVERSATION_ID,
       actorId: HUMAN_ID,
       body: "写一个贪吃蛇",
-      invokeAgentActorId: AGENT_ID,
+      invokeAgentActorIds: [AGENT_ID],
     }));
   });
 
-  it("does not turn ordinary chat into another Agent run", async () => {
+  it("selects one enabled repository mentioned by name in ordinary chat", async () => {
+    const fixture = await createFixture();
+    Object.assign(fixture.store, {
+      listRepositories: vi.fn(async () => [{
+        id: "88888888-8888-4888-8888-888888888888",
+        workspaceId: WORKSPACE_ID,
+        name: "mob-agent-crew",
+        kind: "git",
+        remoteUrl: "https://github.com/cdotlock/mob-agent-crew.git",
+        localPath: null,
+        defaultBranch: "main",
+        allowlisted: true,
+        enabled: true,
+        createdByActorId: HUMAN_ID,
+        createdAt: now,
+        updatedAt: now,
+      }]),
+    });
+
+    const response = await fixture.app.inject({
+      method: "POST",
+      url: `/api/conversations/${CONVERSATION_ID}/messages`,
+      headers: { authorization: `Bearer ${sessionToken()}` },
+      payload: { content: "请在 mob-agent-crew 仓库里修复首页" },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(fixture.createConversationMessage).toHaveBeenCalledWith(expect.objectContaining({
+      repositoryId: "88888888-8888-4888-8888-888888888888",
+    }));
+  });
+
+  it("imports a GitHub URL when the client also sends repositoryId null", async () => {
+    const fixture = await createFixture();
+    const repository = {
+      id: "88888888-8888-4888-8888-888888888888",
+      workspaceId: WORKSPACE_ID,
+      name: "new-repo",
+      kind: "git" as const,
+      remoteUrl: "https://github.com/cdotlock/new-repo.git",
+      localPath: null,
+      defaultBranch: "main",
+      allowlisted: true,
+      enabled: true,
+      createdByActorId: HUMAN_ID,
+      createdAt: now,
+      updatedAt: now,
+    };
+    Object.assign(fixture.store, {
+      createRepositoryImport: vi.fn(async () => ({
+        id: "99999999-9999-4999-8999-999999999991",
+        workspaceId: WORKSPACE_ID,
+        sourceUrl: repository.remoteUrl,
+        requestedByActorId: HUMAN_ID,
+        repositoryId: null,
+        status: "pending",
+        failureMessage: null,
+        createdAt: now,
+        completedAt: null,
+      })),
+      completeRepositoryImport: vi.fn(async () => ({
+        repository,
+        repositoryImport: {
+          id: "99999999-9999-4999-8999-999999999991",
+          status: "imported",
+        },
+      })),
+    });
+
+    const response = await fixture.app.inject({
+      method: "POST",
+      url: `/api/conversations/${CONVERSATION_ID}/messages`,
+      headers: { authorization: `Bearer ${sessionToken()}` },
+      payload: {
+        content: "请处理 https://github.com/cdotlock/new-repo",
+        repositoryId: null,
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(fixture.createConversationMessage).toHaveBeenCalledWith(expect.objectContaining({
+      repositoryId: repository.id,
+    }));
+  });
+
+  it("supports an explicit saved note without waking the direct Agent", async () => {
     const fixture = await createFixture();
     const response = await fixture.app.inject({
       method: "POST",
       url: `/api/conversations/${CONVERSATION_ID}/messages`,
       headers: { authorization: `Bearer ${sessionToken()}` },
-      payload: { content: "@builder 谢谢，先不用继续" },
+      payload: { content: "@builder 谢谢，先不用继续", wake: false },
     });
 
     expect(response.statusCode).toBe(200);
     expect(fixture.createConversationMessage).toHaveBeenCalledWith(
       expect.not.objectContaining({ invokeAgentActorId: expect.anything() }),
     );
+  });
+
+  it("queues a real follow-up when an active run cannot accept steer", async () => {
+    const sendRunCommand = vi.fn(async () => ({ accepted: false, error: "steer unsupported" }));
+    const fixture = await createFixture(directThread, {
+      sendRunCommand,
+    } as unknown as MobWorker);
+    fixture.createConversationMessage.mockResolvedValueOnce({
+      message: {
+        id: "77777777-7777-4777-8777-777777777777",
+        workspaceId: WORKSPACE_ID,
+        taskId: null,
+        conversationId: CONVERSATION_ID,
+        actorId: HUMAN_ID,
+        sourceRunId: null,
+        kind: "comment",
+        body: "补充：先修登录",
+        mentions: [],
+        createdAt: now,
+      },
+      queuedRuns: [],
+      deliveries: [{ agentActorId: AGENT_ID, runId: RUN_ID, action: "steer" }],
+    });
+
+    const response = await fixture.app.inject({
+      method: "POST",
+      url: `/api/conversations/${CONVERSATION_ID}/messages`,
+      headers: { authorization: `Bearer ${sessionToken()}` },
+      payload: { content: "补充：先修登录" },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(sendRunCommand).toHaveBeenCalledWith(RUN_ID, {
+      type: "steer",
+      message: "补充：先修登录",
+    });
+    expect(fixture.queueConversationFollowUp).toHaveBeenCalledWith(expect.objectContaining({
+      predecessorRunId: RUN_ID,
+      messageId: "77777777-7777-4777-8777-777777777777",
+      agentActorId: AGENT_ID,
+    }));
+    expect(response.json().deliveries).toContainEqual(expect.objectContaining({
+      action: "queued_follow_up",
+      waitForRunId: RUN_ID,
+    }));
   });
 
   it("invokes one mentioned Agent exactly once in the primary group", async () => {
@@ -171,7 +322,31 @@ describe("conversation API", () => {
       conversationId: CONVERSATION_ID,
       actorId: HUMAN_ID,
       body: "@builder inspect this",
-      invokeAgentActorId: AGENT_ID,
+      invokeAgentActorIds: [AGENT_ID],
+    }));
+  });
+
+  it("wakes an @mentioned workspace Agent from a group and adds membership", async () => {
+    const fixture = await createFixture({
+      ...directThread,
+      conversation: { ...directThread.conversation, kind: "group" },
+      members: directThread.members.filter((member) => member.actorId === HUMAN_ID),
+    });
+    const response = await fixture.app.inject({
+      method: "POST",
+      url: `/api/conversations/${CONVERSATION_ID}/messages`,
+      headers: { authorization: `Bearer ${sessionToken()}` },
+      payload: { content: "@reviewer challenge this plan" },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(fixture.addConversationMembers).toHaveBeenCalledWith(
+      CONVERSATION_ID,
+      WORKSPACE_ID,
+      [REVIEWER_ID],
+    );
+    expect(fixture.createConversationMessage).toHaveBeenCalledWith(expect.objectContaining({
+      invokeAgentActorIds: [REVIEWER_ID],
     }));
   });
 
@@ -196,7 +371,7 @@ describe("conversation API", () => {
       conversationId: CONVERSATION_ID,
       actorId: HUMAN_ID,
       body: "review this",
-      invokeAgentActorId: REVIEWER_ID,
+      invokeAgentActorIds: [REVIEWER_ID],
     }));
   });
 
@@ -292,6 +467,49 @@ describe("conversation API", () => {
     },
   );
 
+  it("does not import a repository URL from Agent mob say output", async () => {
+    const fixture = await createFixture({
+      ...directThread,
+      runs: [{
+        id: RUN_ID,
+        workspaceId: WORKSPACE_ID,
+        taskId: TASK_ID,
+        conversationId: CONVERSATION_ID,
+        triggerMessageId: null,
+        agentActorId: AGENT_ID,
+        requestedByActorId: HUMAN_ID,
+        delegationId: null,
+        status: "running",
+        priority: 0,
+        writerRequired: true,
+        latestAttemptNumber: 1,
+        createdAt: now,
+        updatedAt: now,
+        completedAt: null,
+      }],
+    });
+    const token = issueRunToken({
+      actorId: AGENT_ID,
+      workspaceId: WORKSPACE_ID,
+      taskId: TASK_ID,
+      runId: RUN_ID,
+      attemptId: ATTEMPT_ID,
+    }, SECRET);
+
+    const response = await fixture.app.inject({
+      method: "POST",
+      url: `/api/tasks/${TASK_ID}/messages`,
+      headers: { authorization: `Bearer ${token}` },
+      payload: {
+        content: "See https://github.com/cdotlock/example for background.",
+        kind: "progress",
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(fixture.createRepositoryImport).not.toHaveBeenCalled();
+  });
+
   it("keeps a direct conversation private from another workspace human", async () => {
     const fixture = await createFixture();
 
@@ -308,6 +526,28 @@ describe("conversation API", () => {
 
     expect(denied.statusCode).toBe(404);
     expect(denied.json()).toMatchObject({ error: "not_found" });
+    expect(allowed.statusCode).toBe(200);
+  });
+
+  it("does not expose a hidden execution Task to a non-member of its conversation", async () => {
+    const fixture = await createFixture();
+    Object.assign(fixture.taskThread.task, {
+      isExecution: true,
+      executionConversationId: CONVERSATION_ID,
+    });
+
+    const denied = await fixture.app.inject({
+      method: "GET",
+      url: `/api/tasks/${TASK_ID}`,
+      headers: { authorization: `Bearer ${sessionTokenFor(secondHuman.id)}` },
+    });
+    const allowed = await fixture.app.inject({
+      method: "GET",
+      url: `/api/tasks/${TASK_ID}`,
+      headers: { authorization: `Bearer ${sessionToken()}` },
+    });
+
+    expect(denied.statusCode).toBe(404);
     expect(allowed.statusCode).toBe(200);
   });
 
@@ -668,12 +908,37 @@ describe("Agent identity API", () => {
   });
 });
 
-async function createFixture(thread: ConversationThread = directThread) {
+async function createFixture(thread: ConversationThread = directThread, worker?: MobWorker) {
   const dataDir = await mkdtemp(join(tmpdir(), "mob-conversations-"));
   temporaryDirectories.push(dataDir);
   const createConversation = vi.fn(async () => directThread);
-  const createConversationMessage = vi.fn(async (input: { body: string; actorId: string }) => ({
-    message: {
+  const createConversationMessage = vi.fn(async (input: {
+    body: string;
+    actorId: string;
+    invokeAgentActorIds?: string[];
+    invokeAgentActorId?: string;
+  }): Promise<CreateMessageResult> => {
+    const invokedAgentIds = input.invokeAgentActorIds ??
+      (input.invokeAgentActorId ? [input.invokeAgentActorId] : []);
+    const queuedRuns = invokedAgentIds.map((agentId) => ({
+      id: RUN_ID,
+      workspaceId: WORKSPACE_ID,
+      taskId: TASK_ID,
+      conversationId: CONVERSATION_ID,
+      triggerMessageId: "77777777-7777-4777-8777-777777777777",
+      waitForRunId: null,
+      agentActorId: agentId,
+      requestedByActorId: input.actorId,
+      delegationId: null,
+      status: "queued" as const,
+      priority: 0,
+      writerRequired: true,
+      latestAttemptNumber: 1,
+      createdAt: now,
+      updatedAt: now,
+      completedAt: null,
+    }));
+    return { message: {
       id: "77777777-7777-4777-8777-777777777777",
       workspaceId: WORKSPACE_ID,
       taskId: TASK_ID,
@@ -685,13 +950,42 @@ async function createFixture(thread: ConversationThread = directThread) {
       mentions: [],
       createdAt: now,
     },
-    queuedRuns: [],
-  }));
+    queuedRuns,
+    deliveries: queuedRuns.map((run) => ({
+      agentActorId: run.agentActorId,
+      runId: run.id,
+      action: "queued_run" as const,
+    })),
+  };
+  });
   const createMessage = vi.fn(async () => ({ message: {}, queuedRuns: [] }));
+  const createRepositoryImport = vi.fn();
+  const queueConversationFollowUp = vi.fn(async (input: { agentActorId: string }) => ({
+    run: {
+      id: "99999999-9999-4999-8999-999999999998",
+      workspaceId: WORKSPACE_ID,
+      taskId: TASK_ID,
+      conversationId: CONVERSATION_ID,
+      triggerMessageId: "77777777-7777-4777-8777-777777777777",
+      waitForRunId: RUN_ID,
+      agentActorId: input.agentActorId,
+      requestedByActorId: HUMAN_ID,
+      delegationId: null,
+      status: "queued" as const,
+      priority: 0,
+      writerRequired: true,
+      latestAttemptNumber: 1,
+      createdAt: now,
+      updatedAt: now,
+      completedAt: null,
+    },
+  }));
   const task = {
     id: TASK_ID,
     workspaceId: WORKSPACE_ID,
     repositoryId: "88888888-8888-4888-8888-888888888888",
+    executionConversationId: null,
+    isExecution: false,
     createdByActorId: HUMAN_ID,
     assignedActorId: null,
     title: "Task",
@@ -720,14 +1014,20 @@ async function createFixture(thread: ConversationThread = directThread) {
   const store = {
     getTask: vi.fn(async () => task),
     listRepositories: vi.fn(async () => []),
+    createRepositoryImport,
+    completeRepositoryImport: vi.fn(),
     listActors: vi.fn(async () => [human, secondHuman, agent, reviewer]),
     createConversation,
+    addConversationMembers: vi.fn(async () => []),
+    updateConversationActiveRepository: vi.fn(async () => thread.conversation),
     getConversationThread: vi.fn(async () => thread),
+    getConversationContext: vi.fn(async () => thread),
     canActorAccessConversation: vi.fn(async (conversationId: string, actorId: string) =>
       conversationId === CONVERSATION_ID && thread.members.some((member) => member.actorId === actorId),
     ),
     canActorAccessTaskRepository: vi.fn(async () => true),
     createConversationMessage,
+    queueConversationFollowUp,
     createMessage,
     getTaskThread: vi.fn(async () => taskThread),
     sql: vi.fn(async () => [{
@@ -744,17 +1044,22 @@ async function createFixture(thread: ConversationThread = directThread) {
   const files = {
     workspaceRoot: vi.fn(() => join(dataDir, "state", "workspaces", WORKSPACE_ID)),
     repairTaskThread: vi.fn(async () => ({ root: "", written: 0, paths: [], removed: 0 })),
+    repairConversationThread: vi.fn(async () => ({ root: "", written: 0, paths: [], removed: 0 })),
     writeActor: vi.fn(async () => "actor.json"),
     writeAgentProfile: vi.fn(async () => "profile.json"),
+    writeRepository: vi.fn(async () => "repository.json"),
   } as unknown as FileWorkspaceStore;
-  const app = await buildApp({ config: config(dataDir), store, files });
+  const app = await buildApp({ config: config(dataDir), store, files, ...(worker ? { worker } : {}) });
   openApps.push(app);
   return {
     app,
     store,
     createConversation,
     createConversationMessage,
+    addConversationMembers: (store as unknown as { addConversationMembers: ReturnType<typeof vi.fn> }).addConversationMembers,
     createMessage,
+    createRepositoryImport,
+    queueConversationFollowUp,
     taskThread,
     writeActor: (files as unknown as { writeActor: ReturnType<typeof vi.fn> }).writeActor,
     writeAgentProfile: (files as unknown as { writeAgentProfile: ReturnType<typeof vi.fn> }).writeAgentProfile,

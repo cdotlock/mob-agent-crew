@@ -25,6 +25,7 @@ const TASK_ID = "44444444-4444-4444-8444-444444444444";
 const REPOSITORY_ID = "55555555-5555-4555-8555-555555555555";
 const RUN_ID = "66666666-6666-4666-8666-666666666666";
 const ATTEMPT_ID = "77777777-7777-4777-8777-777777777777";
+const EXECUTION_CONVERSATION_ID = "88888888-8888-4888-8888-888888888888";
 const SECRET = "review-publication-test-secret-more-than-32-characters";
 const now = new Date("2026-08-13T00:00:00.000Z");
 const temporaryDirectories: string[] = [];
@@ -76,6 +77,36 @@ describe("human review and publication API", () => {
 
     expect(response.statusCode).toBe(200);
     expect(response.json()).toMatchObject({ status: "open", resolution: "unreviewed" });
+  });
+
+  it("records a hidden execution review in its canonical conversation ledger", async () => {
+    const fixture = await createFixture();
+    const executionTask = {
+      ...task,
+      executionConversationId: EXECUTION_CONVERSATION_ID,
+      isExecution: true,
+    };
+    fixture.getTask.mockResolvedValueOnce(executionTask);
+    fixture.reviewTask.mockResolvedValueOnce({ ...executionTask, status: "completed" });
+
+    const response = await fixture.app.inject({
+      method: "POST",
+      url: `/api/tasks/${TASK_ID}/reviews`,
+      headers: { authorization: `Bearer ${sessionToken()}` },
+      payload: { decision: "accept", note: "Looks good." },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(fixture.createConversationMessage).toHaveBeenCalledWith(expect.objectContaining({
+      conversationId: EXECUTION_CONVERSATION_ID,
+      actorId: HUMAN_ID,
+      kind: "system",
+      invokeAgentActorIds: [],
+    }));
+    expect(fixture.createMessage).not.toHaveBeenCalled();
+    expect(fixture.repairConversationThread).toHaveBeenCalledWith(expect.objectContaining({
+      conversation: expect.objectContaining({ id: EXECUTION_CONVERSATION_ID }),
+    }));
   });
 
   it("publishes only after an explicit human confirmation and writes the approved audit record", async () => {
@@ -169,6 +200,8 @@ const task: Task = {
   id: TASK_ID,
   workspaceId: WORKSPACE_ID,
   repositoryId: REPOSITORY_ID,
+  executionConversationId: null,
+  isExecution: false,
   createdByActorId: HUMAN_ID,
   assignedActorId: AGENT_ID,
   title: "Review me",
@@ -230,6 +263,7 @@ async function createFixture() {
   });
   const reviewTask = vi.fn(async (_input: unknown): Promise<Task> => completed);
   const createMessage = vi.fn(async () => ({ message: {}, queuedRuns: [] }));
+  const createConversationMessage = vi.fn(async () => ({ message: {}, queuedRuns: [], deliveries: [] }));
   const requestApproval = vi.fn(async () => approval);
   const decideApproval = vi.fn(async () => approved);
   const withTaskPublicationLock = vi.fn(async (
@@ -246,6 +280,25 @@ async function createFixture() {
       return result;
     }),
     createMessage,
+    createConversationMessage,
+    canActorAccessConversation: vi.fn(async () => true),
+    getConversationContext: vi.fn(async () => ({
+      conversation: {
+        id: EXECUTION_CONVERSATION_ID,
+        workspaceId: WORKSPACE_ID,
+        taskId: null,
+        activeRepositoryId: REPOSITORY_ID,
+        createdByActorId: HUMAN_ID,
+        kind: "direct",
+        title: null,
+        isPrimary: false,
+        createdAt: now,
+        updatedAt: now,
+      },
+      members: [],
+      messages: [],
+      runs: [],
+    })),
     getTaskThread: vi.fn(async () => emptyThread(latestTask)),
     listActors: vi.fn(async () => [{
       id: HUMAN_ID,
@@ -272,10 +325,12 @@ async function createFixture() {
     }]),
   } as unknown as CollaborationStore;
   const repairTaskThread = vi.fn(async () => ({ root: "", written: 0, paths: [], removed: 0 }));
+  const repairConversationThread = vi.fn(async () => ({ root: "", written: 0, paths: [], removed: 0 }));
   const writeApproval = vi.fn(async () => "approval.json");
   const files = {
     workspaceRoot: vi.fn(() => join(dataDir, "state", "workspaces", WORKSPACE_ID)),
     repairTaskThread,
+    repairConversationThread,
     writeApproval,
   } as unknown as FileWorkspaceStore;
   const app = await buildApp({ config: config(dataDir), store, files });
@@ -286,10 +341,12 @@ async function createFixture() {
     getTask: (store as unknown as { getTask: ReturnType<typeof vi.fn> }).getTask,
     reviewTask,
     createMessage,
+    createConversationMessage,
     requestApproval,
     decideApproval,
     withTaskPublicationLock,
     repairTaskThread,
+    repairConversationThread,
     writeApproval,
   };
 }
