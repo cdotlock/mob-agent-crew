@@ -26,6 +26,7 @@ Discover the environment before acting:
     mob conversation list
     mob agent list
     mob model list
+    mob capability list
     mob wiki list --area wiki
 
 Import a local Markdown tree without following hidden paths or symlinks:
@@ -39,13 +40,19 @@ Run and observe an Agent:
     mob run watch <run-id>
     mob run steer <run-id> "also run the focused regression test"
 
-Chat and Agent execution are intentionally separate. A normal message does not
-start compute. Use `agent invoke`, `conversation send --invoke`, or the browser's
-explicit Run action when work should begin.
+Chat notes and Agent execution are separate. In a direct browser chat,
+`Run @agent` is the primary action and streams the real CLI in the right-hand
+terminal; `Post note` records context without starting compute. External clients
+use `agent invoke` or `conversation send --invoke` when work should begin.
 
 Agent identity is a thin composition:
 
-    identity + harness + model + skill references + environment references
+    identity + harness + model + shared Skills + installed Plugins + Environment
+
+`mob capability list` reads the file-native shared catalog. Skill instructions
+and secret-free Environment values are resolved for each run. Plugin catalog
+files never install or execute code; only control-plane-installed, compatible
+Plugins can be selected.
 
 Mob owns collaboration state and access rules. Each installed harness still
 owns its private implementation and memory. Never send provider or GitHub keys

@@ -39,6 +39,7 @@ import {
   createConversation,
   createSession,
   createTask,
+  fetchCapabilityCatalog,
   fetchModelCatalog,
   fetchBootstrap,
   fetchConversation,
@@ -53,9 +54,11 @@ import {
   retryRun,
   reviewTask,
   updateAgent,
+  upsertCapabilityCatalogEntry,
   uploadMarkdown,
 } from "./api.js";
 import { ApiError } from "./api.js";
+import type { CapabilityCatalogKind } from "./api.js";
 import {
   createDemoDetail,
   demoBootstrap,
@@ -70,6 +73,7 @@ import type {
   AgentRun,
   Artifact,
   BootstrapData,
+  CapabilityCatalog,
   ConversationDetail,
   ConversationSummary,
   ImportedContext,
@@ -407,11 +411,13 @@ function MessageItem({
   agents,
   artifacts,
   onOpenArtifact,
+  runAction,
 }: {
   message: ThreadMessage;
   agents: AgentProfile[];
   artifacts: Artifact[];
   onOpenArtifact: (artifactId: string) => void;
+  runAction?: { label: string; onRun: () => void; disabled: boolean };
 }) {
   const visibleContent = visibleMessageContent(message);
   const linkedArtifacts = message.artifactIds
@@ -449,6 +455,11 @@ function MessageItem({
               </button>
             ))}
           </div>
+        ) : null}
+        {runAction ? (
+          <button className="message-run-action" onClick={runAction.onRun} disabled={runAction.disabled}>
+            <Code /> {runAction.label}
+          </button>
         ) : null}
       </div>
     </article>
@@ -492,6 +503,8 @@ function Composer({
         agent.name.toLowerCase().startsWith(mentionQuery),
       ).slice(0, 5);
   const reopensTask = task.status === "completed" || task.status === "cancelled";
+  const runLimitReached = task.budgetLimit > 0 && task.budgetUsed >= task.budgetLimit;
+  const directAgent = conversationKind === "direct" ? runAgents.find((agent) => agent.id === runAgentId) : null;
 
   useEffect(() => setMentionIndex(0), [mentionQuery]);
   useEffect(() => {
@@ -531,6 +544,10 @@ function Composer({
     }
     if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
       event.preventDefault();
+      if (runAgentId) {
+        if (!runLimitReached) onRunAgent(runAgentId);
+        return;
+      }
       onSend();
     }
   }
@@ -558,10 +575,13 @@ function Composer({
       ) : null}
       <div className="composer" aria-label={`Message #${slug(task.title)}`}>
         <textarea
+          id="agent-instruction-composer"
           value={value}
           onChange={(event) => onChange(event.target.value)}
           onKeyDown={onKeyDown}
-          placeholder={`Write a message or an Agent instruction for ${conversationKind === "direct" ? "this direct chat" : `#${slug(task.title)}`}…`}
+          placeholder={conversationKind === "direct" && directAgent
+            ? `Tell @${directAgent.handle} what to do. Run Agent to receive a reply and stream its work…`
+            : `Write a message or an Agent instruction for #${slug(task.title)}…`}
           rows={3}
           disabled={busy}
           aria-label="Message the task thread"
@@ -588,7 +608,9 @@ function Composer({
             <button className="composer-tool" onClick={() => onChange(`${value}${value && !value.endsWith(" ") ? " " : ""}@`)} aria-label="Mention an agent" title="Mention an agent">
               <At />
             </button>
-            <span className="composer-hint">Send = chat only · Run = start Agent</span>
+            <span className="composer-hint">{conversationKind === "direct"
+              ? `Run Agent = reply + live work${navigator.platform.includes("Mac") ? " · ⌘↵" : " · Ctrl↵"}`
+              : "Run Agent starts work · Post note only records chat"}</span>
           </div>
           <div className="composer-submit-actions">
             {runAgents.length ? (
@@ -598,16 +620,18 @@ function Composer({
                     {runAgents.map((agent) => <option key={agent.id} value={agent.id}>@{agent.handle}</option>)}
                   </select>
                 ) : null}
-                <button className="run-agent-button" onClick={() => onRunAgent(runAgentId)} disabled={!value.trim() || busy || !runAgentId} aria-label={`Run ${runAgents.find((agent) => agent.id === runAgentId)?.name ?? "Agent"} with this instruction`}>
+                <button className="run-agent-button" onClick={() => onRunAgent(runAgentId)} disabled={!value.trim() || busy || !runAgentId || runLimitReached} aria-label={`Run ${runAgents.find((agent) => agent.id === runAgentId)?.name ?? "Agent"} with this instruction`}>
                   {busy ? <SpinnerGap className="spin" /> : <Code />}
-                  <span>{reopensTask
-                    ? `Reopen & run${runAgents.length === 1 ? ` ${runAgents[0]?.name}` : ""}`
-                    : runAgents.length === 1 ? `Run @${runAgents[0]?.handle}` : `Run @${runAgents.find((agent) => agent.id === runAgentId)?.handle ?? "agent"}`}</span>
+                  <span>{runLimitReached
+                    ? "Run limit reached"
+                    : reopensTask
+                    ? `Reopen task & run @${runAgents.find((agent) => agent.id === runAgentId)?.handle ?? "agent"}`
+                    : `Run @${runAgents.find((agent) => agent.id === runAgentId)?.handle ?? "agent"}`}</span>
                 </button>
               </div>
             ) : null}
-            <button className="send-button" onClick={onSend} disabled={!value.trim() || busy} aria-label="Send chat message without running an Agent" title="Send chat only">
-              {busy ? <SpinnerGap className="spin" /> : <PaperPlaneRight weight="fill" />}<span>Send</span>
+            <button className="send-button" onClick={onSend} disabled={!value.trim() || busy} aria-label="Post a note without running an Agent" title="This records a note only; the Agent will not reply">
+              {busy ? <SpinnerGap className="spin" /> : <PaperPlaneRight />}<span>Post note</span>
             </button>
           </div>
         </div>
@@ -628,6 +652,7 @@ function ThreadPane({
   onComposerChange,
   onSend,
   onRunAgent,
+  onRunMessage,
   onUpload,
   onOpenGithub,
   onOpenArtifact,
@@ -647,6 +672,7 @@ function ThreadPane({
   onComposerChange: (value: string) => void;
   onSend: () => void;
   onRunAgent: (agentId: string) => void;
+  onRunMessage: (agentId: string, content: string) => void;
   onUpload: (file: File) => void;
   onOpenGithub: () => void;
   onOpenArtifact: (artifactId: string) => void;
@@ -688,6 +714,11 @@ function ThreadPane({
   const conversationLabel = conversation?.kind === "direct" ? "Direct chat" : conversation?.isPrimary ? "Primary group" : "Group chat";
   const activeRun = [...task.runs].reverse().find((run) => !terminalRunStatuses.has(run.status));
   const activeAgent = activeRun ? agents.find((agent) => agent.id === activeRun.agentId) : null;
+  const triggeredMessageIds = new Set(task.runs.map((run) => run.triggerMessageId).filter(Boolean));
+  const lastRunnableMessageId = conversation?.kind === "direct" && !activeRun && task.runs.length === 0
+    ? [...task.messages].reverse().find((message) => message.actorKind === "human" && !message.runId && !triggeredMessageIds.has(message.id) && !task.runs.some((run) => run.summary.trim() === message.content.trim()))?.id ?? null
+    : null;
+  const directRunAgent = conversation?.kind === "direct" ? runnableAgents[0] : null;
   return (
     <main className="thread-pane pane" id="main-content">
       <header className="thread-header">
@@ -733,7 +764,11 @@ function ThreadPane({
           <div>
             <p className="eyebrow">{conversationLabel}</p>
             <h3>{activeTitle}</h3>
-            <p>{conversation?.isPrimary || !conversation ? task.description : `A task-scoped ${conversation.kind} transcript. Chat stays chat until you explicitly run an Agent.`}</p>
+            <p>{conversation?.isPrimary || !conversation
+              ? task.description
+              : conversation.kind === "direct" && directRunAgent
+                ? `Give @${directRunAgent.handle} an instruction and use Run Agent to get a reply. Post note records context without starting the Agent.`
+                : `A task-scoped ${conversation.kind} transcript. Use Run Agent when you want an Agent to work.`}</p>
             <div className="intro-badges">
               <span><GitBranch /> {task.baseRef}</span>
               <span><UsersThree /> {participants.length || task.participantIds.length} agents</span>
@@ -745,7 +780,18 @@ function ThreadPane({
         <div className="date-divider"><span>Shared activity</span></div>
 
         {task.messages.length ? task.messages.map((message) => (
-          <MessageItem key={message.id} message={message} agents={agents} artifacts={task.artifacts} onOpenArtifact={onOpenArtifact} />
+          <MessageItem
+            key={message.id}
+            message={message}
+            agents={agents}
+            artifacts={task.artifacts}
+            onOpenArtifact={onOpenArtifact}
+            {...(message.id === lastRunnableMessageId && directRunAgent ? { runAction: {
+              label: `Run this with @${directRunAgent.handle}`,
+              onRun: () => onRunMessage(directRunAgent.id, message.content),
+              disabled: actionBusy,
+            } } : {})}
+          />
         )) : (
           <div className="messages-empty">
             <ChatCircleDots />
@@ -755,7 +801,7 @@ function ThreadPane({
         )}
       </section>
 
-      {task.status === "review_ready" ? (
+      {(conversation?.isPrimary ?? true) && task.status === "review_ready" ? (
         <div className="review-bar">
           <div className="review-copy"><CheckCircle weight="duotone" /><span><strong>Combined result ready</strong><small>Review the patch and fresh test evidence before publication.</small></span></div>
           <div className="review-actions">
@@ -765,7 +811,7 @@ function ThreadPane({
         </div>
       ) : null}
 
-      {task.status === "completed" && task.resolution === "accepted" && !task.branch.startsWith("mob/") ? (
+      {(conversation?.isPrimary ?? true) && task.status === "completed" && task.resolution === "accepted" && !task.branch.startsWith("mob/") ? (
         <div className="review-bar">
           <div className="review-copy"><ShieldCheck weight="duotone" /><span><strong>Result accepted</strong><small>SCM publication is still separate and requires your confirmation.</small></span></div>
           <div className="review-actions">
@@ -954,7 +1000,7 @@ function InspectorPane({
           </div>
         </section>
         <section className="inspector-section budget-section">
-          <div className="inspector-heading"><span>Task guardrails</span><small>${task.budgetUsed.toFixed(2)} / ${task.budgetLimit.toFixed(2)}</small></div>
+          <div className="inspector-heading"><span>Task guardrails</span><small>Runs used {task.budgetUsed} / {task.budgetLimit}</small></div>
           <div className="budget-track"><span style={{ width: `${Math.min(100, task.budgetLimit ? (task.budgetUsed / task.budgetLimit) * 100 : 0)}%` }} /></div>
           <div className="guardrail-grid"><span><ShieldCheck /> Writer lease</span><strong>1 at a time</strong><span><UsersThree /> Delegation depth</span><strong>{task.delegationDepth} / {task.maxDelegationDepth}</strong></div>
         </section>
@@ -1059,6 +1105,7 @@ function ControlCenterModal({ onClose }: { onClose: () => void }) {
   return (
     <Modal title="Connect & control" description="Everything needed to operate the same environment from the browser, another computer, or another LLM." onClose={onClose}>
       <div className="control-center">
+        <section><span className="control-center-icon"><ChatCircleDots /></span><div><p className="eyebrow">Quick start</p><h3>Get an Agent reply in three steps</h3><ol className="quick-start-list"><li><strong>Write an instruction</strong><small>Open a direct chat and describe the concrete result you want.</small></li><li><strong>Run @Agent</strong><small>Use the purple Run button. “Post note” only records chat and never wakes an Agent.</small></li><li><strong>Watch live work</strong><small>The right terminal streams the CLI process, tools, output, and completion state.</small></li></ol></div></section>
         <section><span className="control-center-icon"><GithubLogo /></span><div><p className="eyebrow">GitHub CLI</p><h3>{github.status?.configured ? "Credential configured" : "Setup required for private repositories"}</h3><p>{github.status?.configured ? "A control-plane credential is present. Verify it with gh auth status; Mob never exposes it to Agents." : "Public repositories work without a token. Configure a repository-scoped GH_TOKEN through Railway standard input."}</p>{!github.status?.configured ? <div className="setup-command"><code>railway variable set GH_TOKEN --stdin --skip-deploys</code><small>Redeploy, then run <code>gh auth status --hostname github.com</code> in the service shell.</small></div> : null}</div></section>
         <section><span className="control-center-icon"><Code /></span><div><p className="eyebrow">External CLI</p><h3>Install `mob` on any computer</h3><div className="setup-command"><code>git clone https://github.com/cdotlock/mob-agent-crew.git</code><code>cd mob-agent-crew &amp;&amp; sh scripts/install-cli.sh</code><small>Then use <code>mob login</code>, <code>mob task list</code>, and <code>mob agent invoke</code>.</small></div></div></section>
         <section><span className="control-center-icon"><BookOpenText /></span><div><p className="eyebrow">Give this to an LLM</p><h3>Machine-readable control guide</h3><p>The short discovery document explains authentication, Agent invocation, runs, Wiki queries, and safety boundaries.</p><div className="control-center-links"><a className="primary-button" href="/llms.txt" target="_blank" rel="noreferrer"><BookOpenText /> Open /llms.txt</a><a className="secondary-button" href="https://github.com/cdotlock/mob-agent-crew/blob/main/docs/llm-control.md" target="_blank" rel="noreferrer"><FileMd /> Full guide</a></div></div></section>
@@ -1084,10 +1131,19 @@ function NewConversationModal({
   onClose: () => void;
   onSubmit: (input: NewConversationInput) => void;
 }) {
+  const taskIsClosed = (task: TaskSummary) => task.status === "completed" || task.status === "cancelled";
+  const activeTasks = tasks.filter((task) => !taskIsClosed(task));
+  const closedTasks = tasks.filter(taskIsClosed);
+  const initialTask = tasks.find((task) => task.id === initialTaskId);
+  const initialSelectableTaskId = initialTask && !taskIsClosed(initialTask)
+    ? initialTask.id
+    : activeTasks[0]?.id ?? "";
   const [kind, setKind] = useState<NewConversationInput["kind"]>("direct");
-  const [taskId, setTaskId] = useState(initialTaskId || tasks[0]?.id || "");
+  const [taskId, setTaskId] = useState(initialSelectableTaskId);
   const [title, setTitle] = useState("");
   const [members, setMembers] = useState<string[]>(agents[0]?.id ? [agents[0].id] : []);
+  const chosenTask = tasks.find((task) => task.id === taskId);
+  const chosenTaskIsClosed = Boolean(chosenTask && taskIsClosed(chosenTask));
   const valid = Boolean(taskId && members.length && (kind === "group" ? title.trim() : members.length === 1));
 
   function chooseKind(next: NewConversationInput["kind"]) {
@@ -1104,7 +1160,7 @@ function NewConversationModal({
   }
 
   return (
-    <Modal title="Create a conversation" description="Chats share a task environment, but messages do not run an Agent until you press Run." onClose={onClose}>
+    <Modal title="Create a conversation" description="A direct chat’s primary action runs the selected Agent and streams its reply. Posting a note records context only." onClose={onClose}>
       <form className="modal-form" onSubmit={(event) => {
         event.preventDefault();
         if (valid) onSubmit({ taskId, kind, title: kind === "group" ? title.trim() : null, members });
@@ -1115,7 +1171,13 @@ function NewConversationModal({
           <button type="button" className={kind === "direct" ? "is-selected" : ""} onClick={() => chooseKind("direct")} aria-pressed={kind === "direct"}><ChatCircleDots /><span><strong>Direct</strong><small>One human + one Agent</small></span></button>
           <button type="button" className={kind === "group" ? "is-selected" : ""} onClick={() => chooseKind("group")} aria-pressed={kind === "group"}><UsersThree /><span><strong>Group</strong><small>Named room with Agents</small></span></button>
         </fieldset>
-        <label><span>Task environment</span><select value={taskId} onChange={(event) => setTaskId(event.target.value)}>{tasks.map((task) => <option key={task.id} value={task.id}>{task.title} · {task.repository}</option>)}</select></label>
+        <label><span>Task environment</span><select value={taskId} onChange={(event) => setTaskId(event.target.value)}>
+          <option value="" disabled>{activeTasks.length ? "Choose an active task" : "No active task — create a new task first"}</option>
+          {activeTasks.length ? <optgroup label="Active tasks">{activeTasks.map((task) => <option key={task.id} value={task.id}>{task.title} · {task.repository} · {taskStatusCopy[task.status]}</option>)}</optgroup> : null}
+          {closedTasks.length ? <optgroup label="Closed tasks (explicit reopen)">{closedTasks.map((task) => <option key={task.id} value={task.id}>{task.title} · {task.repository} · {taskStatusCopy[task.status]}</option>)}</optgroup> : null}
+        </select><small>New conversations reuse a task’s repository, files, run limit, and history.</small></label>
+        {!activeTasks.length && !taskId ? <div className="catalog-alert is-warning"><WarningCircle /><span><strong>Create a new task first</strong><small>All existing tasks are closed. A fresh task has a clean run budget and avoids reopening accepted work.</small></span></div> : null}
+        {chosenTaskIsClosed ? <div className="catalog-alert is-warning"><WarningCircle /><span><strong>This task is {taskStatusCopy[chosenTask!.status].toLowerCase()}</strong><small>The first Agent run will explicitly reopen it and still uses its existing task-wide run budget. A new task is safer for unrelated work.</small></span></div> : null}
         {kind === "group" ? <label><span>Group name</span><input autoFocus required value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Release review" /></label> : null}
         <fieldset className="conversation-members">
           <legend>{kind === "direct" ? "Agent" : "Agent members"}</legend>
@@ -1137,18 +1199,136 @@ function NewConversationModal({
   );
 }
 
+type CapabilityPickerOption = {
+  id: string;
+  name: string;
+  description: string;
+  meta: string;
+  disabled?: boolean;
+  unavailableReason?: string;
+};
+
+function CapabilityPicker({
+  legend,
+  description,
+  options,
+  selected,
+  empty,
+  onToggle,
+}: {
+  legend: string;
+  description: string;
+  options: CapabilityPickerOption[];
+  selected: string[];
+  empty: string;
+  onToggle: (id: string) => void;
+}) {
+  return (
+    <fieldset className="capability-picker">
+      <legend>{legend}<small>{description}</small></legend>
+      {options.length ? <div className="capability-options">{options.map((option) => {
+        const checked = selected.includes(option.id);
+        const disabled = Boolean(option.disabled && !checked);
+        return (
+          <label key={option.id} className={classNames(checked && "is-selected", disabled && "is-disabled")}>
+            <input type="checkbox" checked={checked} disabled={disabled} onChange={() => onToggle(option.id)} />
+            <span><strong>{option.name}</strong><small>{option.description || option.id}</small></span>
+            <em>{disabled ? option.unavailableReason : option.meta}</em>
+          </label>
+        );
+      })}</div> : <p className="capability-empty">{empty}</p>}
+    </fieldset>
+  );
+}
+
+function CatalogManager({ onSaved }: { onSaved: () => Promise<void> }) {
+  const [kind, setKind] = useState<CapabilityCatalogKind>("skills");
+  const [id, setId] = useState("");
+  const [name, setName] = useState("");
+  const [description, setDescription] = useState("");
+  const [instructions, setInstructions] = useState("");
+  const [safeValues, setSafeValues] = useState("");
+  const [compatibleDrivers, setCompatibleDrivers] = useState<NewAgentInput["driver"][]>([]);
+  const [saving, setSaving] = useState(false);
+  const [result, setResult] = useState<{ tone: "success" | "error"; message: string } | null>(null);
+  const idValid = /^[a-z0-9][a-z0-9_-]{0,62}:[a-z0-9][a-z0-9._-]{0,62}$/.test(id);
+
+  function toggleDriver(driver: NewAgentInput["driver"]) {
+    setCompatibleDrivers((current) => current.includes(driver) ? current.filter((entry) => entry !== driver) : [...current, driver]);
+  }
+
+  async function save() {
+    if (!idValid || !name.trim() || saving) return;
+    const values = Object.fromEntries(safeValues.split("\n").map((line) => line.trim()).filter(Boolean).map((line) => {
+      const separator = line.indexOf("=");
+      return separator > 0 ? [line.slice(0, separator).trim(), line.slice(separator + 1).trim()] : [line, ""];
+    }));
+    setSaving(true);
+    setResult(null);
+    try {
+      await upsertCapabilityCatalogEntry(kind, {
+        id,
+        name: name.trim(),
+        description: description.trim(),
+        ...(kind === "skills" ? { instructions } : {}),
+        ...(kind === "plugins" ? { instructions, compatibleDrivers } : {}),
+        ...(kind === "environments" ? { values } : {}),
+      });
+      await onSaved();
+      setResult({ tone: "success", message: kind === "plugins" ? "Plugin registered for the team. It stays unavailable until installed by the control plane." : "Saved to the shared catalog. Every Agent can select it now." });
+      setId("");
+      setName("");
+      setDescription("");
+      setInstructions("");
+      setSafeValues("");
+      setCompatibleDrivers([]);
+    } catch (saveError) {
+      setResult({ tone: "error", message: saveError instanceof Error ? saveError.message : "Catalog entry could not be saved." });
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <details className="catalog-manager">
+      <summary><Plus /> Add to shared catalog <small>Saved as files under capabilities/</small></summary>
+      <div className="catalog-manager-body">
+        <label><span>Type</span><select value={kind} onChange={(event) => { setKind(event.target.value as CapabilityCatalogKind); setResult(null); }}><option value="skills">Skill</option><option value="plugins">Plugin reference</option><option value="environments">Environment</option></select></label>
+        <div className="form-row">
+          <label><span>Shared ID</span><input value={id} onChange={(event) => setId(event.target.value.toLowerCase().replace(/[^a-z0-9:._-]/g, ""))} placeholder={`${kind === "skills" ? "skill" : kind === "plugins" ? "plugin" : "env"}:name`} aria-invalid={Boolean(id) && !idValid} /><small>Use namespace:name</small></label>
+          <label><span>Name</span><input value={name} onChange={(event) => setName(event.target.value)} placeholder="Repository review" /></label>
+        </div>
+        <label><span>Description</span><input value={description} onChange={(event) => setDescription(event.target.value)} placeholder="What teammates should use this for" /></label>
+        {kind === "skills" || kind === "plugins" ? <label><span>{kind === "skills" ? "Shared instructions" : "Plugin reference instructions"}</span><textarea rows={4} value={instructions} onChange={(event) => setInstructions(event.target.value)} placeholder="Plain Markdown instructions loaded into the Agent run…" /></label> : null}
+        {kind === "plugins" ? <fieldset className="catalog-driver-picker"><legend>Compatible harnesses <small>Leave empty for all</small></legend>{(["pi", "omp", "claude", "codex", "hermes", "deepseek"] as const).map((driver) => <label key={driver}><input type="checkbox" checked={compatibleDrivers.includes(driver)} onChange={() => toggleDriver(driver)} /> {driver}</label>)}<p>Registration never installs executable code. New Plugin references remain unavailable until the server control plane installs them.</p></fieldset> : null}
+        {kind === "environments" ? <label><span>Secret-free values</span><textarea rows={4} value={safeValues} onChange={(event) => setSafeValues(event.target.value)} placeholder="LOG_LEVEL=info" /><small>One KEY=value per line. Tokens, credentials, PATH, HOME, and Mob runtime variables are rejected.</small></label> : null}
+        {result ? <p className={classNames("catalog-save-result", `is-${result.tone}`)} role="status">{result.tone === "success" ? <CheckCircle /> : <WarningCircle />} {result.message}</p> : null}
+        <div className="catalog-manager-actions"><button type="button" className="secondary-button" onClick={() => void save()} disabled={saving || !idValid || !name.trim()}>{saving ? <SpinnerGap className="spin" /> : <Plus />} Add to catalog</button></div>
+      </div>
+    </details>
+  );
+}
+
 function NewAgentModal({
   busy,
   error,
-  models,
+  modelCatalog,
+  capabilityCatalog,
+  modelCatalogError,
+  capabilityCatalogError,
   initial,
+  onRetryCatalogs,
   onClose,
   onSubmit,
 }: {
   busy: boolean;
   error: string | null;
-  models: ModelCatalog["models"];
+  modelCatalog: ModelCatalog | null;
+  capabilityCatalog: CapabilityCatalog | null;
+  modelCatalogError: string | null;
+  capabilityCatalogError: string | null;
   initial?: AgentProfile;
+  onRetryCatalogs: () => Promise<void>;
   onClose: () => void;
   onSubmit: (input: NewAgentInput) => void;
 }) {
@@ -1160,12 +1340,9 @@ function NewAgentModal({
     role: initial?.role ?? "Coding agent",
     modelId: initial?.modelId ?? null,
     skillRefs: initial?.skillRefs ?? [],
+    pluginRefs: initial?.pluginRefs ?? [],
     environment: initial?.environment ?? { reference: null, values: {} },
   });
-  const [skills, setSkills] = useState((initial?.skillRefs ?? []).join(", "));
-  const [environmentValues, setEnvironmentValues] = useState(
-    Object.entries(initial?.environment.values ?? {}).map(([key, value]) => `${key}=${value}`).join("\n"),
-  );
   const handleValid = /^[a-z][a-z0-9_-]{1,31}$/.test(form.handle);
   const protocolByDriver: Record<NewAgentInput["driver"], ModelProtocol> = {
     pi: "openai-chat",
@@ -1175,44 +1352,135 @@ function NewAgentModal({
     claude: "anthropic-messages",
     codex: "openai-responses",
   };
-  const compatibleModels = models.filter((model) => model.protocols.includes(protocolByDriver[form.driver]));
+  const requiredProtocol = protocolByDriver[form.driver];
+  const models = modelCatalog?.models ?? [];
+  const compatibleModels = models.filter((model) => model.protocols.includes(requiredProtocol));
+  const incompatibleModels = models.filter((model) => !model.protocols.includes(requiredProtocol));
+  const catalogSkillIds = new Set((capabilityCatalog?.skills ?? []).map((entry) => entry.id));
+  const catalogEnvironmentIds = new Set((capabilityCatalog?.environments ?? []).map((entry) => entry.id));
+  const skillOptions = useMemo(() => {
+    const options = new Map((capabilityCatalog?.skills ?? []).map((entry) => [entry.id, entry]));
+    for (const id of initial?.skillRefs ?? []) {
+      if (!options.has(id)) options.set(id, { id, name: id, description: "Existing shared reference", source: "workspace", status: "available", instructions: "" });
+    }
+    return [...options.values()];
+  }, [capabilityCatalog, initial?.skillRefs]);
+  const pluginOptions = useMemo(() => {
+    const options = new Map((capabilityCatalog?.plugins ?? []).map((entry) => [entry.id, entry]));
+    for (const id of initial?.pluginRefs ?? []) {
+      if (!options.has(id)) options.set(id, { id, name: id, description: "Existing reference not in the shared catalog", source: "workspace", status: "unavailable", mode: "instructions-only", compatibleDrivers: [], instructions: "" });
+    }
+    return [...options.values()];
+  }, [capabilityCatalog, initial?.pluginRefs]);
+  const environmentOptions = useMemo(() => {
+    const options = new Map((capabilityCatalog?.environments ?? []).map((entry) => [entry.id, entry]));
+    const existingId = initial?.environment.reference;
+    if (existingId && !options.has(existingId)) options.set(existingId, { id: existingId, name: existingId, description: "Existing environment reference", source: "workspace", status: "available", values: initial?.environment.values ?? {}, valueKeys: Object.keys(initial?.environment.values ?? {}) });
+    return [...options.values()];
+  }, [capabilityCatalog, initial?.environment]);
+  const invalidSelectedPluginRefs = (form.pluginRefs ?? []).filter((id) => {
+    const plugin = pluginOptions.find((entry) => entry.id === id);
+    return !plugin || plugin.status !== "installed" || Boolean(plugin.compatibleDrivers.length && !plugin.compatibleDrivers.includes(form.driver));
+  });
+  const invalidSelectedSkillRefs = capabilityCatalog
+    ? (form.skillRefs ?? []).filter((id) => !catalogSkillIds.has(id))
+    : [];
+  const invalidSelectedEnvironmentRef = capabilityCatalog && form.environment?.reference && !catalogEnvironmentIds.has(form.environment.reference)
+    ? form.environment.reference
+    : null;
+
+  function toggleRef(field: "skillRefs" | "pluginRefs", id: string) {
+    const current = form[field] ?? [];
+    setForm({ ...form, [field]: current.includes(id) ? current.filter((entry) => entry !== id) : [...current, id] });
+  }
+
+  function chooseDriver(next: NewAgentInput["driver"]) {
+    const compatiblePluginRefs = (form.pluginRefs ?? []).filter((id) => {
+      const plugin = pluginOptions.find((entry) => entry.id === id);
+      return !plugin || (plugin.status === "installed" && (!plugin.compatibleDrivers.length || plugin.compatibleDrivers.includes(next)));
+    });
+    setForm({ ...form, driver: next, modelId: null, pluginRefs: compatiblePluginRefs });
+  }
+
+  function chooseEnvironment(id: string) {
+    setForm({ ...form, environment: { reference: id || null, values: {} } });
+  }
 
   function submitAgent() {
-    const values = Object.fromEntries(environmentValues.split("\n").map((line) => line.trim()).filter(Boolean).map((line) => {
-      const separator = line.indexOf("=");
-      return separator > 0 ? [line.slice(0, separator).trim(), line.slice(separator + 1).trim()] : [line, ""];
-    }));
     onSubmit({
       ...form,
       modelId: form.modelId || null,
-      skillRefs: skills.split(/[\s,]+/u).map((value) => value.trim()).filter(Boolean),
-      environment: {
-        reference: form.environment?.reference?.trim() || null,
-        values,
-      },
+      skillRefs: form.skillRefs ?? [],
+      pluginRefs: form.pluginRefs ?? [],
+      environment: { reference: form.environment?.reference ?? null, values: {} },
     });
   }
+
   return (
-    <Modal title={initial ? `Configure @${initial.handle}` : "Add an Agent"} description="One identity, four small choices. Mob checks compatibility and supplies safe defaults; the selected CLI still owns its own runtime internals." onClose={onClose}>
+    <Modal title={initial ? `Configure @${initial.handle}` : "Add an Agent"} description="Choose one CLI, one compatible model, and reusable workspace capabilities. The selected CLI still owns its runtime internals." onClose={onClose}>
       <form className="modal-form agent-composition-form" onSubmit={(event) => { event.preventDefault(); if (handleValid) submitAgent(); }}>
         {error ? <div className="inline-alert" role="alert"><WarningCircle /> {error}</div> : null}
+        {modelCatalogError || capabilityCatalogError ? (
+          <div className="catalog-alert" role="alert"><WarningCircle /><span><strong>Part of the shared catalog is unavailable</strong><small>{[modelCatalogError, capabilityCatalogError].filter(Boolean).join(" · ")}</small></span><button type="button" onClick={() => void onRetryCatalogs()}><ArrowCounterClockwise /> Retry</button></div>
+        ) : null}
         <div className="form-row">
           <label><span>Identity handle</span><input autoFocus={!initial} required readOnly={Boolean(initial)} value={form.handle} onChange={(event) => setForm({ ...form, handle: event.target.value.toLowerCase().replace(/[^a-z0-9_-]/g, "") })} placeholder="researcher" aria-invalid={Boolean(form.handle) && !handleValid} /><small>{initial ? "Stable after creation" : "Used for @mentions"}</small></label>
           <label><span>Display name</span><input required value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} placeholder="Researcher" /></label>
         </div>
-        <div className="composition-step"><span>1</span><label><strong>Harness</strong><small>The installed CLI that performs the work.</small><select value={form.driver} onChange={(event) => setForm({ ...form, driver: event.target.value as NewAgentInput["driver"], modelId: null })}>
+        <div className="composition-step"><span>1</span><label><strong>Harness</strong><small>The installed CLI that performs the work.</small><select value={form.driver} onChange={(event) => chooseDriver(event.target.value as NewAgentInput["driver"])}>
           <option value="pi">Pi</option><option value="omp">Oh My Pi</option><option value="claude">Claude Code</option><option value="codex">Codex</option><option value="hermes">Hermes</option><option value="deepseek">DeepSeek Harness</option>
         </select></label></div>
-        <div className="composition-step"><span>2</span><label><strong>Model</strong><small>Only compatible MobAI models are shown. Auto uses the workspace default.</small><select value={form.modelId ?? ""} onChange={(event) => setForm({ ...form, modelId: event.target.value || null })}>
+        <div className="composition-step"><span>2</span><label><strong>Model</strong><small>{modelCatalog
+          ? `${models.length} returned · ${compatibleModels.length} compatible with ${form.driver} · ${modelCatalog.source}${modelCatalog.stale ? " (stale)" : ""}`
+          : "MobAI model catalog unavailable. Auto remains available; retry to choose an explicit model."}</small><select value={form.modelId ?? ""} onChange={(event) => setForm({ ...form, modelId: event.target.value || null })}>
           <option value="">Auto · workspace default</option>
-          {compatibleModels.map((model) => <option key={model.id} value={model.id}>{model.name}{model.provider ? ` · ${model.provider}` : ""}</option>)}
-        </select></label></div>
-        <div className="composition-step"><span>3</span><label><strong>Skills</strong><small>References resolved by the chosen harness; comma-separated.</small><input value={skills} onChange={(event) => setSkills(event.target.value)} placeholder="workspace:typescript, repo:review" /></label></div>
-        <div className="composition-step"><span>4</span><label><strong>Environment</strong><small>A secret-free runtime label; safe values are optional below.</small><input value={form.environment?.reference ?? ""} onChange={(event) => setForm({ ...form, environment: { reference: event.target.value, values: form.environment?.values ?? {} } })} placeholder="workspace:railway-small" /></label></div>
-        <details className="composition-advanced"><summary>Advanced safe values</summary><label><span>One KEY=value per line</span><textarea rows={3} value={environmentValues} onChange={(event) => setEnvironmentValues(event.target.value)} placeholder="LOG_LEVEL=info" /><small>Provider keys, tokens, PATH/HOME, and Mob runtime variables are rejected or overridden.</small></label></details>
+          {compatibleModels.length ? <optgroup label={`Compatible (${compatibleModels.length})`}>{compatibleModels.map((model) => <option key={model.id} value={model.id}>{model.name}{model.provider ? ` · ${model.provider}` : ""}</option>)}</optgroup> : null}
+          {incompatibleModels.length ? <optgroup label={`Returned but unavailable for ${form.driver} (${incompatibleModels.length})`}>{incompatibleModels.map((model) => <option key={model.id} value={model.id} disabled>{model.name} · {model.protocols.length ? `supports ${model.protocols.join(", ")}; needs ${requiredProtocol}` : `no ${requiredProtocol} coding endpoint`}</option>)}</optgroup> : null}
+        </select>{modelCatalog?.warnings.length ? <small className="catalog-warning">Router note: {modelCatalog.warnings.join(" · ")}</small> : null}</label></div>
         <label><span>Role</span><input required value={form.role} onChange={(event) => setForm({ ...form, role: event.target.value })} placeholder="Repository research and documentation" /></label>
-        <div className="selected-agent agent-definition-preview"><span className="agent-definition-mark"><Code /></span><span><strong>@{form.handle || "handle"} · {form.driver} · {form.modelId || "Auto model"}</strong><small>{form.skillRefs?.length || skills.trim() ? "Custom skill references" : "Harness defaults"} · {form.environment?.reference || "Default environment"}</small></span></div>
-        <footer className="modal-actions"><button type="button" className="ghost-button" onClick={onClose}>Cancel</button><button className="primary-button" disabled={busy || !handleValid || !form.name.trim() || !form.role.trim()}>{busy ? <SpinnerGap className="spin" /> : initial ? <Check /> : <Plus />} {initial ? "Save configuration" : "Add Agent"}</button></footer>
+        <details className="composition-capabilities">
+          <summary><span><strong>Capabilities</strong><small>Optional · {(form.skillRefs?.length ?? 0)} skills · {(form.pluginRefs?.length ?? 0)} plugins · {form.environment?.reference ? "1 environment" : "default environment"}</small></span><CaretDown /></summary>
+          <div className="composition-capabilities-body">
+        <div className="composition-step capability-step"><span>3</span><CapabilityPicker
+          legend="Skills"
+          description={`${skillOptions.length} in shared library · select any reusable instructions`}
+          options={skillOptions.map((skill) => {
+            const available = !capabilityCatalog || catalogSkillIds.has(skill.id);
+            return { id: skill.id, name: skill.name, description: skill.description, meta: skill.source, disabled: !available, unavailableReason: "not in shared catalog" };
+          })}
+          selected={form.skillRefs ?? []}
+          empty={capabilityCatalogError ? "Skill library unavailable. Retry the catalog." : "No shared Skills yet. This Agent will use its harness defaults."}
+          onToggle={(id) => toggleRef("skillRefs", id)}
+        /></div>
+        <div className="composition-step capability-step"><span>4</span><CapabilityPicker
+          legend="Plugins"
+          description={`${pluginOptions.length} in shared library · instruction bundles only`}
+          options={pluginOptions.map((plugin) => {
+            const driverCompatible = !plugin.compatibleDrivers.length || plugin.compatibleDrivers.includes(form.driver);
+            const available = plugin.status === "installed" && driverCompatible;
+            return { id: plugin.id, name: plugin.name, description: plugin.description, meta: `${plugin.source} · ${plugin.mode}`, disabled: !available, unavailableReason: plugin.status !== "installed" ? "not installed" : `not compatible with ${form.driver}` };
+          })}
+          selected={form.pluginRefs ?? []}
+          empty={capabilityCatalogError ? "Plugin library unavailable. Retry the catalog." : "No shared Plugins yet. Plugins are optional."}
+          onToggle={(id) => toggleRef("pluginRefs", id)}
+        /></div>
+        <div className="composition-step"><span>5</span><label><strong>Environment</strong><small>{environmentOptions.length} secret-free profiles in the shared library.</small><select value={form.environment?.reference ?? ""} onChange={(event) => chooseEnvironment(event.target.value)}>
+          <option value="">Workspace default</option>
+          {environmentOptions.map((environment) => {
+            const available = !capabilityCatalog || catalogEnvironmentIds.has(environment.id);
+            return <option key={environment.id} value={environment.id} disabled={!available}>{environment.name} · {available ? environment.description || environment.id : "not in shared catalog"}{environment.valueKeys.length ? ` · ${environment.valueKeys.length} safe values` : ""}</option>;
+          })}
+        </select></label></div>
+        <CatalogManager onSaved={onRetryCatalogs} />
+          </div>
+        </details>
+        {invalidSelectedSkillRefs.length || invalidSelectedPluginRefs.length || invalidSelectedEnvironmentRef ? <div className="catalog-alert is-warning"><WarningCircle /><span><strong>Replace unavailable capability selections</strong><small>{[
+          ...invalidSelectedSkillRefs,
+          ...invalidSelectedPluginRefs,
+          ...(invalidSelectedEnvironmentRef ? [invalidSelectedEnvironmentRef] : []),
+        ].join(" · ")} is not available for this configuration. Open Capabilities and remove it or choose a shared catalog entry before saving.</small></span></div> : null}
+        <div className="selected-agent agent-definition-preview"><span className="agent-definition-mark"><Code /></span><span><strong>@{form.handle || "handle"} · {form.driver} · {form.modelId || "Auto model"}</strong><small>{form.skillRefs?.length ?? 0} skills · {form.pluginRefs?.length ?? 0} plugins · {form.environment?.reference || "Default environment"}</small></span></div>
+        <footer className="modal-actions"><span className="catalog-root">Shared catalog: {capabilityCatalog?.canonicalRoot ?? "capabilities"}/</span><button type="button" className="ghost-button" onClick={onClose}>Cancel</button><button className="primary-button" disabled={busy || !handleValid || !form.name.trim() || !form.role.trim() || Boolean(invalidSelectedSkillRefs.length || invalidSelectedPluginRefs.length || invalidSelectedEnvironmentRef)}>{busy ? <SpinnerGap className="spin" /> : initial ? <Check /> : <Plus />} {initial ? "Save configuration" : "Add Agent"}</button></footer>
       </form>
     </Modal>
   );
@@ -1293,6 +1561,9 @@ export function App() {
   const [composer, setComposer] = useState("");
   const [wikiOpen, setWikiOpen] = useState(false);
   const [modelCatalog, setModelCatalog] = useState<ModelCatalog | null>(null);
+  const [capabilityCatalog, setCapabilityCatalog] = useState<CapabilityCatalog | null>(null);
+  const [modelCatalogError, setModelCatalogError] = useState<string | null>(null);
+  const [capabilityCatalogError, setCapabilityCatalogError] = useState<string | null>(null);
   const [mobilePane, setMobilePane] = useState<MobilePane>("thread");
   const [modal, setModal] = useState<ModalKind>(null);
   const [editingAgentId, setEditingAgentId] = useState<string | null>(null);
@@ -1386,16 +1657,28 @@ export function App() {
     if (authState === "authenticated") void loadBootstrap();
   }, [authState, loadBootstrap]);
 
+  const loadCompositionCatalogs = useCallback(async (refreshModels = false) => {
+    if (source !== "api") return;
+    setModelCatalogError(null);
+    setCapabilityCatalogError(null);
+    const [modelsResult, capabilitiesResult] = await Promise.allSettled([
+      fetchModelCatalog(refreshModels),
+      fetchCapabilityCatalog(),
+    ]);
+    if (modelsResult.status === "fulfilled") setModelCatalog(modelsResult.value);
+    else {
+      setModelCatalogError(modelsResult.reason instanceof Error ? modelsResult.reason.message : "Model catalog could not be loaded.");
+    }
+    if (capabilitiesResult.status === "fulfilled") setCapabilityCatalog(capabilitiesResult.value);
+    else {
+      setCapabilityCatalogError(capabilitiesResult.reason instanceof Error ? capabilitiesResult.reason.message : "Capability catalog could not be loaded.");
+    }
+  }, [source]);
+
   useEffect(() => {
     if (source !== "api" || loadState !== "ready") return;
-    let stopped = false;
-    void fetchModelCatalog().then((catalog) => {
-      if (!stopped) setModelCatalog(catalog);
-    }).catch(() => {
-      if (!stopped) setModelCatalog(null);
-    });
-    return () => { stopped = true; };
-  }, [loadState, source]);
+    void loadCompositionCatalogs();
+  }, [loadCompositionCatalogs, loadState, source]);
 
   const loadTask = useCallback(async (task: TaskSummary, force = false) => {
     if (!force && detailCache[task.id]) return;
@@ -1533,6 +1816,10 @@ export function App() {
       setActionError("Choose a conversation before running an Agent.");
       return false;
     }
+    if (invoke && detail.budgetLimit > 0 && detail.budgetUsed >= detail.budgetLimit) {
+      setActionError(`This task has used all ${detail.budgetLimit} Agent runs. Create a new task for more work.`);
+      return false;
+    }
     const content = requestedContent;
     const optimisticId = `message-${crypto.randomUUID()}`;
     const optimistic: ThreadMessage = {
@@ -1600,6 +1887,7 @@ export function App() {
           finishedAt: null,
           summary: content,
           parentRunId: null,
+          triggerMessageId: optimisticId,
         };
         updateActiveTranscript((current) => ({
           messages: current.messages.map((message) => message.id === optimisticId ? { ...message, delivery: "sent" } : message),
@@ -1625,6 +1913,10 @@ export function App() {
 
   async function handleRunAgent(agentId: string) {
     await submitComposer(true, agentId);
+  }
+
+  async function handleRunMessage(agentId: string, content: string) {
+    await submitComposer(true, agentId, content);
   }
 
   async function handleWikiAgentQuestion(agentId: string, question: string, retrieval: KnowledgeQueryResult) {
@@ -1670,6 +1962,7 @@ export function App() {
           finishedAt: null,
           summary: input.deliverable,
           parentRunId: detail.runs.at(-1)?.id ?? null,
+          triggerMessageId: null,
         };
       }
       const system: ThreadMessage = {
@@ -1724,7 +2017,7 @@ export function App() {
         };
         created = createDemoDetail(summary, `@${agent?.name ?? "agent"} ${input.initialMessage}`);
         if (agent) {
-          created.runs = [{ id: `run-${crypto.randomUUID()}`, agentId: agent.id, role: "Initial assignment", status: "queued", attempt: 1, startedAt: null, finishedAt: null, summary: input.initialMessage, parentRunId: null }];
+          created.runs = [{ id: `run-${crypto.randomUUID()}`, agentId: agent.id, role: "Initial assignment", status: "queued", attempt: 1, startedAt: null, finishedAt: null, summary: input.initialMessage, parentRunId: null, triggerMessageId: null }];
         }
       }
       setTasks((current) => [created, ...current]);
@@ -1790,6 +2083,7 @@ export function App() {
         role: input.role,
         modelId: input.modelId ?? null,
         skillRefs: input.skillRefs ?? [],
+        pluginRefs: input.pluginRefs ?? [],
         environment: input.environment ?? null,
       });
       const live = await fetchBootstrap();
@@ -1808,6 +2102,12 @@ export function App() {
     setEditingAgentId(agentId);
     setModalError(null);
     setModal("edit-agent");
+  }
+
+  function focusInstructionComposer() {
+    setWikiOpen(false);
+    setMobilePane("thread");
+    window.requestAnimationFrame(() => document.getElementById("agent-instruction-composer")?.focus());
   }
 
   function importedContextToArtifact(context: ImportedContext, producerAgentId: string): Artifact {
@@ -2072,6 +2372,7 @@ export function App() {
               onComposerChange={setComposer}
               onSend={() => void handleSend()}
               onRunAgent={(agentId) => void handleRunAgent(agentId)}
+              onRunMessage={(agentId, content) => void handleRunMessage(agentId, content)}
               onUpload={(file) => void handleUpload(file)}
               onOpenGithub={() => { setModalError(null); setModal("github"); }}
               onOpenArtifact={handleOpenArtifact}
@@ -2082,14 +2383,14 @@ export function App() {
             />
           </>
         )}
-        <WorkspaceInspector task={detail} agents={agents} onDelegate={openDelegate} onConfigure={openAgentConfiguration} source={source} />
+        <WorkspaceInspector task={detail} agents={agents} onDelegate={openDelegate} onConfigure={openAgentConfiguration} onStartInstruction={focusInstructionComposer} source={source} />
       </div>
       <MobileNavigation active={mobilePane} onChange={setMobilePane} />
 
       {modal === "new-task" ? <NewTaskModal agents={agents} busy={modalBusy} error={modalError} onClose={() => setModal(null)} onSubmit={(input) => void handleCreateTask(input)} /> : null}
       {modal === "new-conversation" ? <NewConversationModal tasks={tasks} agents={agents} initialTaskId={selectedTaskId ?? ""} busy={modalBusy} error={modalError} onClose={() => setModal(null)} onSubmit={(input) => void handleCreateConversation(input)} /> : null}
-      {modal === "new-agent" ? <NewAgentModal models={modelCatalog?.models ?? []} busy={modalBusy} error={modalError} onClose={() => setModal(null)} onSubmit={(input) => void handleCreateAgent(input)} /> : null}
-      {modal === "edit-agent" && editingAgent ? <NewAgentModal initial={editingAgent} models={modelCatalog?.models ?? []} busy={modalBusy} error={modalError} onClose={() => { setModal(null); setEditingAgentId(null); }} onSubmit={(input) => void handleUpdateAgent(input)} /> : null}
+      {modal === "new-agent" ? <NewAgentModal modelCatalog={modelCatalog} capabilityCatalog={capabilityCatalog} modelCatalogError={modelCatalogError} capabilityCatalogError={capabilityCatalogError} onRetryCatalogs={() => loadCompositionCatalogs(true)} busy={modalBusy} error={modalError} onClose={() => setModal(null)} onSubmit={(input) => void handleCreateAgent(input)} /> : null}
+      {modal === "edit-agent" && editingAgent ? <NewAgentModal initial={editingAgent} modelCatalog={modelCatalog} capabilityCatalog={capabilityCatalog} modelCatalogError={modelCatalogError} capabilityCatalogError={capabilityCatalogError} onRetryCatalogs={() => loadCompositionCatalogs(true)} busy={modalBusy} error={modalError} onClose={() => { setModal(null); setEditingAgentId(null); }} onSubmit={(input) => void handleUpdateAgent(input)} /> : null}
       {modal === "delegate" ? <DelegateModal agents={agents} initialAgentId={delegateAgentId} busy={modalBusy} error={modalError} onClose={() => setModal(null)} onSubmit={(input) => void handleDelegate(input)} /> : null}
       {modal === "github" ? <GithubModal busy={modalBusy} error={modalError} onClose={() => setModal(null)} onSubmit={(url) => void handleGithubImport(url)} /> : null}
       {modal === "help" ? <ControlCenterModal onClose={() => setModal(null)} /> : null}

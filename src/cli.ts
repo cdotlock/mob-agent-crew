@@ -28,6 +28,7 @@ interface ListedAgent {
   harness?: string;
   modelId?: string | null;
   skillRefs?: string[];
+  pluginRefs?: string[];
   environment?: {
     reference?: string | null;
     values?: Record<string, string>;
@@ -45,6 +46,7 @@ interface AgentAddOptions {
   role: string;
   model?: string;
   skill?: string[];
+  plugin?: string[];
   environment?: string;
 }
 
@@ -56,6 +58,8 @@ interface AgentConfigureOptions {
   defaultModel?: boolean;
   skill?: string[];
   clearSkills?: boolean;
+  plugin?: string[];
+  clearPlugins?: boolean;
   environment?: string;
   clearEnvironment?: boolean;
 }
@@ -183,10 +187,12 @@ agentCommands.command("add")
   .option("--role <role>", "short collaboration role", "Coding collaborator")
   .option("--model <model>", "MobAI model ID; omit to use the harness default")
   .option("--skill <skill>", "skill reference (repeatable)", collectOption)
+  .option("--plugin <plugin>", "installed shared plugin reference (repeatable)", collectOption)
   .option("--environment <reference>", "secret-free environment reference, for example railway:default")
   .action(async (options: AgentAddOptions) => {
     const modelId = optionalNonEmpty(options.model, "--model");
     const skillRefs = options.skill?.map((value) => requiredNonEmpty(value, "--skill"));
+    const pluginRefs = options.plugin?.map((value) => requiredNonEmpty(value, "--plugin"));
     const environmentReference = optionalNonEmpty(options.environment, "--environment");
     console.log(JSON.stringify(await (await connectedClient()).request("/api/agents", {
       method: "POST",
@@ -197,6 +203,7 @@ agentCommands.command("add")
         role: options.role,
         ...(modelId === undefined ? {} : { modelId }),
         ...(skillRefs === undefined ? {} : { skillRefs }),
+        ...(pluginRefs === undefined ? {} : { pluginRefs }),
         ...(environmentReference === undefined
           ? {}
           : { environment: { reference: environmentReference, values: {} } }),
@@ -213,6 +220,8 @@ agentCommands.command("configure")
   .option("--default-model", "use the selected harness default model")
   .option("--skill <skill>", "replace skills with this reference (repeatable)", collectOption)
   .option("--clear-skills", "remove every configured skill reference")
+  .option("--plugin <plugin>", "replace plugins with this installed shared reference (repeatable)", collectOption)
+  .option("--clear-plugins", "remove every configured plugin reference")
   .option("--environment <reference>", "replace the secret-free environment reference")
   .option("--clear-environment", "remove the environment reference and safe values")
   .action(async (agent: string, options: AgentConfigureOptions) => {
@@ -230,6 +239,9 @@ agentCommands.command("configure")
     const skillRefs = options.clearSkills
       ? []
       : options.skill?.map((value) => requiredNonEmpty(value, "--skill")) ?? current.skillRefs ?? [];
+    const pluginRefs = options.clearPlugins
+      ? []
+      : options.plugin?.map((value) => requiredNonEmpty(value, "--plugin")) ?? current.pluginRefs ?? [];
     const environment = options.clearEnvironment
       ? { reference: null, values: {} }
       : options.environment === undefined
@@ -247,6 +259,7 @@ agentCommands.command("configure")
         driver,
         modelId,
         skillRefs,
+        pluginRefs,
         environment,
       },
     }), null, 2));
@@ -289,6 +302,11 @@ agentCommands.command("invoke")
 const modelCommands = program.command("model").description("discover models exposed by the connected Mob environment");
 modelCommands.command("list").action(async () => {
   console.log(JSON.stringify(await (await connectedClient()).request("/api/models"), null, 2));
+});
+
+const capabilityCommands = program.command("capability").alias("catalog").description("inspect shared Skill, Plugin, and Environment files");
+capabilityCommands.command("list").action(async () => {
+  console.log(JSON.stringify(await (await connectedClient()).request("/api/capabilities/catalog"), null, 2));
 });
 
 const conversationCommands = program.command("conversation").alias("conversations").description("work with direct and group chats");
@@ -592,6 +610,9 @@ function assertAgentConfigureOptions(options: AgentConfigureOptions): void {
   if (options.skill !== undefined && options.clearSkills) {
     throw new Error("Choose --skill or --clear-skills, not both");
   }
+  if (options.plugin !== undefined && options.clearPlugins) {
+    throw new Error("Choose --plugin or --clear-plugins, not both");
+  }
   if (options.environment !== undefined && options.clearEnvironment) {
     throw new Error("Choose --environment or --clear-environment, not both");
   }
@@ -603,6 +624,8 @@ function assertAgentConfigureOptions(options: AgentConfigureOptions): void {
     !options.defaultModel &&
     options.skill === undefined &&
     !options.clearSkills &&
+    options.plugin === undefined &&
+    !options.clearPlugins &&
     options.environment === undefined &&
     !options.clearEnvironment
   ) {

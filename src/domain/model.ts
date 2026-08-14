@@ -138,6 +138,7 @@ export interface AgentProfile {
   role: string;
   modelId: string | null;
   skillRefs: string[];
+  pluginRefs: string[];
   environment: AgentEnvironment;
   capabilities: DriverCapabilities;
   maxConcurrentRuns: number;

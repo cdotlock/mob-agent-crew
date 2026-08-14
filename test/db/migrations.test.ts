@@ -3,7 +3,7 @@ import { MIGRATIONS } from "../../src/db/migrations.js";
 
 describe("database migrations", () => {
   it("are ordered and cover the collaboration aggregate", () => {
-    expect(MIGRATIONS.map(({ version }) => version)).toEqual([1, 2, 3]);
+    expect(MIGRATIONS.map(({ version }) => version)).toEqual([1, 2, 3, 4]);
     const sql = MIGRATIONS[0]?.sql ?? "";
     for (const table of [
       "workspaces",
@@ -52,6 +52,13 @@ describe("database migrations", () => {
     expect(sql).toContain("ADD COLUMN skill_refs jsonb NOT NULL DEFAULT '[]'::jsonb");
     expect(sql).toContain("ADD COLUMN environment jsonb NOT NULL");
     expect(sql).toContain("jsonb_typeof(skill_refs) = 'array'");
+    expect(sql).not.toContain("DROP COLUMN driver");
+  });
+
+  it("adds shared plugin references without replacing harness ownership", () => {
+    const sql = MIGRATIONS[3]?.sql ?? "";
+    expect(sql).toContain("ADD COLUMN plugin_refs jsonb NOT NULL DEFAULT '[]'::jsonb");
+    expect(sql).toContain("jsonb_typeof(plugin_refs) = 'array'");
     expect(sql).not.toContain("DROP COLUMN driver");
   });
 });

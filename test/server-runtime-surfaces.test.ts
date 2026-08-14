@@ -262,14 +262,16 @@ describe("runtime control surfaces", () => {
     expect(repository.statusCode).toBe(200);
   });
 
-  it("exposes only knowledge and documents from the workspace file ledger", async () => {
+  it("exposes only capabilities, knowledge and documents from the workspace file ledger", async () => {
     const dataDir = await mkdtemp(join(tmpdir(), "mob-workspace-files-acl-"));
     temporaryDirectories.push(dataDir);
     const workspaceRoot = join(dataDir, "state", "workspaces", WORKSPACE_ID);
     await mkdir(join(workspaceRoot, "knowledge"), { recursive: true });
     await mkdir(join(workspaceRoot, "documents"), { recursive: true });
+    await mkdir(join(workspaceRoot, "capabilities", "skills"), { recursive: true });
     await mkdir(join(workspaceRoot, "tasks", TASK_ID, "conversations", CONVERSATION_ID), { recursive: true });
     await writeFile(join(workspaceRoot, "knowledge", "index.md"), "# Shared knowledge\n");
+    await writeFile(join(workspaceRoot, "capabilities", "skills", "review.json"), "{\"secretFree\":true}\n");
     await writeFile(join(workspaceRoot, "tasks", TASK_ID, "conversations", CONVERSATION_ID, "messages.md"), "private\n");
     const store = {
       getTask: vi.fn(async () => ({ id: TASK_ID, workspaceId: WORKSPACE_ID })),
@@ -288,7 +290,15 @@ describe("runtime control surfaces", () => {
       headers: { authorization: authorizationFor(HUMAN_ID) },
     });
     expect(root.statusCode).toBe(200);
-    expect(root.json().entries.map((entry: { name: string }) => entry.name)).toEqual(["documents", "knowledge"]);
+    expect(root.json().entries.map((entry: { name: string }) => entry.name)).toEqual(["capabilities", "documents", "knowledge"]);
+
+    const capability = await app.inject({
+      method: "GET",
+      url: `/api/files/content?scope=workspace&taskId=${TASK_ID}&path=capabilities/skills/review.json`,
+      headers: { authorization: authorizationFor(HUMAN_ID) },
+    });
+    expect(capability.statusCode).toBe(200);
+    expect(capability.body).toContain("secretFree");
 
     const denied = await app.inject({
       method: "GET",

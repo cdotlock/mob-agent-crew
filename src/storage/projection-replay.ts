@@ -618,6 +618,7 @@ function replayRows(snapshot: FileWorkspaceSnapshot): ReplayRows {
       role: profile.role,
       model_id: profile.modelId ?? null,
       skill_refs: profile.skillRefs ?? [],
+      plugin_refs: profile.pluginRefs ?? [],
       environment: profile.environment ?? { reference: null, values: {} },
       capabilities: profile.capabilities,
       max_concurrent_runs: profile.maxConcurrentRuns,
@@ -828,7 +829,7 @@ const columns = (source: string): ColumnSpec[] => source.split(/\s*,\s*/u).map((
 
 const WORKSPACES = spec("workspaces", "id uuid, slug text, name text, created_at timestamptz, updated_at timestamptz", ["id"]);
 const ACTORS = spec("actors", "id uuid, workspace_id uuid, kind text, handle text, display_name text, status text, created_at timestamptz, updated_at timestamptz", ["id"], ["workspace_id", "kind"]);
-const AGENT_PROFILES = spec("agent_profiles", "actor_id uuid, workspace_id uuid, owner_actor_id uuid, driver text, home text, role text, model_id text, skill_refs jsonb, environment jsonb, capabilities jsonb, max_concurrent_runs integer, created_at timestamptz, updated_at timestamptz", ["actor_id"], ["workspace_id"]);
+const AGENT_PROFILES = spec("agent_profiles", "actor_id uuid, workspace_id uuid, owner_actor_id uuid, driver text, home text, role text, model_id text, skill_refs jsonb, plugin_refs jsonb, environment jsonb, capabilities jsonb, max_concurrent_runs integer, created_at timestamptz, updated_at timestamptz", ["actor_id"], ["workspace_id"]);
 const REPOSITORIES = spec("repositories", "id uuid, workspace_id uuid, name text, kind text, remote_url text, local_path text, default_branch text, allowlisted boolean, enabled boolean, created_by_actor_id uuid, created_at timestamptz, updated_at timestamptz", ["id"], ["workspace_id"]);
 const DOCUMENTS = spec("workspace_documents", "id uuid, workspace_id uuid, name text, content text, local_path text, source text, uploaded_by_actor_id uuid, created_at timestamptz, updated_at timestamptz", ["id"], ["workspace_id"]);
 const TASKS = spec("tasks", "id uuid, workspace_id uuid, repository_id uuid, created_by_actor_id uuid, assigned_actor_id uuid, title text, description text, base_revision text, branch_name text, status text, max_delegation_depth integer, run_budget integer, writer_fence bigint, created_at timestamptz, updated_at timestamptz", ["id"], ["workspace_id"], { writer_fence: "GREATEST(tasks.writer_fence, EXCLUDED.writer_fence)" });

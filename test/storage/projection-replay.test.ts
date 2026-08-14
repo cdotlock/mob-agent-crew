@@ -100,6 +100,7 @@ function fixture(): {
     role: "Builder",
     modelId: null,
     skillRefs: [],
+    pluginRefs: [],
     environment: { reference: null, values: {} },
     capabilities: { streaming: true, steer: true, followUp: true, resume: false, nativeCancel: true },
     maxConcurrentRuns: 1,
@@ -259,6 +260,7 @@ describe("file projection replay", () => {
     const envelope = JSON.parse(await readFile(path, "utf8")) as { data: Record<string, unknown> };
     delete envelope.data.modelId;
     delete envelope.data.skillRefs;
+    delete envelope.data.pluginRefs;
     delete envelope.data.environment;
     await writeFile(path, `${JSON.stringify(envelope)}\n`, "utf8");
 
@@ -267,6 +269,7 @@ describe("file projection replay", () => {
     expect(snapshot.agentProfiles[0]).toMatchObject({
       modelId: null,
       skillRefs: [],
+      pluginRefs: [],
       environment: { reference: null, values: {} },
     });
     expect(validateFileWorkspaceSnapshot(snapshot)).toEqual([]);

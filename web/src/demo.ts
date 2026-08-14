@@ -18,6 +18,7 @@ export const demoAgents: AgentProfile[] = [
     modelId: "claude-opus-4-6:free",
     effectiveModelId: "claude-opus-4-6:free",
     skillRefs: ["workspace:repository-review"],
+    pluginRefs: [],
     environment: { reference: "workspace:railway-small", values: {} },
     compatibility: { compatible: true, status: "compatible", driverProtocols: ["anthropic-messages"], modelProtocols: ["anthropic-messages"] },
     driver: "Claude Code",
@@ -36,6 +37,7 @@ export const demoAgents: AgentProfile[] = [
     modelId: "gpt-5.6-sol",
     effectiveModelId: "gpt-5.6-sol",
     skillRefs: ["workspace:typescript"],
+    pluginRefs: [],
     environment: { reference: "workspace:railway-small", values: {} },
     compatibility: { compatible: true, status: "compatible", driverProtocols: ["openai-responses"], modelProtocols: ["openai-responses"] },
     driver: "Codex",
@@ -54,6 +56,7 @@ export const demoAgents: AgentProfile[] = [
     modelId: null,
     effectiveModelId: "deepseek-v4-pro",
     skillRefs: ["workspace:test-review"],
+    pluginRefs: [],
     environment: { reference: null, values: {} },
     compatibility: { compatible: true, status: "uses-default", driverProtocols: ["openai-chat"], modelProtocols: [] },
     driver: "Pi",
@@ -72,6 +75,7 @@ export const demoAgents: AgentProfile[] = [
     modelId: "deepseek-v4-flash",
     effectiveModelId: "deepseek-v4-flash",
     skillRefs: [],
+    pluginRefs: [],
     environment: { reference: null, values: {} },
     compatibility: { compatible: true, status: "compatible", driverProtocols: ["openai-chat"], modelProtocols: ["openai-chat"] },
     driver: "Oh My Pi",
@@ -140,7 +144,7 @@ const webhookTask: TaskDetail = {
   baseRef: "main@7c9d2a1",
   maxDelegationDepth: 3,
   delegationDepth: 2,
-  budgetUsed: 4.82,
+  budgetUsed: 3,
   budgetLimit: 8,
   messages: [
     {
@@ -220,6 +224,7 @@ const webhookTask: TaskDetail = {
       finishedAt: ago(30),
       summary: "Reproduced the race and published a bounded diagnosis.",
       parentRunId: null,
+      triggerMessageId: null,
     },
     {
       id: "run-fix",
@@ -231,6 +236,7 @@ const webhookTask: TaskDetail = {
       finishedAt: ago(15),
       summary: "Published patch r1 from an isolated writer lease.",
       parentRunId: "run-scout",
+      triggerMessageId: null,
     },
     {
       id: "run-verify",
@@ -242,6 +248,7 @@ const webhookTask: TaskDetail = {
       finishedAt: ago(4),
       summary: "Fresh checkout passed focused and full tests.",
       parentRunId: "run-fix",
+      triggerMessageId: null,
     },
   ],
   artifacts: [
@@ -307,7 +314,7 @@ const authTask: TaskDetail = {
   baseRef: "main@7c9d2a1",
   maxDelegationDepth: 2,
   delegationDepth: 1,
-  budgetUsed: 2.16,
+  budgetUsed: 2,
   budgetLimit: 6,
   messages: [
     {
@@ -347,6 +354,7 @@ const authTask: TaskDetail = {
       finishedAt: null,
       summary: "Tracing run-token scope through the publication request.",
       parentRunId: null,
+      triggerMessageId: null,
     },
     {
       id: "run-orbit",
@@ -358,6 +366,7 @@ const authTask: TaskDetail = {
       finishedAt: null,
       summary: "Reviewing approval actor boundaries.",
       parentRunId: "run-mira-auth",
+      triggerMessageId: null,
     },
   ],
   artifacts: [],
@@ -369,7 +378,7 @@ const serializerTask: TaskDetail = {
   baseRef: "release/1.8@a18be21",
   maxDelegationDepth: 2,
   delegationDepth: 0,
-  budgetUsed: 0.71,
+  budgetUsed: 1,
   budgetLimit: 4,
   messages: [
     {
@@ -397,6 +406,7 @@ const serializerTask: TaskDetail = {
       finishedAt: ago(58),
       summary: "Driver process exited with code 1 before artifact publication.",
       parentRunId: null,
+      triggerMessageId: null,
     },
   ],
   artifacts: [
@@ -421,7 +431,7 @@ const readmeTask: TaskDetail = {
   baseRef: "main@3a9d1b2",
   maxDelegationDepth: 2,
   delegationDepth: 0,
-  budgetUsed: 0.48,
+  budgetUsed: 0,
   budgetLimit: 3,
   messages: [],
   runs: [],

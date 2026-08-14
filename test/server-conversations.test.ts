@@ -361,6 +361,7 @@ describe("conversation API", () => {
     expect(denied.statusCode).toBe(200);
     expect(denied.json().artifacts).toEqual([]);
     expect(allowed.statusCode).toBe(200);
+    expect(allowed.json()).toMatchObject({ budgetUsed: 1, budgetLimit: 8 });
     expect(allowed.json().artifacts).toEqual([
       expect.objectContaining({ name: "private-result.md" }),
     ]);
@@ -417,10 +418,10 @@ describe("Agent identity API", () => {
         driver,
         role: "Independent reviewer",
         modelId: "test-model",
-        skillRefs: ["repo:review", "workspace:typescript"],
+        skillRefs: ["mob:repository-knowledge", "mob:collaboration"],
         environment: {
-          reference: "workspace:railway-small",
-          values: { LOG_LEVEL: "info" },
+          reference: "local:default",
+          values: {},
         },
       },
     });
@@ -430,15 +431,41 @@ describe("Agent identity API", () => {
       driver,
       role: "Independent reviewer",
       modelId: "test-model",
-      skillRefs: ["repo:review", "workspace:typescript"],
+      skillRefs: ["mob:repository-knowledge", "mob:collaboration"],
+      pluginRefs: [],
       environment: {
-        reference: "workspace:railway-small",
-        values: { LOG_LEVEL: "info" },
+        reference: "local:default",
+        values: {},
       },
       capabilities: expect.objectContaining(capabilities),
     }));
     expect(fixture.writeActor).toHaveBeenCalledOnce();
     expect(fixture.writeAgentProfile).toHaveBeenCalledOnce();
+  });
+
+  it("rejects unknown shared capability selections before creating an Agent", async () => {
+    const fixture = await createFixture();
+    const createActor = vi.fn();
+    Object.assign(fixture.store, { createActor });
+    const response = await fixture.app.inject({
+      method: "POST",
+      url: "/api/agents",
+      headers: { authorization: `Bearer ${sessionToken()}` },
+      payload: {
+        handle: "unknown-skill-agent",
+        name: "Unknown skill Agent",
+        driver: "pi",
+        modelId: "test-model",
+        skillRefs: ["team:not-installed"],
+        environment: { reference: "local:default", values: {} },
+      },
+    });
+
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toMatchObject({ error: "capability_not_found" });
+    expect(createActor).not.toHaveBeenCalled();
+    expect(fixture.writeActor).not.toHaveBeenCalled();
+    expect(fixture.writeAgentProfile).not.toHaveBeenCalled();
   });
 
   it("lists the identity plus four thin composition selections without exposing Agent home", async () => {
@@ -452,8 +479,9 @@ describe("Agent identity API", () => {
         home: "/private/runtime/home",
         role: "Builder",
         modelId: "test-model",
-        skillRefs: ["repo:review"],
-        environment: { reference: "workspace:railway-small", values: { LOG_LEVEL: "info" } },
+        skillRefs: ["mob:repository-knowledge"],
+        pluginRefs: [],
+        environment: { reference: "local:default", values: {} },
         capabilities: { streaming: true, steer: true, followUp: true, resume: false, nativeCancel: true },
         maxConcurrentRuns: 1,
         createdAt: now,
@@ -473,8 +501,9 @@ describe("Agent identity API", () => {
       handle: "builder",
       harness: "pi",
       modelId: "test-model",
-      skillRefs: ["repo:review"],
-      environment: { reference: "workspace:railway-small", values: { LOG_LEVEL: "info" } },
+      skillRefs: ["mob:repository-knowledge"],
+      pluginRefs: [],
+      environment: { reference: "local:default", values: {} },
     }));
     expect(response.body).not.toContain("/private/runtime/home");
   });
@@ -490,10 +519,11 @@ describe("Agent identity API", () => {
       home: join(temporaryDirectories.at(-1)!, "agents", AGENT_ID),
       role: "Research and implementation",
       modelId: "test-model",
-      skillRefs: ["repo:review", "workspace:typescript"],
+      skillRefs: ["mob:repository-knowledge", "mob:collaboration"],
+      pluginRefs: [],
       environment: {
-        reference: "workspace:railway-small",
-        values: { LOG_LEVEL: "debug" },
+        reference: "local:default",
+        values: {},
       },
       capabilities: {
         streaming: true,
@@ -521,10 +551,10 @@ describe("Agent identity API", () => {
         role: "Research and implementation",
         driver: "hermes",
         modelId: "test-model",
-        skillRefs: ["repo:review", "workspace:typescript"],
+        skillRefs: ["mob:repository-knowledge", "mob:collaboration"],
         environment: {
-          reference: "workspace:railway-small",
-          values: { LOG_LEVEL: "debug" },
+          reference: "local:default",
+          values: {},
         },
       },
     });
@@ -537,10 +567,11 @@ describe("Agent identity API", () => {
       driver: "hermes",
       role: "Research and implementation",
       modelId: "test-model",
-      skillRefs: ["repo:review", "workspace:typescript"],
+      skillRefs: ["mob:repository-knowledge", "mob:collaboration"],
+      pluginRefs: [],
       environment: {
-        reference: "workspace:railway-small",
-        values: { LOG_LEVEL: "debug" },
+        reference: "local:default",
+        values: {},
       },
       capabilities: {
         streaming: true,
@@ -558,10 +589,11 @@ describe("Agent identity API", () => {
       harness: "hermes",
       modelId: "test-model",
       effectiveModelId: "test-model",
-      skillRefs: ["repo:review", "workspace:typescript"],
+      skillRefs: ["mob:repository-knowledge", "mob:collaboration"],
+      pluginRefs: [],
       environment: {
-        reference: "workspace:railway-small",
-        values: { LOG_LEVEL: "debug" },
+        reference: "local:default",
+        values: {},
       },
       compatibility: { compatible: true, status: "compatible" },
     });

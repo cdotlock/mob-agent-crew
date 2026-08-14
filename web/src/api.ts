@@ -6,6 +6,10 @@ import type {
   Artifact,
   ArtifactKind,
   BootstrapData,
+  CapabilityCatalog,
+  CapabilityCatalogEnvironment,
+  CapabilityCatalogPlugin,
+  CapabilityCatalogSkill,
   ConversationDetail,
   ConversationMember,
   ConversationSummary,
@@ -190,6 +194,7 @@ function normalizeAgent(value: unknown, index = 0): AgentProfile {
     modelId,
     effectiveModelId: text(source, ["effectiveModelId", "effective_model_id"], modelId ?? "Default model"),
     skillRefs: stringArray(source.skillRefs ?? source.skill_refs),
+    pluginRefs: stringArray(source.pluginRefs ?? source.plugin_refs),
     environment: {
       reference: text(environment, ["reference"]) || null,
       values: Object.fromEntries(
@@ -264,6 +269,7 @@ function normalizeRun(value: unknown, index = 0): AgentRun {
     finishedAt: text(item, ["finishedAt", "finished_at", "completedAt", "completed_at"]) || null,
     summary: text(item, ["summary", "result", "errorMessage", "error_message"]),
     parentRunId: text(item, ["parentRunId", "parent_run_id"]) || null,
+    triggerMessageId: text(item, ["triggerMessageId", "trigger_message_id"]) || null,
   };
 }
 
@@ -336,17 +342,18 @@ export function normalizeTaskDetail(value: unknown, fallback: TaskSummary): Task
     title: summary.title === "Untitled collaboration" ? fallback.title : summary.title,
     repository: summary.repository === "No repository" ? fallback.repository : summary.repository,
   };
+  const runs = array(taskRoot.runs ?? root.runs).map(normalizeRun);
   return {
     ...merged,
     description: text(taskRoot, ["description", "prompt", "initialMessage", "initial_message"], fallback.summary),
     baseRef: text(taskRoot, ["baseRef", "base_ref", "revision", "sha"], `${merged.branch}@HEAD`),
     messages: array(taskRoot.messages ?? root.messages).map(normalizeMessage),
-    runs: array(taskRoot.runs ?? root.runs).map(normalizeRun),
+    runs,
     artifacts: array(taskRoot.artifacts ?? root.artifacts).map(normalizeArtifact),
     maxDelegationDepth: number(taskRoot, ["maxDelegationDepth", "max_delegation_depth"], 2),
     delegationDepth: number(taskRoot, ["delegationDepth", "delegation_depth"], 0),
-    budgetUsed: number(taskRoot, ["budgetUsed", "budget_used", "cost"], 0),
-    budgetLimit: number(taskRoot, ["budgetLimit", "budget_limit"], 5),
+    budgetUsed: number(taskRoot, ["budgetUsed", "budget_used"], runs.length),
+    budgetLimit: number(taskRoot, ["runBudget", "run_budget", "budgetLimit", "budget_limit"], 5),
   };
 }
 
@@ -611,6 +618,90 @@ export async function fetchModelCatalog(refresh = false): Promise<ModelCatalog> 
     models: array(value.models).map(normalizeModel).filter((model) => model.id),
     warnings: stringArray(value.warnings),
   };
+}
+
+function capabilitySource(value: unknown): "builtin" | "workspace" {
+  return value === "workspace" ? "workspace" : "builtin";
+}
+
+function normalizeCatalogSkill(value: unknown): CapabilityCatalogSkill | null {
+  const item = object(value);
+  const id = text(item, ["id"]);
+  if (!id) return null;
+  return {
+    id,
+    name: text(item, ["name"], id),
+    description: text(item, ["description"]),
+    source: capabilitySource(item.source),
+    status: "available",
+    instructions: text(item, ["instructions"]),
+  };
+}
+
+function normalizeCatalogPlugin(value: unknown): CapabilityCatalogPlugin | null {
+  const item = object(value);
+  const id = text(item, ["id"]);
+  if (!id) return null;
+  return {
+    id,
+    name: text(item, ["name"], id),
+    description: text(item, ["description"]),
+    source: capabilitySource(item.source),
+    status: item.status === "installed" ? "installed" : "unavailable",
+    mode: "instructions-only",
+    compatibleDrivers: stringArray(item.compatibleDrivers ?? item.compatible_drivers),
+    instructions: text(item, ["instructions"]),
+  };
+}
+
+function normalizeCatalogEnvironment(value: unknown): CapabilityCatalogEnvironment | null {
+  const item = object(value);
+  const id = text(item, ["id"]);
+  if (!id) return null;
+  const values = object(item.values);
+  return {
+    id,
+    name: text(item, ["name"], id),
+    description: text(item, ["description"]),
+    source: capabilitySource(item.source),
+    status: "available",
+    values: Object.fromEntries(Object.entries(values).filter((entry): entry is [string, string] => typeof entry[1] === "string")),
+    valueKeys: stringArray(item.valueKeys ?? item.value_keys),
+  };
+}
+
+export function normalizeCapabilityCatalog(input: unknown): CapabilityCatalog {
+  const value = unbox(input);
+  return {
+    version: 1,
+    workspaceId: text(value, ["workspaceId", "workspace_id"]),
+    canonicalRoot: text(value, ["canonicalRoot", "canonical_root"], "capabilities"),
+    skills: array(value.skills).map(normalizeCatalogSkill).filter((entry): entry is CapabilityCatalogSkill => Boolean(entry)),
+    plugins: array(value.plugins).map(normalizeCatalogPlugin).filter((entry): entry is CapabilityCatalogPlugin => Boolean(entry)),
+    environments: array(value.environments).map(normalizeCatalogEnvironment).filter((entry): entry is CapabilityCatalogEnvironment => Boolean(entry)),
+  };
+}
+
+export async function fetchCapabilityCatalog(): Promise<CapabilityCatalog> {
+  return normalizeCapabilityCatalog(await request("/api/capabilities/catalog"));
+}
+
+export type CapabilityCatalogKind = "skills" | "plugins" | "environments";
+
+export type CapabilityCatalogUpsert = {
+  id: string;
+  name: string;
+  description?: string;
+  instructions?: string;
+  compatibleDrivers?: string[];
+  values?: Record<string, string>;
+};
+
+export async function upsertCapabilityCatalogEntry(kind: CapabilityCatalogKind, input: CapabilityCatalogUpsert): Promise<void> {
+  await request(`/api/capabilities/catalog/${kind}`, {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
 }
 
 export async function fetchGitHubConnectionStatus(): Promise<GitHubConnectionStatus> {

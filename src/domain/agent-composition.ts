@@ -25,6 +25,7 @@ const secretValuePatterns = [
 export interface AgentCompositionInput {
   modelId?: string | null | undefined;
   skillRefs?: readonly string[] | undefined;
+  pluginRefs?: readonly string[] | undefined;
   environment?: AgentEnvironmentInput | null | undefined;
 }
 
@@ -36,6 +37,7 @@ export interface AgentEnvironmentInput {
 export interface NormalizedAgentComposition {
   modelId: string | null;
   skillRefs: string[];
+  pluginRefs: string[];
   environment: AgentEnvironment;
 }
 
@@ -44,8 +46,9 @@ export function normalizeAgentComposition(
 ): NormalizedAgentComposition {
   const modelId = normalizeOptionalReference(input.modelId, "modelId");
   const skillRefs = normalizeSkillRefs(input.skillRefs ?? []);
+  const pluginRefs = normalizeCapabilityRefs(input.pluginRefs ?? [], "plugin");
   const environment = normalizeAgentEnvironment(input.environment);
-  return { modelId, skillRefs, environment };
+  return { modelId, skillRefs, pluginRefs, environment };
 }
 
 export function normalizeAgentEnvironment(
@@ -109,21 +112,29 @@ export function normalizeAgentEnvironment(
 }
 
 function normalizeSkillRefs(values: readonly string[]): string[] {
+  return normalizeCapabilityRefs(values, "skill");
+}
+
+function normalizeCapabilityRefs(values: readonly string[], kind: "skill" | "plugin"): string[] {
   if (!Array.isArray(values) || values.length > 32) {
-    throw new DomainRuleError("invalid_skill_refs", "An Agent supports at most 32 skill references.");
+    throw new DomainRuleError(`invalid_${kind}_refs`, `An Agent supports at most 32 ${kind} references.`);
   }
   const unique = new Set<string>();
   for (const rawValue of values) {
     if (typeof rawValue !== "string") {
-      throw new DomainRuleError("invalid_skill_ref", "Skill references must be strings.");
+      throw new DomainRuleError(`invalid_${kind}_ref`, `${capitalize(kind)} references must be strings.`);
     }
     const value = rawValue.trim();
     if (!modelOrSkillPattern.test(value)) {
-      throw new DomainRuleError("invalid_skill_ref", `Skill reference '${value}' is invalid.`);
+      throw new DomainRuleError(`invalid_${kind}_ref`, `${capitalize(kind)} reference '${value}' is invalid.`);
     }
     unique.add(value);
   }
   return [...unique];
+}
+
+function capitalize(value: string): string {
+  return `${value.slice(0, 1).toUpperCase()}${value.slice(1)}`;
 }
 
 function normalizeOptionalReference(

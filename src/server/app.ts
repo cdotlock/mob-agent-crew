@@ -35,6 +35,8 @@ import {
 import { assertGitHubPublishRemote, publishTaskBranch } from "../workspace/publish.js";
 import { controlRepositoryDirectory } from "../workspace/materialize.js";
 import { ModelCatalogService } from "./model-catalog.js";
+import { CapabilityCatalogService } from "../capabilities/index.js";
+import { routeCapabilityKind, type CapabilityRouteKind } from "../domain/capabilities.js";
 
 const sessionCookie = "mob_session";
 
@@ -169,6 +171,9 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     ...(config.mobAiModelCatalogTtlMs ? { ttlMs: config.mobAiModelCatalogTtlMs } : {}),
     fallbackModels: configuredModelFallbacks(config),
   });
+  const capabilityCatalog = new CapabilityCatalogService({
+    workspaceRoot: (workspaceId) => files.workspaceRoot(workspaceId),
+  });
   await app.register(cookie);
   await app.register(multipart, { limits: { files: 1, fileSize: 1_000_000 } });
   app.addHook("preSerialization", async (_request, _reply, payload) => jsonSafe(payload));
@@ -296,6 +301,34 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     return modelCatalog.get({ refresh });
   });
 
+  app.get("/api/capabilities/catalog", async (request) => {
+    const actor = requireHuman(request);
+    return capabilityCatalog.get(actor.workspaceId);
+  });
+
+  app.post<{ Params: { kind: CapabilityRouteKind } }>("/api/capabilities/catalog/:kind", async (request) => {
+    const actor = requireHuman(request);
+    const kind = z.enum(["skills", "plugins", "environments"]).parse(request.params.kind);
+    const common = {
+      id: z.string().min(1).max(128),
+      name: z.string().min(1).max(120),
+      description: z.string().max(1_000).optional(),
+    } as const;
+    const body = (kind === "skills"
+      ? z.object({ ...common, instructions: z.string().max(20_000).optional() }).strict()
+      : kind === "plugins"
+        ? z.object({
+            ...common,
+            instructions: z.string().max(20_000).optional(),
+            status: z.enum(["installed", "unavailable"]).optional(),
+            compatibleDrivers: z.array(z.string().max(32)).max(32).optional(),
+          }).strict()
+        : z.object({ ...common, values: z.record(z.string(), z.string()).optional() }).strict()
+    ).parse(request.body);
+    const capability = await capabilityCatalog.upsert(actor.workspaceId, routeCapabilityKind(kind), body);
+    return { capability };
+  });
+
   app.get("/api/integrations/github/status", async (request) => {
     requireHuman(request);
     return githubConnectionStatus(config.githubCliConfigured ?? false);
@@ -329,6 +362,7 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
       defaults: {
         modelId: config.mobAiModel,
         skills: [],
+        plugins: [],
         environment: { reference: null, values: {} },
       },
     };
@@ -343,12 +377,15 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
       driver: z.enum(["pi", "omp", "claude", "codex", "hermes", "deepseek"]),
       modelId: z.string().max(128).nullable().optional(),
       skillRefs: z.array(z.string().max(128)).max(32).optional(),
+      pluginRefs: z.array(z.string().max(128)).max(32).optional(),
       environment: z.object({
         reference: z.string().max(128).nullable().optional(),
         values: z.record(z.string(), z.string()).optional(),
       }).strict().nullable().optional(),
     }).parse(request.body);
     const composition = normalizeAgentComposition(body);
+    await capabilityCatalog.resolve(actor.workspaceId, { driver: body.driver, ...composition });
+    const storedComposition = catalogBackedComposition(composition);
     const catalog = composition.modelId ? await modelCatalog.get() : null;
     const selectedModel = catalog?.models.find((model) => model.id === composition.modelId) ?? null;
     const compatibility = assertAgentModelCompatible(
@@ -385,7 +422,7 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
       driver: body.driver,
       home,
       role: body.role,
-      ...composition,
+      ...storedComposition,
       capabilities,
       maxConcurrentRuns: 1,
     });
@@ -401,12 +438,15 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
       driver: z.enum(["pi", "omp", "claude", "codex", "hermes", "deepseek"]),
       modelId: z.string().max(128).nullable().optional(),
       skillRefs: z.array(z.string().max(128)).max(32).optional(),
+      pluginRefs: z.array(z.string().max(128)).max(32).optional(),
       environment: z.object({
         reference: z.string().max(128).nullable().optional(),
         values: z.record(z.string(), z.string()).optional(),
       }).strict().nullable().optional(),
     }).parse(request.body);
     const composition = normalizeAgentComposition(body);
+    await capabilityCatalog.resolve(human.workspaceId, { driver: body.driver, ...composition });
+    const storedComposition = catalogBackedComposition(composition);
     const catalog = composition.modelId ? await modelCatalog.get() : null;
     const selectedModel = catalog?.models.find((model) => model.id === composition.modelId) ?? null;
     const compatibility = assertAgentModelCompatible(
@@ -421,7 +461,7 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
       displayName: body.name,
       driver: body.driver,
       role: body.role,
-      ...composition,
+      ...storedComposition,
       capabilities,
     });
     const effectiveModelId = composition.modelId ?? defaultModelForDriver(config, body.driver);
@@ -466,6 +506,8 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     }
     return {
       ...thread.task,
+      budgetUsed: thread.runs.length,
+      budgetLimit: thread.task.runBudget,
       resolution: taskResolution(thread.task),
       repository: repo?.name,
       branch: thread.task.branchName ?? thread.task.baseRevision,
@@ -1368,6 +1410,19 @@ function effectiveAgentModel(config: AppConfig, profile: AgentProfile | undefine
   return profile?.modelId ?? defaultModelForDriver(config, profile?.driver ?? "pi");
 }
 
+function catalogBackedComposition(
+  composition: ReturnType<typeof normalizeAgentComposition>,
+): ReturnType<typeof normalizeAgentComposition> {
+  return composition.environment.reference === null
+    ? composition
+    : {
+        ...composition,
+        // Catalog values are resolved fresh for every run. Persisting a copy
+        // here would make shared environment edits silently stale.
+        environment: { reference: composition.environment.reference, values: {} },
+      };
+}
+
 function agentApiView(
   actor: Actor,
   profile: AgentProfile,
@@ -1385,6 +1440,7 @@ function agentApiView(
     modelId: profile.modelId,
     effectiveModelId,
     skillRefs: profile.skillRefs,
+    pluginRefs: profile.pluginRefs,
     environment: profile.environment,
     capabilities: profile.capabilities,
     compatibility,
@@ -1534,7 +1590,7 @@ function providerRequestBody(
   return compatibleBody;
 }
 
-const safeWorkspaceFileRoots = new Set(["documents", "knowledge"]);
+const safeWorkspaceFileRoots = new Set(["capabilities", "documents", "knowledge"]);
 
 function assertSafeWorkspaceFilePath(path: string, allowRoot: boolean): void {
   const normalized = path.replaceAll("\\", "/").replace(/^\/+|\/+$/gu, "");

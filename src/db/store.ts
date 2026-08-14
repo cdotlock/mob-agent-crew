@@ -201,6 +201,7 @@ export interface CreateAgentProfileInput {
   maxConcurrentRuns?: number;
   modelId?: string | null;
   skillRefs?: readonly string[];
+  pluginRefs?: readonly string[];
   environment?: AgentProfile["environment"] | null;
 }
 
@@ -213,6 +214,7 @@ export interface UpdateAgentDefinitionInput {
   capabilities: DriverCapabilities;
   modelId?: string | null;
   skillRefs?: readonly string[];
+  pluginRefs?: readonly string[];
   environment?: AgentProfile["environment"] | null;
 }
 
@@ -442,11 +444,12 @@ export class CollaborationStore {
     const rows = await this.sql<DbRow[]>`
       INSERT INTO agent_profiles (
         actor_id, workspace_id, owner_actor_id, driver, home, role,
-        model_id, skill_refs, environment, capabilities, max_concurrent_runs
+        model_id, skill_refs, plugin_refs, environment, capabilities, max_concurrent_runs
       ) VALUES (
         ${input.actorId}, ${input.workspaceId}, ${input.ownerActorId}, ${input.driver.trim()},
         ${input.home.trim()}, ${input.role?.trim() ?? ''}, ${composition.modelId},
         ${JSON.stringify(composition.skillRefs)}::jsonb,
+        ${JSON.stringify(composition.pluginRefs)}::jsonb,
         ${JSON.stringify(composition.environment)}::jsonb,
         ${JSON.stringify(capabilities)}::jsonb,
         ${input.maxConcurrentRuns ?? 1}
@@ -484,6 +487,7 @@ export class CollaborationStore {
         UPDATE agent_profiles
         SET driver = ${driver}, role = ${role}, model_id = ${composition.modelId},
             skill_refs = ${JSON.stringify(composition.skillRefs)}::jsonb,
+            plugin_refs = ${JSON.stringify(composition.pluginRefs)}::jsonb,
             environment = ${JSON.stringify(composition.environment)}::jsonb,
             capabilities = ${JSON.stringify(input.capabilities)}::jsonb,
             updated_at = now()

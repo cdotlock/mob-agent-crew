@@ -158,6 +158,7 @@ describe("mob agent CLI", () => {
             driver: "pi",
             modelId: "deepseek-v4-flash",
             skillRefs: ["code:typescript"],
+            pluginRefs: ["mob:deepseek-harness"],
             environment: { reference: "railway:default", values: { MODE: "focused" } },
           }],
         });
@@ -186,6 +187,7 @@ describe("mob agent CLI", () => {
           driver: "codex",
           modelId: null,
           skillRefs: [],
+          pluginRefs: ["mob:deepseek-harness"],
           environment: { reference: "railway:engineering", values: {} },
         },
       }),
@@ -198,6 +200,19 @@ describe("mob agent CLI", () => {
     ])).rejects.toMatchObject({
       stderr: expect.stringContaining("Choose --model or --default-model, not both"),
     });
+  });
+
+  it("lists the shared capability catalog", async () => {
+    const requests: RecordedRequest[] = [];
+    const server = await listen(async (request, response) => {
+      requests.push(await record(request));
+      replyJson(response, { version: 1, skills: [], plugins: [], environments: [] });
+    });
+
+    const result = await runCli(server, ["capability", "list"]);
+
+    expect(requests).toEqual([expect.objectContaining({ method: "GET", path: "/api/capabilities/catalog" })]);
+    expect(JSON.parse(result.stdout)).toMatchObject({ version: 1 });
   });
 });
 

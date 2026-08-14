@@ -92,12 +92,18 @@ describe("Worker Agent profile composition", () => {
 
     expect(receivedInput).toBeDefined();
     const input = receivedInput as AgentRunInput;
-    expect(input.metadata).toEqual({
+    expect(input.metadata).toMatchObject({
       modelId: PROFILE_MODEL,
       skillRefs: ["skill:review", "skill:test"],
+      pluginRefs: [],
       environmentReference: "railway:small",
+      capabilityWarnings: expect.arrayContaining([
+        expect.stringContaining("Legacy skill 'skill:review' was skipped"),
+        expect.stringContaining("Legacy environment 'railway:small'"),
+      ]),
     });
-    expect(input.prompt).toContain("Configured skill references (resolve only through your own harness): skill:review, skill:test");
+    expect(input.prompt).toContain("Requested shared skill references: skill:review, skill:test");
+    expect(input.prompt).toContain("Capability warnings:");
     expect(input.prompt).toContain("Configured environment reference: railway:small");
     expect(input.env).toMatchObject({
       PROFILE_ONLY: "from-profile",
@@ -120,9 +126,45 @@ describe("Worker Agent profile composition", () => {
       taskId: TASK_ID,
     });
   });
+
+  it("loads selected shared skill instructions and the latest environment values for a run", async () => {
+    let receivedInput: AgentRunInput | undefined;
+    const driver = new MockDriver({
+      delegate: (input) => {
+        receivedInput = input;
+        return { finalMessage: "catalog applied" };
+      },
+    });
+    const claim = leaseClaim();
+    const thread = taskThread();
+    const store = workerStore(claim, thread, {
+      skillRefs: ["mob:repository-knowledge"],
+      pluginRefs: [],
+      environment: { reference: "railway:default", values: {} },
+    });
+    const worker = new MobWorker({
+      id: claim.workerId,
+      store,
+      files: fileStore(),
+      drivers: new AgentDriverRegistry([driver]),
+      config: workerConfig(),
+    });
+
+    await expect(worker.tick()).resolves.toBe(true);
+
+    const input = receivedInput as AgentRunInput;
+    expect(input.prompt).toContain("Selected shared capabilities (trusted, secret-free instructions)");
+    expect(input.prompt).toContain("Ground repository-specific claims in the Workspace knowledge excerpts");
+    expect(input.env).toMatchObject({ MOB_ENVIRONMENT_KIND: "railway" });
+    expect(input.metadata).toMatchObject({ capabilityWarnings: [] });
+  });
 });
 
-function workerStore(claim: LeaseClaim, thread: TaskThread): CollaborationStore {
+function workerStore(
+  claim: LeaseClaim,
+  thread: TaskThread,
+  profileOverrides: Record<string, unknown> = {},
+): CollaborationStore {
   let sequence = 0;
   const sql = vi.fn(async (strings: TemplateStringsArray) => {
     const query = strings.join(" ");
@@ -133,6 +175,7 @@ function workerStore(claim: LeaseClaim, thread: TaskThread): CollaborationStore 
         role: "Regression reviewer",
         modelId: PROFILE_MODEL,
         skillRefs: ["skill:review", "skill:test"],
+        pluginRefs: [],
         environment: {
           reference: "railway:small",
           values: {
@@ -146,6 +189,7 @@ function workerStore(claim: LeaseClaim, thread: TaskThread): CollaborationStore 
             MOB_AI_CODEX_MODEL: "profile-codex-override",
           },
         },
+        ...profileOverrides,
       }];
     }
     if (query.includes("FROM tasks")) {

@@ -199,7 +199,7 @@ function demoRunEvents(run: AgentRun, agent: AgentProfile | undefined): RunEvent
   return events;
 }
 
-function AgentTerminal({ task, agents, demo }: { task: TaskDetail; agents: AgentProfile[]; demo: boolean }) {
+function AgentTerminal({ task, agents, demo, onStartInstruction }: { task: TaskDetail; agents: AgentProfile[]; demo: boolean; onStartInstruction: () => void }) {
   const latestRun = task.runs.at(-1) ?? null;
   const [selectedRunId, setSelectedRunId] = useState<string | null>(latestRun?.id ?? null);
   const [events, setEvents] = useState<RunEvent[]>([]);
@@ -308,6 +308,7 @@ function AgentTerminal({ task, agents, demo }: { task: TaskDetail; agents: Agent
             ))}
           </select>
         ) : <span className="terminal-title">No run yet</span>}
+        <span className="terminal-run-budget">Runs {task.budgetUsed} / {task.budgetLimit}</span>
         {selectedRun ? <span className={classes("terminal-status", `is-${selectedRun.status}`)}>{selectedRun.status}</span> : null}
       </div>
       <div className="terminal-output" ref={outputRef} role="log" aria-live="off">
@@ -324,7 +325,7 @@ function AgentTerminal({ task, agents, demo }: { task: TaskDetail; agents: Agent
             <time>{line.time}</time><span>{line.text}</span>
           </div>
         ))}
-        {!selectedRun ? <p className="terminal-placeholder">Send a message to an Agent. Its actual process, tools, output, and exit state will stream here.</p> : null}
+        {!selectedRun ? <div className="terminal-empty-state"><Robot weight="duotone" /><h3>No Agent run in this conversation</h3><p>Write an instruction in the middle panel, then use <strong>Run Agent</strong>. The CLI process, tools, output, and exit state will stream here.</p><button type="button" onClick={onStartInstruction}><Code /> Write an instruction</button></div> : null}
         {selectedRun && state === "ready" && !lines.length ? <p className="terminal-placeholder">Run accepted. Waiting for the connector to emit its first event…</p> : null}
       </div>
       {error ? <div className="terminal-error" role="alert"><WarningCircle /> {error}</div> : null}
@@ -333,7 +334,7 @@ function AgentTerminal({ task, agents, demo }: { task: TaskDetail; agents: Agent
         <input
           value={command}
           onChange={(event) => setCommand(event.target.value)}
-          placeholder={selectedRun && !terminalStatuses.has(selectedRun.status) ? `Steer @${selectedAgent?.name ?? "agent"} while it works…` : "Start a new instruction from the conversation"}
+          placeholder={selectedRun && !terminalStatuses.has(selectedRun.status) ? `Steer @${selectedAgent?.name ?? "agent"} while it works…` : "Run an Agent from the middle conversation first"}
           disabled={!selectedRun || terminalStatuses.has(selectedRun.status) || sending}
           aria-label="Steer the active Agent run"
         />
@@ -460,6 +461,7 @@ function AgentEnvironment({ task, agents, onDelegate, onConfigure }: { task: Tas
         <div><dt>Environment ref</dt><dd>{agent.environment.reference ?? "Workspace default"}</dd></div>
         <div><dt>Knowledge</dt><dd>Automatic manifest per run</dd></div>
         <div className="wide"><dt>Skills</dt><dd>{agent.skillRefs.length ? agent.skillRefs.join(" · ") : `${agent.driver} defaults`}</dd></div>
+        <div className="wide"><dt>Plugins</dt><dd>{agent.pluginRefs.length ? agent.pluginRefs.join(" · ") : "None selected"}</dd></div>
       </dl>
       <div className="capability-list">{agent.capabilities.map((capability) => <span key={capability}>{capability}</span>)}</div>
       <div className="agent-workbench-actions"><button className="secondary-button" onClick={() => onConfigure(agent.id)}><Code /> Configure</button><button className="agent-command-button" onClick={() => onDelegate(agent.id)}><TerminalWindow /> Give @{agent.handle} a bounded task</button></div>
@@ -472,12 +474,14 @@ export function WorkspaceInspector({
   agents,
   onDelegate,
   onConfigure,
+  onStartInstruction,
   source,
 }: {
   task: TaskDetail | null;
   agents: AgentProfile[];
   onDelegate: (agentId: string) => void;
   onConfigure: (agentId: string) => void;
+  onStartInstruction: () => void;
   source: "api" | "demo";
 }) {
   const [tab, setTab] = useState<InspectorTab>("terminal");
@@ -494,7 +498,7 @@ export function WorkspaceInspector({
         <button role="tab" aria-controls="workspace-inspector-panel" aria-label="Agent" aria-selected={tab === "agent"} className={tab === "agent" ? "is-active" : ""} onClick={() => setTab("agent")}><Robot /><span>Agent</span></button>
       </nav>
       <div className="work-inspector-body" id="workspace-inspector-panel" role="tabpanel">
-        {tab === "terminal" ? <AgentTerminal task={task} agents={agents} demo={source === "demo"} /> : null}
+        {tab === "terminal" ? <AgentTerminal task={task} agents={agents} demo={source === "demo"} onStartInstruction={onStartInstruction} /> : null}
         {tab === "files" ? <FileBrowser task={task} demo={source === "demo"} /> : null}
         {tab === "agent" ? <AgentEnvironment task={task} agents={agents} onDelegate={onDelegate} onConfigure={onConfigure} /> : null}
       </div>

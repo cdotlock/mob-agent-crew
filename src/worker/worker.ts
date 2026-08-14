@@ -22,6 +22,7 @@ import {
   redactedRuntimeError,
 } from "./runtime-redaction.js";
 import { runConversationContext } from "./prompt-context.js";
+import { CapabilityCatalogService, type ResolvedAgentCapabilities } from "../capabilities/index.js";
 
 export interface WorkerOptions {
   id: string;
@@ -39,6 +40,7 @@ type RuntimeProfile = {
   role: string;
   modelId: string | null;
   skillRefs: string[];
+  pluginRefs: string[];
   environment: {
     reference: string | null;
     values: Record<string, string>;
@@ -134,6 +136,7 @@ export class MobWorker {
       SELECT driver, home, role,
              model_id AS "modelId",
              skill_refs AS "skillRefs",
+             plugin_refs AS "pluginRefs",
              environment
       FROM agent_profiles
       WHERE actor_id = ${claim.agentActorId} AND workspace_id = ${claim.workspaceId}
@@ -148,6 +151,7 @@ export class MobWorker {
       ...profile,
       modelId: profile.modelId ?? null,
       skillRefs: Array.isArray(profile.skillRefs) ? profile.skillRefs : [],
+      pluginRefs: Array.isArray(profile.pluginRefs) ? profile.pluginRefs : [],
       environment: profile.environment && typeof profile.environment === "object"
         ? {
             reference: profile.environment.reference ?? null,
@@ -157,7 +161,11 @@ export class MobWorker {
     };
   }
 
-  async #buildPrompt(claim: LeaseClaim, profile: RuntimeProfile): Promise<string> {
+  async #buildPrompt(
+    claim: LeaseClaim,
+    profile: RuntimeProfile,
+    capabilities: ResolvedAgentCapabilities,
+  ): Promise<string> {
     const [thread, actors] = await Promise.all([
       this.#options.store.getTaskThread(claim.taskId),
       this.#options.store.listActors(claim.workspaceId),
@@ -186,10 +194,19 @@ export class MobWorker {
     return [
       `You are participating as ${profile.role || "a coding agent"} in a shared Mob Agent Crew task.`,
       profile.skillRefs.length
-        ? `Configured skill references (resolve only through your own harness): ${profile.skillRefs.join(", ")}`
+        ? `Requested shared skill references: ${profile.skillRefs.join(", ")}. Only catalog entries whose instructions appear below are active.`
+        : "",
+      profile.pluginRefs.length
+        ? `Requested shared plugin references: ${profile.pluginRefs.join(", ")}. Mob loads instructions only, never arbitrary plugin code.`
         : "",
       profile.environment.reference
         ? `Configured environment reference: ${profile.environment.reference}`
+        : "",
+      capabilities.promptContext
+        ? `Selected shared capabilities (trusted, secret-free instructions):\n${capabilities.promptContext}`
+        : "",
+      capabilities.warnings.length
+        ? `Capability warnings:\n${capabilities.warnings.map((warning) => `- ${warning}`).join("\n")}`
         : "",
       `Task: ${thread.task.title}`,
       thread.task.description && currentInstruction !== thread.task.description
@@ -254,12 +271,28 @@ export class MobWorker {
     ];
     try {
       const profile = await this.#loadProfile(claim);
+      const capabilities = await new CapabilityCatalogService({
+        workspaceRoot: (workspaceId) => this.#options.files.workspaceRoot(workspaceId),
+      }).resolve(claim.workspaceId, {
+        driver: profile.driver,
+        skillRefs: profile.skillRefs,
+        pluginRefs: profile.pluginRefs,
+        environment: profile.environment,
+      }, { strict: false });
       if (profile.driver !== "mock" && !this.#options.drivers.has(profile.driver)) {
         throw new Error(`Agent driver '${profile.driver}' is not registered`);
       }
       const driver = this.#options.drivers.get(profile.driver);
       const runningAttempt = await this.#options.store.markAttemptRunning(claim);
       await this.#options.files.writeAttempt(runningAttempt);
+      for (const warning of capabilities.warnings) {
+        const event = await this.#options.store.appendRunEvent({
+          claim,
+          type: "capability.warning",
+          payload: { message: warning },
+        });
+        await this.#options.files.writeEvent(event);
+      }
       const syncing = await this.#options.store.appendRunEvent({
         claim,
         type: "workspace.sync.started",
@@ -331,12 +364,12 @@ export class MobWorker {
       nativeRun = await driver.run({
         jobId: claim.runId,
         attemptId: claim.attemptId,
-        prompt: await this.#buildPrompt(claim, profile),
+        prompt: await this.#buildPrompt(claim, profile, capabilities),
         cwd: taskDir,
         timeoutMs: 30 * 60_000,
         ...(profile.driver !== "mock" ? { profileDirectory: profile.home } : {}),
         env: {
-          ...profile.environment.values,
+          ...capabilities.environmentValues,
           ...agentRuntimeProviderEnvironment(this.#options.config, token),
           MOB_AI_MODEL: profile.driver === "claude" || profile.driver === "codex"
             ? this.#options.config.mobAiModel
@@ -353,7 +386,9 @@ export class MobWorker {
         metadata: {
           modelId: effectiveModel,
           skillRefs: profile.skillRefs,
+          pluginRefs: profile.pluginRefs,
           environmentReference: profile.environment.reference,
+          capabilityWarnings: capabilities.warnings,
         },
       });
       this.#active.set(claim.runId, nativeRun);

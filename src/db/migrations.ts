@@ -539,6 +539,17 @@ ALTER TABLE agent_profiles
   ADD CONSTRAINT agent_profiles_environment_object CHECK (jsonb_typeof(environment) = 'object');
 `,
   },
+  {
+    version: 4,
+    name: "agent_plugin_references",
+    sql: String.raw`
+ALTER TABLE agent_profiles
+  ADD COLUMN plugin_refs jsonb NOT NULL DEFAULT '[]'::jsonb;
+
+ALTER TABLE agent_profiles
+  ADD CONSTRAINT agent_profiles_plugin_refs_array CHECK (jsonb_typeof(plugin_refs) = 'array');
+`,
+  },
 ] as const;
 
 export type MigrationClient = Pick<postgres.Sql, "unsafe" | "begin">;

@@ -51,6 +51,7 @@ export interface AgentProfile {
   modelId: string | null;
   effectiveModelId: string;
   skillRefs: string[];
+  pluginRefs: string[];
   environment: {
     reference: string | null;
     values: Record<string, string>;
@@ -128,6 +129,7 @@ export interface AgentRun {
   finishedAt: string | null;
   summary: string;
   parentRunId: string | null;
+  triggerMessageId: string | null;
 }
 
 export interface RunEvent {
@@ -213,6 +215,47 @@ export interface ModelCatalog {
   warnings: string[];
 }
 
+export type CapabilitySource = "builtin" | "workspace";
+
+export interface CapabilityCatalogSkill {
+  id: string;
+  name: string;
+  description: string;
+  source: CapabilitySource;
+  status: "available";
+  instructions: string;
+}
+
+export interface CapabilityCatalogPlugin {
+  id: string;
+  name: string;
+  description: string;
+  source: CapabilitySource;
+  status: "installed" | "unavailable";
+  mode: "instructions-only";
+  compatibleDrivers: string[];
+  instructions: string;
+}
+
+export interface CapabilityCatalogEnvironment {
+  id: string;
+  name: string;
+  description: string;
+  source: CapabilitySource;
+  status: "available";
+  values: Record<string, string>;
+  valueKeys: string[];
+}
+
+export interface CapabilityCatalog {
+  version: 1;
+  workspaceId: string;
+  canonicalRoot: string;
+  skills: CapabilityCatalogSkill[];
+  plugins: CapabilityCatalogPlugin[];
+  environments: CapabilityCatalogEnvironment[];
+}
+
 export interface Artifact {
   id: string;
   name: string;
@@ -272,6 +315,7 @@ export interface NewAgentInput {
   role: string;
   modelId?: string | null;
   skillRefs?: string[];
+  pluginRefs?: string[];
   environment?: {
     reference?: string | null;
     values?: Record<string, string>;

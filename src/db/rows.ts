@@ -114,6 +114,7 @@ export function mapAgentProfile(row: DbRow): AgentProfile {
   const composition = normalizeAgentComposition({
     modelId: nullableString(row, "model_id"),
     skillRefs: arrayValue(row, "skill_refs"),
+    pluginRefs: arrayValue(row, "plugin_refs"),
     environment: objectValue(row, "environment"),
   });
   return {

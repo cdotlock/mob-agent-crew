@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { normalizeBootstrap, normalizeTaskDetail } from "../../web/src/api.js";
+import { normalizeBootstrap, normalizeCapabilityCatalog, normalizeTaskDetail } from "../../web/src/api.js";
 import type { TaskSummary } from "../../web/src/model.js";
 
 const fallback: TaskSummary = {
@@ -25,6 +25,7 @@ describe("task API normalization", () => {
         handle: "claude-smoke",
         name: "Claude Code",
         driver: "claude",
+        pluginRefs: ["plugin:mob"],
       }],
       tasks: [],
     });
@@ -32,6 +33,22 @@ describe("task API normalization", () => {
     expect(bootstrap.agents[0]).toMatchObject({
       handle: "claude-smoke",
       name: "Claude Code",
+      pluginRefs: ["plugin:mob"],
+    });
+  });
+
+  it("normalizes shared capability selectors without treating registered plugins as installed", () => {
+    expect(normalizeCapabilityCatalog({
+      workspaceId: "workspace-1",
+      canonicalRoot: "capabilities",
+      skills: [{ id: "skill:review", name: "Review", source: "workspace", instructions: "Review carefully" }],
+      plugins: [{ id: "plugin:deepseek", name: "DeepSeek plugin", source: "workspace", status: "unavailable", compatibleDrivers: ["deepseek"] }],
+      environments: [{ id: "env:small", name: "Small", source: "builtin", values: { LOG_LEVEL: "info" }, valueKeys: ["LOG_LEVEL"] }],
+    })).toMatchObject({
+      workspaceId: "workspace-1",
+      skills: [{ id: "skill:review", status: "available" }],
+      plugins: [{ id: "plugin:deepseek", status: "unavailable", compatibleDrivers: ["deepseek"] }],
+      environments: [{ id: "env:small", valueKeys: ["LOG_LEVEL"] }],
     });
   });
 
@@ -60,5 +77,24 @@ describe("task API normalization", () => {
       summary: "Using a tool…",
     });
     expect(detail.artifacts[0]?.downloadUrl).toBe("/api/artifacts/artifact-1/download");
+  });
+
+  it("uses the real task run budget and links runs to their triggering message", () => {
+    const detail = normalizeTaskDetail({
+      id: "task-1",
+      runBudget: 8,
+      runs: [{
+        id: "run-1",
+        agentId: "builder",
+        status: "succeeded",
+        triggerMessageId: "message-1",
+      }],
+    }, fallback);
+
+    expect(detail).toMatchObject({
+      budgetUsed: 1,
+      budgetLimit: 8,
+      runs: [{ triggerMessageId: "message-1" }],
+    });
   });
 });

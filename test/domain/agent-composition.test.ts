@@ -10,6 +10,7 @@ describe("Agent composition", () => {
     expect(normalizeAgentComposition({
       modelId: " deepseek-v4-pro ",
       skillRefs: ["repo:review", "repo:review", "workspace:typescript"],
+      pluginRefs: ["mob:crew", "mob:crew"],
       environment: {
         reference: "workspace:railway-small",
         values: { NODE_ENV: "development", LOG_LEVEL: "info" },
@@ -17,6 +18,7 @@ describe("Agent composition", () => {
     })).toEqual({
       modelId: "deepseek-v4-pro",
       skillRefs: ["repo:review", "workspace:typescript"],
+      pluginRefs: ["mob:crew"],
       environment: {
         reference: "workspace:railway-small",
         values: { NODE_ENV: "development", LOG_LEVEL: "info" },

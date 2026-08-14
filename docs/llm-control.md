@@ -170,20 +170,33 @@ place the token in a URL. Ordinary messages should omit `invoke` or set it to
 
 ## Add and define an Agent
 
-An Agent identity is a stable Actor plus a small connector profile. The
-harness, model, skills, plugins and private memory remain implemented by the
-selected CLI or runtime; Mob only stores and passes their identifiers.
+An Agent identity is a stable Actor plus a small connector profile. Harnesses,
+models and private memory remain implemented by the selected CLI or runtime.
+Mob owns a small, file-native shared catalog for reusable Skill instructions,
+installed Plugin references, and secret-free Environment profiles. List it
+before composing an Agent:
+
+```bash
+mob model list
+mob capability list
+```
+
+The model response includes every Router entry and its supported protocol. A
+model is selectable only when that protocol matches the chosen harness; media,
+embedding, rerank, Chat, Responses and Messages entries are not silently
+treated as interchangeable.
 
 ```bash
 mob agent add \
   --handle reviewer-two \
   --name "Reviewer Two" \
-  --driver hermes \
+  --driver deepseek \
   --role "Independent implementation reviewer" \
   --model deepseek-v4-pro \
-  --skill review:typescript \
-  --skill workflow:focused-tests \
-  --environment railway:engineering
+  --skill mob:repository-knowledge \
+  --skill mob:collaboration \
+  --plugin mob:deepseek-harness \
+  --environment railway:default
 mob agent list
 ```
 
@@ -194,9 +207,9 @@ an existing identity by UUID or stable handle:
 mob agent configure @reviewer-two \
   --driver codex \
   --model gpt-5.6-sol \
-  --skill review:typescript \
-  --skill workflow:focused-tests \
-  --environment railway:engineering
+  --skill mob:repository-knowledge \
+  --skill mob:collaboration \
+  --environment railway:default
 ```
 
 `configure` first reads the current Agent and preserves every field not named
@@ -205,18 +218,40 @@ the explicit reset flags when that is the intended change:
 
 ```bash
 mob agent configure <agent-uuid> --default-model
-mob agent configure @reviewer-two --clear-skills --clear-environment
+mob agent configure @reviewer-two --clear-skills --clear-plugins --clear-environment
 ```
 
 `--model` conflicts with `--default-model`; `--skill` conflicts with
-`--clear-skills`; and `--environment` conflicts with `--clear-environment`.
-The environment option accepts only a secret-free reference such as
-`railway:engineering`; selecting a new reference also removes any old inline
-safe values. The reference is a label passed into the run context, not a secret
-resolver. There is deliberately no CLI flag for environment values, provider
-keys, GitHub tokens, passwords, or other secrets. Non-secret values can be set
-from the browser's Advanced section; control-plane credentials remain outside
-the Agent environment.
+`--clear-skills`; `--plugin` conflicts with `--clear-plugins`; and
+`--environment` conflicts with `--clear-environment`. Fields not named on
+`configure` are preserved.
+
+The environment option accepts a catalog reference such as `railway:default`.
+Mob resolves its latest secret-free values for every run, so one catalog edit
+updates every Agent that selected it. There is deliberately no CLI flag for
+environment values, provider keys, GitHub tokens, passwords, or other secrets.
+Control-plane credentials remain outside Agent profiles and catalog files.
+
+The browser's **Add Agent → Capabilities → Add to shared catalog** form writes
+stable JSON under the workspace `capabilities/` directory. Equivalent
+human-authenticated HTTP operations are:
+
+```text
+GET  /api/capabilities/catalog
+POST /api/capabilities/catalog/skills
+     {"id":"team:review","name":"Team review","instructions":"..."}
+POST /api/capabilities/catalog/environments
+     {"id":"team:focused","name":"Focused","values":{"LOG_LEVEL":"info"}}
+POST /api/capabilities/catalog/plugins
+     {"id":"team:tooling","name":"Tooling","compatibleDrivers":["pi"]}
+```
+
+Workspace users may register a Plugin reference, but they cannot claim that
+executable code is installed. Only control-plane built-ins can be selected as
+installed Plugins; ordinary catalog Plugin entries remain visibly unavailable
+until the runtime image provides them. Selected Skill and installed Plugin
+instructions are added to the bounded run context. Mob never executes code from
+a catalog file.
 
 Valid driver IDs are `pi`, `omp`, `claude`, `codex`, `hermes`, and `deepseek`.
 The standard

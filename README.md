@@ -55,9 +55,10 @@ printf '%s' "$MOB_PASSWORD" | mob login \
   --password-stdin
 
 mob task list
-mob chat send <task-id> "@builder inspect this repository"
-mob agent invoke <task-id> reviewer "review Builder's result"
+mob chat send <task-id> "Context note only; this does not start an Agent."
+mob agent invoke <task-id> @builder "inspect this repository"
 mob run watch <run-id>
+mob capability list
 ```
 
 The client stores only the server URL and scoped session token in
@@ -74,6 +75,12 @@ sh scripts/install-cli.sh
 For direct/group chats, live steering, Agent definition, GitHub access,
 self-iteration, file browsing, and the exact HTTP contracts, give
 [the Mob control protocol](docs/llm-control.md) to the controlling LLM.
+
+In the browser, a direct Agent chat uses **Run @agent** as its primary action;
+that creates a run, streams the real CLI in the right-hand terminal, and posts
+the Agent reply. **Post note** only records shared context. Agent Skills,
+installed Plugins, and secret-free Environments are selected from the shared
+file catalog rather than typed as opaque strings.
 
 ## Built-in file knowledge
 
