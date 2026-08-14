@@ -6,7 +6,9 @@ import { FileCodeIcon as FileCode } from "@phosphor-icons/react/FileCode";
 import { FileIcon as File } from "@phosphor-icons/react/File";
 import { FolderIcon as Folder } from "@phosphor-icons/react/Folder";
 import { FolderOpenIcon as FolderOpen } from "@phosphor-icons/react/FolderOpen";
+import { GithubLogoIcon as GithubLogo } from "@phosphor-icons/react/GithubLogo";
 import { PaperPlaneRightIcon as PaperPlaneRight } from "@phosphor-icons/react/PaperPlaneRight";
+import { PlusIcon as Plus } from "@phosphor-icons/react/Plus";
 import { RobotIcon as Robot } from "@phosphor-icons/react/Robot";
 import { SpinnerGapIcon as SpinnerGap } from "@phosphor-icons/react/SpinnerGap";
 import { StopCircleIcon as StopCircle } from "@phosphor-icons/react/StopCircle";
@@ -29,6 +31,7 @@ import type {
   RunEvent,
   TaskDetail,
 } from "./model.js";
+import type { RepositoryResource } from "./conversation-ui.js";
 
 type InspectorTab = "terminal" | "files" | "agent";
 
@@ -325,7 +328,7 @@ function AgentTerminal({ task, agents, demo, onStartInstruction }: { task: TaskD
             <time>{line.time}</time><span>{line.text}</span>
           </div>
         ))}
-        {!selectedRun ? <div className="terminal-empty-state"><Robot weight="duotone" /><h3>No Agent run in this conversation</h3><p>Write an instruction in the middle panel, then use <strong>Run Agent</strong>. The CLI process, tools, output, and exit state will stream here.</p><button type="button" onClick={onStartInstruction}><Code /> Write an instruction</button></div> : null}
+        {!selectedRun ? <div className="terminal-empty-state"><Robot weight="duotone" /><h3>No Agent working yet</h3><p>Chat normally in the middle. A direct message to an Agent—or an @mention in a group—will wake it and show its work here.</p><button type="button" onClick={onStartInstruction}><Code /> Go to chat</button></div> : null}
         {selectedRun && state === "ready" && !lines.length ? <p className="terminal-placeholder">Run accepted. Waiting for the connector to emit its first event…</p> : null}
       </div>
       {error ? <div className="terminal-error" role="alert"><WarningCircle /> {error}</div> : null}
@@ -420,7 +423,7 @@ function FileBrowser({ task, demo }: { task: TaskDetail; demo: boolean }) {
           <span key={`${segment}-${index}`}><CaretRight /><button onClick={() => { setPath(breadcrumbs.slice(0, index + 1).join("/")); setSelected(null); }}>{segment}</button></span>
         ))}
       </nav>
-      {error ? <div className="panel-error" role="alert"><WarningCircle /><span>{error}<small>{scope === "repository" ? "The checkout appears after this task starts its first Agent run." : "Workspace state may still be initializing."}</small></span></div> : null}
+      {error ? <div className="panel-error" role="alert"><WarningCircle /><span>{error}<small>{scope === "repository" ? "The checkout appears after an Agent starts repository work." : "Workspace state may still be initializing."}</small></span></div> : null}
       {selected ? <FilePreview file={selected} /> : (
         <div className="file-list" aria-busy={loading}>
           {loading ? <p className="panel-placeholder"><SpinnerGap className="spin" /> Reading files…</p> : null}
@@ -437,14 +440,14 @@ function FileBrowser({ task, demo }: { task: TaskDetail; demo: boolean }) {
   );
 }
 
-function AgentEnvironment({ task, agents, onDelegate, onConfigure }: { task: TaskDetail; agents: AgentProfile[]; onDelegate: (agentId: string) => void; onConfigure: (agentId: string) => void }) {
-  const latest = task.runs.at(-1);
-  const [agentId, setAgentId] = useState(latest?.agentId ?? task.participantIds[0] ?? agents[0]?.id ?? "");
+function AgentEnvironment({ task, agents, repository, onConfigure, onStartInstruction }: { task: TaskDetail | null; agents: AgentProfile[]; repository: RepositoryResource | undefined; onConfigure: (agentId: string) => void; onStartInstruction: (agentId?: string) => void }) {
+  const latest = task?.runs.at(-1);
+  const [agentId, setAgentId] = useState(latest?.agentId ?? task?.participantIds[0] ?? agents[0]?.id ?? "");
   const agent = agents.find((entry) => entry.id === agentId) ?? agents[0];
 
   useEffect(() => {
     if (latest?.agentId) setAgentId(latest.agentId);
-  }, [task.id, latest?.agentId]);
+  }, [task?.id, latest?.agentId]);
 
   if (!agent) return <p className="panel-placeholder">No Agent has been defined in this workspace.</p>;
   return (
@@ -457,14 +460,15 @@ function AgentEnvironment({ task, agents, onDelegate, onConfigure }: { task: Tas
         <div><dt>Harness</dt><dd><Code /> {agent.driver}</dd></div>
         <div><dt>Model</dt><dd>{agent.effectiveModelId}</dd></div>
         <div><dt>Status</dt><dd>{agent.status}</dd></div>
-        <div><dt>Environment</dt><dd>{task.repository} · {task.branch}</dd></div>
+        <div><dt>Environment</dt><dd>{task ? `${task.repository} · ${task.branch}` : repository ? `${repository.name} · ${repository.defaultBranch}` : "Scratch workspace"}</dd></div>
         <div><dt>Environment ref</dt><dd>{agent.environment.reference ?? "Workspace default"}</dd></div>
         <div><dt>Knowledge</dt><dd>Automatic manifest per run</dd></div>
         <div className="wide"><dt>Skills</dt><dd>{agent.skillRefs.length ? agent.skillRefs.join(" · ") : `${agent.driver} defaults`}</dd></div>
         <div className="wide"><dt>Plugins</dt><dd>{agent.pluginRefs.length ? agent.pluginRefs.join(" · ") : "None selected"}</dd></div>
       </dl>
       <div className="capability-list">{agent.capabilities.map((capability) => <span key={capability}>{capability}</span>)}</div>
-      <div className="agent-workbench-actions"><button className="secondary-button" onClick={() => onConfigure(agent.id)}><Code /> Configure</button><button className="agent-command-button" onClick={() => onDelegate(agent.id)}><TerminalWindow /> Give @{agent.handle} a bounded task</button></div>
+      <p className="agent-chat-guidance">Message normally in a direct chat. In a group, mention @{agent.handle} to bring this Agent in.</p>
+      <div className="agent-workbench-actions"><button className="secondary-button" onClick={() => onConfigure(agent.id)}><Code /> Configure</button><button className="agent-command-button" onClick={() => onStartInstruction(agent.id)}><PaperPlaneRight /> Message @{agent.handle}</button></div>
     </section>
   );
 }
@@ -472,35 +476,69 @@ function AgentEnvironment({ task, agents, onDelegate, onConfigure }: { task: Tas
 export function WorkspaceInspector({
   task,
   agents,
-  onDelegate,
+  repositories,
+  selectedRepositoryId,
+  busy,
   onConfigure,
   onStartInstruction,
+  onSelectRepository,
+  onAddRepository,
+  onReview,
+  onPublish,
   source,
 }: {
   task: TaskDetail | null;
   agents: AgentProfile[];
-  onDelegate: (agentId: string) => void;
+  repositories: RepositoryResource[];
+  selectedRepositoryId: string;
+  busy: boolean;
   onConfigure: (agentId: string) => void;
-  onStartInstruction: () => void;
+  onStartInstruction: (agentId?: string) => void;
+  onSelectRepository: (repositoryId: string) => void;
+  onAddRepository: () => void;
+  onReview: (decision: "accept" | "request_changes") => void;
+  onPublish: () => void;
   source: "api" | "demo";
 }) {
-  const [tab, setTab] = useState<InspectorTab>("terminal");
-  if (!task) return <aside className="inspector-pane pane"><div className="inspector-empty"><TerminalWindow /><span>Agent work appears here.</span></div></aside>;
+  const [tab, setTab] = useState<InspectorTab>(task?.runs.length ? "terminal" : "agent");
+  useEffect(() => {
+    setTab(task?.runs.length ? "terminal" : "agent");
+  }, [task?.id, task?.runs.length]);
   return (
     <aside className="inspector-pane pane work-inspector" aria-label="Agent work, files, and knowledge">
       <header className="work-inspector-header">
-        <div><p className="eyebrow">{source === "demo" ? "Demo workspace" : "Live workspace"}</p><h2>{tab === "terminal" ? "Agent terminal" : tab === "files" ? "Files" : "Agent"}</h2></div>
+        <div><p className="eyebrow">{source === "demo" ? "Demo workspace" : "Live workspace"}</p><h2>{tab === "terminal" ? "Agent work" : tab === "files" ? "Files" : "Agent"}</h2></div>
         <span className={classes("work-state", source === "demo" && "is-demo")}><i /> {source === "demo" ? "demo preview" : "connected"}</span>
       </header>
+      <section className="repository-shelf" aria-label="Repositories">
+        <div className="repository-shelf-heading"><span><GithubLogo /> Repositories</span><button type="button" onClick={onAddRepository}><Plus /> Add</button></div>
+        <div className="repository-shelf-list">
+          {repositories.length ? repositories.map((repository) => (
+            <button
+              type="button"
+              className={selectedRepositoryId === repository.id ? "is-selected" : ""}
+              key={repository.id}
+              onClick={() => onSelectRepository(repository.id)}
+              disabled={!repository.enabled}
+            >
+              <strong>{repository.name}</strong><small>{repository.defaultBranch}{repository.enabled ? "" : " · disabled"}</small>
+            </button>
+          )) : <p>No repositories yet. Add one whenever the conversation needs code.</p>}
+        </div>
+      </section>
+      {task?.status === "review_ready" ? <section className="execution-decision-card"><Check /><span><strong>Agent work is ready</strong><small>Review the files and terminal before approving.</small></span><div><button type="button" onClick={() => onReview("request_changes")} disabled={busy}>Request changes</button><button type="button" onClick={() => onReview("accept")} disabled={busy}>Approve</button></div></section> : null}
+      {task?.status === "completed" && task.resolution === "accepted" && !task.branch.startsWith("mob/") ? <section className="execution-decision-card is-approved"><Check /><span><strong>Work approved</strong><small>Publishing remains a separate human action.</small></span><div><button type="button" onClick={onPublish} disabled={busy}>Publish branch</button></div></section> : null}
       <nav className="inspector-tabs" aria-label="Workspace inspector" role="tablist">
         <button role="tab" aria-controls="workspace-inspector-panel" aria-label="Terminal" aria-selected={tab === "terminal"} className={tab === "terminal" ? "is-active" : ""} onClick={() => setTab("terminal")}><TerminalWindow /><span>Terminal</span></button>
         <button role="tab" aria-controls="workspace-inspector-panel" aria-label="Files" aria-selected={tab === "files"} className={tab === "files" ? "is-active" : ""} onClick={() => setTab("files")}><FolderOpen /><span>Files</span></button>
         <button role="tab" aria-controls="workspace-inspector-panel" aria-label="Agent" aria-selected={tab === "agent"} className={tab === "agent" ? "is-active" : ""} onClick={() => setTab("agent")}><Robot /><span>Agent</span></button>
       </nav>
       <div className="work-inspector-body" id="workspace-inspector-panel" role="tabpanel">
-        {tab === "terminal" ? <AgentTerminal task={task} agents={agents} demo={source === "demo"} onStartInstruction={onStartInstruction} /> : null}
-        {tab === "files" ? <FileBrowser task={task} demo={source === "demo"} /> : null}
-        {tab === "agent" ? <AgentEnvironment task={task} agents={agents} onDelegate={onDelegate} onConfigure={onConfigure} /> : null}
+        {!task && tab === "terminal" ? <div className="inspector-empty"><TerminalWindow /><span>No live work yet. Agent commands and output will stream here.</span></div> : null}
+        {!task && tab === "files" ? <div className="inspector-empty"><FolderOpen /><span>No worktree yet. Files appear after an Agent starts repository work.</span></div> : null}
+        {task && tab === "terminal" ? <AgentTerminal task={task} agents={agents} demo={source === "demo"} onStartInstruction={() => onStartInstruction()} /> : null}
+        {task && tab === "files" ? <FileBrowser task={task} demo={source === "demo"} /> : null}
+        {tab === "agent" ? <AgentEnvironment task={task} agents={agents} repository={repositories.find((entry) => entry.id === selectedRepositoryId)} onConfigure={onConfigure} onStartInstruction={onStartInstruction} /> : null}
       </div>
     </aside>
   );

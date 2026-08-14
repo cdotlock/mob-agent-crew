@@ -22,9 +22,9 @@ Connect without putting a password in shell history:
 
 Discover the environment before acting:
 
-    mob task list
-    mob conversation list
+    mob chat list
     mob agent list
+    mob repo list
     mob model list
     mob capability list
     mob wiki list --area wiki
@@ -34,16 +34,28 @@ Import a local Markdown tree without following hidden paths or symlinks:
     mob wiki import-dir ./docs --area raw
     mob wiki import-dir ./curated-wiki --area wiki
 
-Run and observe an Agent:
+Start a direct chat, group, or normal message:
 
-    mob agent invoke <task-id> @builder "inspect the failure and fix it"
+    mob chat new --kind direct --member @builder
+    mob chat new --kind group --title "Release room" --member @builder @rydia
+    mob chat send <chat-id> "please inspect the failure"
+
+Repository work is optional and can begin at any point:
+
+    mob repo import https://github.com/owner/repository
+    mob repo use <chat-id> <repository-id>
+    mob chat send <chat-id> --repository <repository-id> "fix the failing test"
+
+Observe or steer an Agent after it starts working:
+
     mob run watch <run-id>
     mob run steer <run-id> "also run the focused regression test"
 
-Chat notes and Agent execution are separate. In a direct browser chat,
-`Run @agent` is the primary action and streams the real CLI in the right-hand
-terminal; `Post note` records context without starting compute. External clients
-use `agent invoke` or `conversation send --invoke` when work should begin.
+Chat never requires a Task or repository. A direct message to an Agent wakes
+that Agent automatically. A direct message to a human is ordinary chat. In a
+group, an `@agent` mention wakes that Agent; a message without an Agent mention
+stays ordinary chat. There is no `--invoke` switch. An Agent may reply, ask for
+clarification, or begin longer work; live work appears in the right-hand panel.
 
 Agent identity is a thin composition:
 
@@ -56,7 +68,7 @@ Plugins can be selected.
 
 Mob owns collaboration state and access rules. Each installed harness still
 owns its private implementation and memory. Never send provider or GitHub keys
-through chat, Wiki, task files, command arguments, or Agent environment fields.
+through chat, Wiki, workspace files, command arguments, or Agent environment fields.
 
 Wiki is available through the browser's Wiki button and through `mob wiki`.
 Use `mob wiki ask "question"` for a natural-language retrieval with file

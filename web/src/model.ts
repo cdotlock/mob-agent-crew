@@ -75,11 +75,15 @@ export interface ConversationMember {
   handle: string;
   kind: "human" | "agent";
   initials: string;
+  status?: string;
 }
+
+export type WorkspaceActor = ConversationMember;
 
 export interface ConversationSummary {
   id: string;
-  taskId: string;
+  taskId: string | null;
+  activeRepositoryId: string | null;
   kind: ConversationKind;
   title: string | null;
   isPrimary: boolean;
@@ -95,6 +99,7 @@ export interface ConversationDetail extends ConversationSummary {
 
 export interface TaskSummary {
   id: string;
+  repositoryId?: string | null;
   title: string;
   repository: string;
   branch: string;
@@ -121,6 +126,7 @@ export interface ThreadMessage {
 
 export interface AgentRun {
   id: string;
+  taskId?: string | null;
   agentId: string;
   role: string;
   status: RunStatus;
@@ -302,7 +308,8 @@ export interface DelegationInput {
 }
 
 export interface NewConversationInput {
-  taskId: string;
+  taskId?: string | null;
+  activeRepositoryId?: string | null;
   kind: ConversationKind;
   title?: string | null;
   members: string[];

@@ -1579,8 +1579,8 @@ kbd {
   overscroll-behavior: contain;
 }
 
-/* The work inspector is intentionally terminal-first: one clear place to see
-   what the selected Agent process is doing, with files and knowledge adjacent. */
+/* The work inspector stays quiet until execution begins, then exposes terminal
+   and files beside the repository and Agent controls. */
 .work-inspector {
   background: #080d14;
 }
@@ -3888,6 +3888,14 @@ kbd {
     min-height: 34px;
   }
 
+  .unified-send-button {
+    width: 64px;
+  }
+
+  .repository-context-select select {
+    max-width: 92px;
+  }
+
   .mention-menu {
     left: 8px;
     right: 8px;
@@ -4014,14 +4022,162 @@ kbd {
   }
 }
 
-/* Conversations and Agent identities stay deliberately thin: the task owns
-   execution context, while these controls expose only chat membership and CLI driver. */
+/* Conversation-first controls keep chat independent from optional repository work. */
 .sidebar-create-actions {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: 1fr;
   gap: 6px;
   margin: -3px 12px 10px;
 }
+
+/* Conversation-first workspace */
+.repository-context-select {
+  min-width: 0;
+  height: 30px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: 2px;
+  padding: 0 5px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #0e1520;
+  color: var(--muted);
+}
+
+.repository-context-select svg {
+  width: 13px;
+  height: 13px;
+  flex: 0 0 auto;
+}
+
+.repository-context-select select {
+  max-width: 150px;
+  min-width: 88px;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--text-soft);
+  font-size: 9px;
+}
+
+.unified-send-button {
+  min-width: 76px;
+  height: 34px;
+  border: 1px solid #9e91f9;
+  background: linear-gradient(180deg, #8f7ff3, #7868df);
+  box-shadow: 0 4px 14px rgba(93, 76, 202, 0.2);
+}
+
+.unified-send-button:hover:not(:disabled) {
+  border-color: #b5aaff;
+  background: linear-gradient(180deg, #9d8efb, #8373e8);
+}
+
+.repository-shelf {
+  display: grid;
+  gap: 7px;
+  padding: 9px 10px 10px;
+  border-top: 1px solid var(--border);
+  background: #0b111a;
+}
+
+.repository-shelf-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 750;
+}
+
+.repository-shelf-heading > span,
+.repository-shelf-heading button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.repository-shelf-heading svg {
+  width: 13px;
+  height: 13px;
+}
+
+.repository-shelf-heading button {
+  min-height: 24px;
+  padding: 0 7px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--surface);
+  color: var(--text-soft);
+  font-size: 8px;
+  font-weight: 700;
+}
+
+.repository-shelf-list {
+  display: flex;
+  gap: 5px;
+  overflow-x: auto;
+  padding-bottom: 2px;
+}
+
+.repository-shelf-list > button {
+  min-width: 132px;
+  max-width: 190px;
+  display: grid;
+  gap: 2px;
+  padding: 7px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #0e1520;
+  color: var(--muted);
+  text-align: left;
+}
+
+.repository-shelf-list > button.is-selected {
+  border-color: rgba(140, 124, 245, 0.62);
+  background: var(--accent-soft);
+  color: var(--text);
+}
+
+.repository-shelf-list strong,
+.repository-shelf-list small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.repository-shelf-list strong { font-size: 9px; }
+.repository-shelf-list small { color: var(--faint); font-size: 8px; }
+.repository-shelf-list p { margin: 0; color: var(--faint); font-size: 9px; }
+
+.execution-decision-card {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr);
+  gap: 7px;
+  padding: 9px 10px;
+  border-top: 1px solid rgba(91, 184, 255, 0.2);
+  background: rgba(91, 184, 255, 0.06);
+  color: var(--blue);
+}
+
+.execution-decision-card > span { display: grid; gap: 2px; }
+.execution-decision-card strong { color: var(--text); font-size: 10px; }
+.execution-decision-card small { color: var(--muted); font-size: 8px; }
+.execution-decision-card > div { grid-column: 2; display: flex; gap: 5px; }
+.execution-decision-card button {
+  min-height: 27px;
+  padding: 0 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: 5px;
+  background: var(--surface-2);
+  color: var(--text-soft);
+  font-size: 8px;
+  font-weight: 700;
+}
+.execution-decision-card.is-approved { border-color: rgba(69, 216, 164, 0.2); background: rgba(69, 216, 164, 0.06); color: var(--green); }
+
+.work-inspector .inspector-tabs { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 
 .sidebar-create-actions button {
   min-height: 32px;
@@ -4652,6 +4808,13 @@ kbd {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);
   gap: 7px;
+}
+
+.agent-chat-guidance {
+  margin: 10px 1px 0;
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 1.5;
 }
 
 .agent-workbench-actions .agent-command-button {

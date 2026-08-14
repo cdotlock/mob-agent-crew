@@ -34,7 +34,9 @@ import type {
   TaskStatus,
   TaskSummary,
   ThreadMessage,
+  WorkspaceActor,
 } from "./model.js";
+import type { RepositoryResource } from "./conversation-ui.js";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -146,6 +148,7 @@ function normalizeTask(value: unknown, index = 0): TaskSummary {
   const participants = item.participantIds ?? item.participant_ids ?? item.participants ?? [];
   return {
     id: text(item, ["id", "taskId", "task_id"], `task-${index + 1}`),
+    repositoryId: text(item, ["repositoryId", "repository_id"]) || null,
     title: text(item, ["title", "name", "subject"], "Untitled collaboration"),
     repository: text(item, ["repository", "repo", "repositoryName", "repository_name"], "No repository"),
     branch: text(item, ["branch", "baseRef", "base_ref"], "main"),
@@ -229,6 +232,7 @@ function normalizeConversationMember(value: unknown, index = 0): ConversationMem
     handle: text(item, ["handle"], name.toLowerCase().replace(/[^a-z0-9_-]+/g, "-")),
     kind: text(item, ["kind"]) === "agent" ? "agent" : "human",
     initials: text(item, ["initials"], initials(name)),
+    status: text(item, ["status"], "active"),
   };
 }
 
@@ -261,6 +265,7 @@ function normalizeRun(value: unknown, index = 0): AgentRun {
   const normalizedStatus = rawStatus.toLowerCase().replace(/[\s-]+/g, "_");
   return {
     id: text(item, ["id", "runId", "run_id"], `run-${index + 1}`),
+    taskId: text(item, ["taskId", "task_id"]) || null,
     agentId: text(item, ["agentId", "agent_id", "agentActorId", "agent_actor_id", "actorId", "actor_id"], "unknown-agent"),
     role: text(item, ["role", "intent", "label"], "Agent run"),
     status: statusAliases[normalizedStatus] ?? enumValue<RunStatus>(item.status, runStatuses, "queued"),
@@ -279,7 +284,8 @@ function normalizeConversation(value: unknown, index = 0): ConversationDetail {
   const lastMessage = isRecord(last) ? normalizeMessage(last) : null;
   return {
     id: text(item, ["id", "conversationId", "conversation_id"], `conversation-${index + 1}`),
-    taskId: text(item, ["taskId", "task_id"]),
+    taskId: text(item, ["taskId", "task_id"]) || null,
+    activeRepositoryId: text(item, ["activeRepositoryId", "active_repository_id"]) || null,
     kind: text(item, ["kind"]) === "direct" ? "direct" : "group",
     title: text(item, ["title"]) || null,
     isPrimary: item.isPrimary === true || item.is_primary === true,
@@ -400,6 +406,42 @@ export async function fetchConversations(): Promise<ConversationSummary[]> {
   return array(value.conversations).map(normalizeConversation);
 }
 
+export async function fetchWorkspaceActors(): Promise<WorkspaceActor[]> {
+  const value = unbox(await request("/api/actors"));
+  return array(value.actors).map(normalizeConversationMember);
+}
+
+function normalizeRepositoryResource(value: unknown, index = 0): RepositoryResource {
+  const repository = object(value);
+  return {
+    id: text(repository, ["id", "repositoryId", "repository_id"], `repository-${index + 1}`),
+    name: text(repository, ["name", "fullName", "full_name"], "Unnamed repository"),
+    remoteUrl: text(repository, ["remoteUrl", "remote_url", "url"]) || null,
+    defaultBranch: text(repository, ["defaultBranch", "default_branch", "branch"], "main"),
+    enabled: repository.enabled !== false,
+  };
+}
+
+export async function fetchRepositories(): Promise<RepositoryResource[]> {
+  const value = unbox(await request("/api/repositories"));
+  return array(value.repositories).map(normalizeRepositoryResource);
+}
+
+export async function importRepository(url: string): Promise<RepositoryResource> {
+  const value = unbox(await request("/api/repositories/import", {
+    method: "POST",
+    body: JSON.stringify({ url }),
+  }));
+  return normalizeRepositoryResource(value.repository ?? value);
+}
+
+export async function updateConversationRepository(conversationId: string, repositoryId: string | null): Promise<void> {
+  await request(`/api/conversations/${encodeURIComponent(conversationId)}`, {
+    method: "PATCH",
+    body: JSON.stringify({ activeRepositoryId: repositoryId }),
+  });
+}
+
 export async function fetchConversation(conversationId: string): Promise<ConversationDetail> {
   return normalizeConversation(await request(`/api/conversations/${encodeURIComponent(conversationId)}`));
 }
@@ -414,7 +456,7 @@ export async function createConversation(input: NewConversationInput): Promise<C
 export async function postConversationMessage(
   conversationId: string,
   content: string,
-  options: { invoke?: boolean; agent?: string } = {},
+  options: { repositoryId?: string | null } = {},
 ): Promise<{ message: ThreadMessage; runs: AgentRun[] }> {
   const value = unbox(await request(`/api/conversations/${encodeURIComponent(conversationId)}/messages`, {
     method: "POST",
